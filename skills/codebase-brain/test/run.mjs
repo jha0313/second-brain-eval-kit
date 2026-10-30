@@ -145,7 +145,7 @@ check('an uncommitted edit makes JSON and why answers stale', () => {
   const r = q('why', 'why does reserve throw InsufficientCredits instead of returning false?');
   assert.equal(r.freshness.state, 'stale');
   assert.deepEqual(r.freshness.files, ['src/lib/charge.ts']);
-  assert.match(text('why', 'why does reserve throw InsufficientCredits?'), /stale: .*1 file changed since the index/);
+  assert.match(text('why', 'why does reserve throw InsufficientCredits?'), /stale: .*1 file changed since the index \(src\/lib\/charge\.ts\)/);
 });
 check('build --if-stale rebuilds a stale index, and the edit it indexed is no longer "changed"', () => {
   assert.equal(rebuild().skipped, false);

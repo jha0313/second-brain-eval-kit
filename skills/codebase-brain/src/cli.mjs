@@ -84,7 +84,9 @@ function target(db, q, opt) {
 // JSON answers carry it as `freshness`; text answers print the stale line only when the checkout moved on
 const fresh = (db) => freshnessOf(freshness(db, checkout));
 function staleNote(f) {
-  if (f.state === 'stale') out(c.yellow(`  stale: HEAD @${f.head.slice(0, 8)}, ${plural(f.changed, 'file')} changed since the index — grep those, or brain build`));
+  if (f.state !== 'stale') return;
+  const names = f.files.slice(0, 5).join(', ') + (f.changed > 5 ? `, +${f.changed - 5} more` : '');   // the files to grep, no extra call
+  out(c.yellow(`  stale: HEAD @${f.head.slice(0, 8)}, ${plural(f.changed, 'file')} changed since the index${names ? ` (${names})` : ''} — grep those, or brain build`));
 }
 
 function footer(db, cov, extra = '') {
