@@ -566,9 +566,7 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         "grader_exceptions": sorted(r["trial_id"] for r in results if r.get("grader_exception")),
         "runner_exceptions": sorted(r["trial_id"] for r in results if r.get("runner_exception")), "limitations": report.LIMITS + suite.notes,
         "cases": {c.id: {"kind": c.kind, "prompt": c.prompt, "family": c.family} for c in suite.cases if c.id in case_ids},
-        "counts": {"expected": len(specs), "attempted": sum(not r["outcome"].startswith("skipped") for r in results),
-                   "scored": sum(r["outcome"] in SCORED for r in results),
-                   "excluded": {o: sum(r["outcome"] == o for r in results) for o in EXCLUDED}},
+        "counts": run_counts(results, len(specs)),
         "spent_usd": round(budget.spent, 4),
         "isolation": {"all_ok": all(r.get("isolation_ok", True) for r in results),
                       "skills_visible_in_none": sorted({s for r in results if r["arm"] == "none" for s in (r.get("visible", {}).get("skills") or [])}),
@@ -578,6 +576,12 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
     data = {"meta": meta, "aggregate": agg, "trials": results}
     (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
     return data
+
+
+def run_counts(results: list[dict], expected: int) -> dict:
+    return {"expected": expected, "attempted": sum(not r["outcome"].startswith("skipped") for r in results),
+            "scored": sum(r["outcome"] in SCORED for r in results),
+            "excluded": {o: sum(r["outcome"] == o for r in results) for o in EXCLUDED}}
 
 
 def repo_instructions(suite) -> dict:

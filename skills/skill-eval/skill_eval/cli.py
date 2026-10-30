@@ -174,6 +174,7 @@ def cmd_grade(a):
     suite = load_suite(os.path.expanduser(data["meta"]["suite_file"]), a.repo)
     cases = {c.id: c for c in suite.cases}
     deny = runner.deny_list(suite, out)
+    regraded, judged, judge_usd = 0, 0, 0.0
     for rec in data["trials"]:
         # a trial excluded because the grader failed (bad judge votes, a check that raised) has a sound trajectory and is
         # graded again; limits, the agent's own infra errors, runner bugs and isolation errors keep their outcome
@@ -188,8 +189,14 @@ def cmd_grade(a):
         traj["ws_state"] = rec.get("ws_state")
         hard = checks.run_hard_checks(case, traj, rec["arm"], suite.repo, suite.commit, deny)
         failed = any(h["gate"] and h["ok"] is False for h in hard)
-        votes = (judge.judge(case, traj, suite.judge_model, suite.votes, suite.repo, suite.commit)
-                 if (case.rubric and not failed and not a.no_judge) else rec.get("votes"))
+        regraded += 1
+        if case.rubric and not failed and not a.no_judge:
+            votes = judge.judge(case, traj, suite.judge_model, suite.votes, suite.repo, suite.commit)
+            judged += 1
+            judge_usd += sum(v.get("cost_usd", 0) for v in votes)
+            rec["judge_models"] = sorted({m for v in votes for m in v.get("models", [])})
+        else:
+            votes = rec.get("votes")
         used = judge.usable_votes(votes, len(votes) // 2 + 1) if votes and not failed else None
         if votes and not failed and used is None:        # same rule as the runner: a broken judge excludes, never scores 0
             rec.update(hard=hard, votes=votes, outcome="infra_error", score=None, passed=None, rubric=None, grader_error=True,
@@ -203,10 +210,22 @@ def cmd_grade(a):
         rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes or [])
     arms = list(data["meta"]["arms"])
     data["aggregate"] = stats.aggregate(data["trials"], arms, list(data["meta"]["cases"]), suite.compare, suite.sensitivity)
-    data["meta"]["regraded"] = datetime.now().isoformat(timespec="seconds")
+    m = data["meta"]
+    m["regraded"] = datetime.now().isoformat(timespec="seconds")
     if was != checks.GRADING_VERSION:
-        data["meta"]["graded_first_with"] = data["meta"].get("graded_first_with", was)
-    data["meta"]["grading_version"] = checks.GRADING_VERSION
+        m["graded_first_with"] = m.get("graded_first_with", was)
+    m["grading_version"] = checks.GRADING_VERSION
+    # the run summary follows the new grades; spent_usd keeps every dollar (the run plus each re-grade's judge calls)
+    m["counts"] = runner.run_counts(data["trials"], m["counts"]["expected"])
+    m["spent_usd"] = round(m.get("spent_usd", 0) + judge_usd, 4)
+    m["regrades"] = m.get("regrades", []) + [{
+        "at": m["regraded"], "grading_version": checks.GRADING_VERSION, "trials_regraded": regraded, "judge_calls": judged,
+        "judge_usd": round(judge_usd, 4), "judge_version": judge.JUDGE_VERSION if judged else None,
+        "judge_model": suite.judge_model if judged else None}]
+    if judged:
+        m["judge_version"], m["judge_model"] = judge.JUDGE_VERSION, suite.judge_model
+    m["judge_models_seen"] = sorted({x for r in data["trials"] for x in r.get("judge_models", [])})
+    m["grader_exceptions"] = sorted(r["trial_id"] for r in data["trials"] if r.get("grader_exception"))
     (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
     html_path, text = report.write_reports(data, out)
     print(text)

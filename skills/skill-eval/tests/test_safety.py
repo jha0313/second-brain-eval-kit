@@ -186,3 +186,19 @@ def test_grade_recovers_a_trial_the_judge_failed(monkeypatch, tmp_path, repo):
         repo.write({f"b{i}.ts": "y\n"})
         data, calls = _grade(monkeypatch, stored_run(tmp_path / f"b{i}", repo, "infra_error", **extra), [GOOD] * 3)
         assert calls == [] and data["trials"][0]["outcome"] == "infra_error"
+
+
+def test_grade_updates_counts_cost_and_judge_metadata(monkeypatch, tmp_path, repo):
+    # review r2 #5: a re-grade that turns a pass into an exclusion must show in meta.counts, and its judge cost in spent_usd
+    repo.write({"a.ts": "x\n"})
+    run = stored_run(tmp_path, repo, "pass", score=1.0, passed=True, votes=[GOOD] * 3)
+    data, _ = _grade(monkeypatch, run, [BROKEN] * 3)
+    m = data["meta"]
+    assert data["trials"][0]["outcome"] == "infra_error"
+    assert m["counts"]["scored"] == 0 and m["counts"]["excluded"]["infra_error"] == 1 and m["counts"]["attempted"] == 1
+    assert m["spent_usd"] == pytest.approx(0.01 + 3 * 0.02)
+    assert m["regrades"][-1]["judge_usd"] == pytest.approx(0.06) and m["regrades"][-1]["judge_calls"] == 1
+    assert m["judge_version"] == judge.JUDGE_VERSION and m["regrades"][-1]["grading_version"] == m["grading_version"]
+    data, _ = _grade(monkeypatch, run, [GOOD] * 3)                        # a second re-grade adds to the history
+    assert len(data["meta"]["regrades"]) == 2 and data["meta"]["spent_usd"] == pytest.approx(0.07 + 0.3)
+    assert data["meta"]["counts"]["scored"] == 1 and data["meta"]["judge_models_seen"] == ["judge-m"]
