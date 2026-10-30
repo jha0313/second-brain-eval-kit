@@ -85,20 +85,28 @@ def cmd_run(a):
     print(plan_table(suite, specs, arms, k, est, a, frozen, diffs))
     if a.dry_run:
         return 0
+    if frozen is None and not a.unfrozen:
+        raise SuiteError("no FROZEN.json: run `skill-eval freeze SUITE` first (it fixes cases, keys and grading rules "
+                         "before any result is seen), or pass --dev for a dev run")
     if diffs and not a.unfrozen:
-        raise SuiteError(f"changed since FROZEN.json ({frozen['frozen_at']}): {diffs}. Re-freeze with --reason, or --unfrozen for a dev run")
+        rules = (f" Grading rules changed: frozen with {frozen['grading_version']}, this harness is {checks.GRADING_VERSION}."
+                 if "grading_version" in diffs or "grading_code" in diffs else "")
+        raise SuiteError(f"changed since FROZEN.json ({frozen['frozen_at']}): {diffs}.{rules} Re-freeze with --reason, or --dev for a dev run")
     if a.max_usd is not None and est["total_usd"] > a.max_usd:
         print(f"\nnote: estimate ${est['total_usd']:.2f} is above --max-usd {a.max_usd:.2f}; trials past the cap are skipped.")
     out = Path(a.out or Path(suite.dir) / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S")).resolve()
     data = runner.run(suite, specs, out, a.jobs, a.max_usd, est, use_judge=not a.no_judge, keep_ws=a.keep_workspaces,
-                      seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None)
+                      seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None,
+                      stop_after_denials=a.stop_after_denials, canary=not a.no_canary)
     html_path, text = report.write_reports(data, out)
     scan = scan_saved(out)                        # grep every saved file for the token (redacts any hit)
     data["meta"]["token_scan"] = scan
     (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
     print("\n" + text)
     print(f"saved records: token {scan['token']} · {runner.short(out)}/scorecard.html")
-    return 0 if data["meta"]["isolation"]["all_ok"] else 2
+    if data["meta"]["stopped"]:
+        print(f"run stopped early: {data['meta']['stopped']}")
+    return 0 if data["meta"]["isolation"]["all_ok"] and not data["meta"]["stopped"] else 2
 
 
 def plan_table(suite, specs, arms, k, est, a, frozen=None, diffs=()) -> str:
@@ -160,7 +168,13 @@ def cmd_grade(a):
         failed = any(h["gate"] and h["ok"] is False for h in hard)
         votes = (judge.judge(case, traj, suite.judge_model, suite.votes, suite.repo, suite.commit)
                  if (case.rubric and not failed and not a.no_judge) else rec.get("votes"))
-        s = checks.score_trial(hard, votes if not failed else None, case.pass_threshold)
+        used = judge.usable_votes(votes, len(votes) // 2 + 1) if votes and not failed else None
+        if votes and not failed and used is None:        # same rule as the runner: a broken judge excludes, never scores 0
+            rec.update(hard=hard, votes=votes, outcome="infra_error", score=None, passed=None, rubric=None, grader_error=True,
+                       reason=f"grader error: {sum(bool(v.get('grader_error')) for v in votes)}/{len(votes)} judge votes invalid")
+            rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes)
+            continue
+        s = checks.score_trial(hard, used, case.pass_threshold)
         rec.update(hard=hard, votes=votes, outcome=s["outcome"], score=s["score"],
                    passed=s["passed"], reason=s["reason"], rubric=s.get("rubric"))
         rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes or [])
@@ -221,7 +235,11 @@ def main(argv=None):
     r.add_argument("--keep-workspaces", action="store_true")
     r.add_argument("--seed", type=int, default=0, help="arm order shuffle seed")
     r.add_argument("--repo", help="repo clone (default: repo.path in the suite)")
-    r.add_argument("--unfrozen", action="store_true", help="dev only: run although FROZEN.json does not match")
+    r.add_argument("--dev", "--unfrozen", dest="unfrozen", action="store_true",
+                   help="dev only: run without FROZEN.json or although it does not match")
+    r.add_argument("--stop-after-denials", type=int, default=3, metavar="N",
+                   help="stop the run after N trials with permission denials (0 = never; default 3)")
+    r.add_argument("--no-canary", action="store_true", help="skip the 1-trial-per-arm canary before the rest")
     r.set_defaults(fn=cmd_run)
     rp = sub.add_parser("report", help="rebuild reports from results.json")
     rp.add_argument("run_dir")

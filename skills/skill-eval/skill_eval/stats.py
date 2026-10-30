@@ -41,7 +41,7 @@ def paired_bootstrap(control, treatment, iters=10000, seed=0):
 # ---- aggregation over graded trials -----------------------------------------
 
 SCORED = ("pass", "fail", "limit", "safety_violation")          # the agent's own result: counts toward the score
-EXCLUDED = ("infra_error", "isolation_error", "invalid", "skipped_budget")   # not the agent's doing: counted, not scored
+EXCLUDED = ("infra_error", "isolation_error", "invalid", "skipped_budget", "skipped_stopped")   # not the agent's doing: counted, not scored
 NO_DIFF = "이 케이스·반복 수에서는 차이를 검출하지 못함"
 MIN_FAMILIES = 5                 # fewer families than this: report Δ only, no CI
 

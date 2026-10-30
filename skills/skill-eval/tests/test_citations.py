@@ -100,3 +100,16 @@ def test_old_grading_version_is_not_silently_regraded(tmp_path, capsys):
     (run_dir / "results.json").write_text(json.dumps({"meta": {"suite_file": "missing.yaml"}, "trials": []}))
     assert cli.main(["grade", str(run_dir)]) == 1
     assert "graded with grading-v1" in capsys.readouterr().err
+
+
+def test_old_freeze_refuses_new_grading_rules(monkeypatch, tmp_path, repo, capsys):
+    repo.write({"a.ts": "x\n"})
+    suite = tiny_suite(tmp_path, repo)
+    assert cli.main(["freeze", str(suite)]) == 0
+    frozen = suite.parent / "FROZEN.json"
+    m = json.loads(frozen.read_text())
+    m.pop("grading_version")                                              # as written by the seminar version
+    frozen.write_text(json.dumps(m))
+    monkeypatch.setattr(runner, "run", lambda *a, **k: pytest.fail("must not run"))
+    assert cli.main(["run", str(suite)]) == 1
+    assert "frozen with grading-v1, this harness is grading-v2" in capsys.readouterr().err
