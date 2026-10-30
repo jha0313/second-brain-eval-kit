@@ -202,6 +202,8 @@ def test_grade_updates_counts_cost_and_judge_metadata(monkeypatch, tmp_path, rep
     data, _ = _grade(monkeypatch, run, [GOOD] * 3)                        # a second re-grade adds to the history
     assert len(data["meta"]["regrades"]) == 2 and data["meta"]["spent_usd"] == pytest.approx(0.07 + 0.3)
     assert data["meta"]["counts"]["scored"] == 1 and data["meta"]["judge_models_seen"] == ["judge-m"]
+    data, _ = _grade(monkeypatch, run, [{**GOOD, "cost_unknown_attempts": 1}] * 3)   # judge retries of unknown cost
+    assert data["meta"]["cost_unknown_attempts"] == 3
 
 
 def test_tokens_count_every_attempt(monkeypatch, tmp_path):

@@ -568,6 +568,8 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         "cases": {c.id: {"kind": c.kind, "prompt": c.prompt, "family": c.family} for c in suite.cases if c.id in case_ids},
         "counts": run_counts(results, len(specs)),
         "spent_usd": round(budget.spent, 4),
+        "cost_unknown_attempts": sum(r["metrics"].get("cost_unknown_attempts", 0) for r in results)
+        + sum(v.get("cost_unknown_attempts", 0) for r in results for v in r.get("votes") or []),
         "isolation": {"all_ok": all(r.get("isolation_ok", True) for r in results),
                       "skills_visible_in_none": sorted({s for r in results if r["arm"] == "none" for s in (r.get("visible", {}).get("skills") or [])}),
                       "hook_events_total": sum(r.get("hook_events", 0) for r in results),

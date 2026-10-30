@@ -174,7 +174,7 @@ def cmd_grade(a):
     suite = load_suite(os.path.expanduser(data["meta"]["suite_file"]), a.repo)
     cases = {c.id: c for c in suite.cases}
     deny = runner.deny_list(suite, out)
-    regraded, judged, judge_usd = 0, 0, 0.0
+    regraded, judged, judge_usd, unknown = 0, 0, 0.0, 0
     for rec in data["trials"]:
         # a trial excluded because the grader failed (bad judge votes, a check that raised) has a sound trajectory and is
         # graded again; limits, the agent's own infra errors, runner bugs and isolation errors keep their outcome
@@ -194,6 +194,7 @@ def cmd_grade(a):
             votes = judge.judge(case, traj, suite.judge_model, suite.votes, suite.repo, suite.commit)
             judged += 1
             judge_usd += sum(v.get("cost_usd", 0) for v in votes)
+            unknown += sum(v.get("cost_unknown_attempts", 0) for v in votes)
             rec["judge_models"] = sorted({m for v in votes for m in v.get("models", [])})
         else:
             votes = rec.get("votes")
@@ -218,6 +219,7 @@ def cmd_grade(a):
     # the run summary follows the new grades; spent_usd keeps every dollar (the run plus each re-grade's judge calls)
     m["counts"] = runner.run_counts(data["trials"], m["counts"]["expected"])
     m["spent_usd"] = round(m.get("spent_usd", 0) + judge_usd, 4)
+    m["cost_unknown_attempts"] = m.get("cost_unknown_attempts", 0) + unknown
     m["regrades"] = m.get("regrades", []) + [{
         "at": m["regraded"], "grading_version": checks.GRADING_VERSION, "trials_regraded": regraded, "judge_calls": judged,
         "judge_usd": round(judge_usd, 4), "judge_version": judge.JUDGE_VERSION if judged else None,

@@ -87,6 +87,12 @@ def _split(t) -> bool:
     return any(len(x) > 1 for x in seen.values())
 
 
+def spent_text(m) -> str:
+    """$ spent; when some attempt's cost is unknown (no result line), the sum is a lower bound and says so."""
+    n = m.get("cost_unknown_attempts") or 0
+    return f"${m['spent_usd']:.2f}" if not n else f"≥${m['spent_usd']:.2f} ({n} attempt(s) of unknown cost)"
+
+
 def _mde_text(c) -> str:
     if not c.get("mde_80"):
         return ""
@@ -184,7 +190,7 @@ def terminal(data: dict, color: bool = False, per_case: bool = False) -> str:
     exc = ", ".join(f"{k} {v}" for k, v in cnt["excluded"].items() if v) or "0"
     vault = next((v["meta"]["vault"] for v in (idx.get("files") or {}).values() if "vault" in v.get("meta", {})), "n/a")
     lines.append((f"index {idx['seconds']:.0f}s, vault {'none' if vault is None else vault} · " if idx.get("files") else "")
-                 + f"${m['spent_usd']:.2f} · {cnt['scored']}/{cnt['expected']} scored · excluded {exc} · "
+                 + f"{spent_text(m)} · {cnt['scored']}/{cnt['expected']} scored · excluded {exc} · "
                  + f"cut-off {m.get('truncated_output', 0)} · denied {len(m.get('permission_denied_trials') or [])} · "
                  + f"isolation {'OK' if m['isolation']['all_ok'] else 'BROKEN'}")
     lines.append("* = pre-registered primary metric · CI = exploratory paired bootstrap over case families")
@@ -409,7 +415,7 @@ def scorecard(data: dict) -> str:
     exc = ", ".join(f"{k} {v}" for k, v in cnt["excluded"].items() if v) or "0"
     man = m.get("manifest")
     out.append(f'<h2>실행 기록</h2><div class="card sub">expected {cnt["expected"]} · attempted {cnt["attempted"]} · scored {cnt["scored"]} · '
-               f'excluded {exc} · spent ${m["spent_usd"]:.2f} (estimate ${m["estimate"]["total_usd"]:.2f}) · wall {m.get("wall_seconds", 0) // 60}분<br>'
+               f'excluded {exc} · spent {_e(spent_text(m))} (estimate ${m["estimate"]["total_usd"]:.2f}) · wall {m.get("wall_seconds", 0) // 60}분<br>'
                + (f'인덱스: 한 번 빌드 {idx["seconds"]:.0f}s · ' + ", ".join(f'{v["bytes"] / 1e6:.0f} MB sha256 {v["sha256"][:12]}' for v in idx["files"].values())
                   + f' · {", ".join(idx["arms"])}가 같은 파일을 읽기 전용으로 씀<br>' if idx.get("files") else "")
                + f'격리: {"OK" if iso["all_ok"] else "BROKEN"} · 인증 {_e(m.get("auth_mode"))} · none arm에 보인 스킬 {len(iso["skills_visible_in_none"])}개 · '

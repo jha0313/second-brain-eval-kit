@@ -27,7 +27,7 @@
   - 남은 trial은 `skipped_stopped`로 남기고, 멈춘 이유는 `meta.stopped`에 적습니다. `results.json`은 그래도 씁니다.
 - `--no-canary`로 canary를 끌 수 있습니다.
 - 비용은 재시도한 시도까지 모두 더합니다.
-  - agent 시도는 `metrics.attempts`에 하나씩 남습니다. 결과 줄이 없는 시도는 $0으로 치지 않고 `cost_unknown_attempts`로 셉니다.
+  - agent 시도는 `metrics.attempts`에 하나씩 남습니다. 결과 줄이 없는 시도는 $0으로 치지 않고 `cost_unknown_attempts`로 셉니다. 그런 시도가 있으면 보고서 금액은 `≥$X`(확인된 비용 이상)로 나옵니다.
   - judge 재시도 비용도 더합니다.
 - 계획한 반복 중 일부가 제외된 칸은 pass@k·pass^k를 N/A로 둡니다.
 

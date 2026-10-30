@@ -33,3 +33,16 @@ def test_reports_show_causes_splits_and_detection_power(monkeypatch, tmp_path):
     assert "실패 원인" in page and "cites_exist · not_a_commit" in summary
     comp = next(c for c in data["aggregate"]["comparisons"] if c["subset"] == "all")
     assert comp["families"] == 6 and comp["mde_80"] and "검출력" in text and "어림값" in page
+
+
+def test_spend_with_unknown_attempt_costs_reads_as_a_lower_bound(monkeypatch, tmp_path):
+    # review r2 (optional): an attempt with no result line has no known cost; the total is "at least", not exact
+    def trial(spec, n):
+        r = make_rec(spec)
+        if n == 1:
+            r["metrics"]["cost_unknown_attempts"] = 1
+        return r
+    data, _ = fake_run(monkeypatch, tmp_path, [make_case("W0")], trial, canary=False)
+    assert data["meta"]["cost_unknown_attempts"] == 1
+    html_path, text = report.write_reports(data, tmp_path / "out")
+    assert "≥$" in text and "1 attempt(s) of unknown cost" in text and "≥$" in html_path.read_text()
