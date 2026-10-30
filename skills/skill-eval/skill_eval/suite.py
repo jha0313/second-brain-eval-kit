@@ -101,6 +101,9 @@ def load_suite(path: str | Path, repo_override: str | None = None) -> Suite:
     repo_path = repo_override or os.path.expandvars(str(repo.get("path", "")))
     if not repo_path or "$" in repo_path:
         raise SuiteError(f"repo.path is not set ({repo.get('path')}): export the variable or pass --repo DIR")
+    if not re.fullmatch(r"[0-9a-f]{7,40}", str(repo.get("commit", ""))):
+        raise SuiteError(f"repo.commit is not a commit SHA ({repo.get('commit')!r}): put the repo's `git rev-parse HEAD` "
+                         "there (the commit the cases and keys were written against)")
     suite = Suite(
         path=path,
         name=raw.get("name", path.stem),
@@ -166,7 +169,7 @@ def load_case(path: Path, suite: Suite) -> Case:
         if name not in HARD_CHECKS:
             raise SuiteError(f"{path.name}: unknown hard check '{name}'")
         args = dict(args or {})
-        if name == "set_match":
+        if name in ("set_match", "sources_hit"):   # keys sit next to the case file, like JSON cases' answer_key
             args["key"] = str(_resolve(path.parent, args["key"]))
             if not Path(args["key"]).exists():
                 raise SuiteError(f"{path.name}: answer key not found: {args['key']}")

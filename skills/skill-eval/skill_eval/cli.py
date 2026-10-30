@@ -6,7 +6,8 @@
   skill-eval run SUITE --dry-run                     print the plan and the estimated cost; no model calls
   skill-eval run SUITE [-k 3] [-j 4] [--max-usd 20]  run, grade, write results.json + scorecard.html
   skill-eval report RUN_DIR                          rebuild the terminal table and scorecard.html
-  skill-eval grade RUN_DIR                           re-grade stored trajectories (hard checks + judge; no agent runs)
+  skill-eval grade RUN_DIR [--new-grading]           re-grade stored trajectories (hard checks + judge; no agent runs)
+  skill-eval keycheck SUITE                          do the answer keys point at real commits, files and lines? ($0)
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from pathlib import Path
 from . import checks, extract, judge, report, runner, stats
 from .freeze import freeze, verify
 from .isolation import scan_saved
+from .keycheck import check_keys
 from .probe import format_probe, run_probe
 from .selftest import run_selftest
 from .suite import SuiteError, load_suite
@@ -48,8 +50,21 @@ def cmd_selftest(a):
     return 0 if not bad else 2
 
 
+def cmd_keycheck(a):
+    suite = load_suite(a.suite, a.repo)
+    problems = check_keys(suite)
+    for p in problems:
+        print(f"  BAD {p['where']:<14} {p['problem']}")
+    print(f"keycheck: {len(suite.cases)} cases @{suite.commit[:8]}, {len(problems)} problem(s)")
+    return 0 if not problems else 2
+
+
 def cmd_freeze(a):
     suite = load_suite(a.suite, a.repo)
+    problems = check_keys(suite)
+    if problems:
+        raise SuiteError(f"keycheck finds {len(problems)} problem(s), e.g. {problems[0]['where']}: {problems[0]['problem']}. "
+                         "Run `skill-eval keycheck SUITE` and fix the keys before freezing")
     bad = [r for r in run_selftest(suite) if not r["ok"]]
     if bad:
         raise SuiteError(f"selftest fails on {len(bad)} answers; fix grading before freezing")
@@ -85,20 +100,29 @@ def cmd_run(a):
     print(plan_table(suite, specs, arms, k, est, a, frozen, diffs))
     if a.dry_run:
         return 0
+    if frozen is None and not a.unfrozen:
+        raise SuiteError("no FROZEN.json: run `skill-eval freeze SUITE` first (it fixes cases, keys and grading rules "
+                         "before any result is seen), or pass --dev for a dev run")
     if diffs and not a.unfrozen:
-        raise SuiteError(f"changed since FROZEN.json ({frozen['frozen_at']}): {diffs}. Re-freeze with --reason, or --unfrozen for a dev run")
+        rules = (f" Grading rules changed: frozen with {frozen['grading_version']}, this harness is {checks.GRADING_VERSION}."
+                 if frozen["grading_version"] != checks.GRADING_VERSION else
+                 " The grading code changed since the freeze (same grading version)." if "grading_code" in diffs else "")
+        raise SuiteError(f"changed since FROZEN.json ({frozen['frozen_at']}): {diffs}.{rules} Re-freeze with --reason, or --dev for a dev run")
     if a.max_usd is not None and est["total_usd"] > a.max_usd:
         print(f"\nnote: estimate ${est['total_usd']:.2f} is above --max-usd {a.max_usd:.2f}; trials past the cap are skipped.")
     out = Path(a.out or Path(suite.dir) / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S")).resolve()
     data = runner.run(suite, specs, out, a.jobs, a.max_usd, est, use_judge=not a.no_judge, keep_ws=a.keep_workspaces,
-                      seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None)
+                      seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None,
+                      stop_after_denials=a.stop_after_denials, canary=not a.no_canary)
     html_path, text = report.write_reports(data, out)
     scan = scan_saved(out)                        # grep every saved file for the token (redacts any hit)
     data["meta"]["token_scan"] = scan
     (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
     print("\n" + text)
     print(f"saved records: token {scan['token']} · {runner.short(out)}/scorecard.html")
-    return 0 if data["meta"]["isolation"]["all_ok"] else 2
+    if data["meta"]["stopped"]:
+        print(f"run stopped early: {data['meta']['stopped']}")
+    return 0 if data["meta"]["isolation"]["all_ok"] and not data["meta"]["stopped"] else 2
 
 
 def plan_table(suite, specs, arms, k, est, a, frozen=None, diffs=()) -> str:
@@ -143,26 +167,82 @@ def cmd_report(a):
 def cmd_grade(a):
     out = Path(a.run_dir).resolve()
     data = json.loads((out / "results.json").read_text())
+    was = data["meta"].get("grading_version", "grading-v1")      # runs before the field existed: seminar-2026-10-31 rules
+    if was != checks.GRADING_VERSION and not a.new_grading:
+        raise SuiteError(f"this run was graded with {was}; re-grading would apply {checks.GRADING_VERSION} rules. "
+                         "Pass --new-grading to do that on purpose (results.json then records both versions).")
     suite = load_suite(os.path.expanduser(data["meta"]["suite_file"]), a.repo)
     cases = {c.id: c for c in suite.cases}
     deny = runner.deny_list(suite, out)
+    regraded, judged, judge_usd, unknown = 0, 0, 0.0, 0
     for rec in data["trials"]:
-        if rec["outcome"] not in ("pass", "fail", "safety_violation", "invalid") or rec["case"] not in cases:
-            continue                                   # limits, infra and isolation errors keep their outcome
+        # a trial excluded because the grader failed is graded again by the runner's own _grade, with the gates the run
+        # recorded (infra, isolation, answer-key access, limits). Bad judge votes come after every gate passed; a check
+        # that raised came before them, so it needs gate_inputs (runs recorded without them keep the exclusion).
+        # The agent's own infra errors, runner bugs and isolation errors keep their outcome, and so does every grader
+        # failure under --no-judge (the other trials keep their votes; a rubric-less score would not compare).
+        grader_failed = rec["outcome"] == "infra_error" and not rec.get("runner_exception") and not a.no_judge and bool(
+            rec.get("grader_error") or (rec.get("grader_exception") and "gate_inputs" in rec))
+        path = out / "trials" / rec["trial_id"] / "trajectory.jsonl"
+        if (rec["outcome"] not in ("pass", "fail", "safety_violation", "invalid") and not grader_failed) \
+                or rec["case"] not in cases or not path.exists():
+            continue
         case = cases[rec["case"]]
-        traj = parse_stream(out / "trials" / rec["trial_id"] / "trajectory.jsonl")
+        traj = parse_stream(path)
         traj["ws_state"] = rec.get("ws_state")
+        if grader_failed:
+            for k in ("votes", "grader_error", "grader_exception", "rubric"):
+                rec.pop(k, None)
+            g = rec.get("gate_inputs") or {"infra": False, "timed_out": False}
+            runner._grade(rec, suite, case, traj, rec["arm"], deny, not a.no_judge, g["infra"], g["timed_out"])
+            regraded += 1
+            if rec.get("votes"):
+                judged += 1
+                judge_usd += sum(v.get("cost_usd", 0) for v in rec["votes"])
+                unknown += sum(v.get("cost_unknown_attempts", 0) for v in rec["votes"])
+            continue
         hard = checks.run_hard_checks(case, traj, rec["arm"], suite.repo, suite.commit, deny)
         failed = any(h["gate"] and h["ok"] is False for h in hard)
-        votes = (judge.judge(case, traj, suite.judge_model, suite.votes, suite.repo, suite.commit)
-                 if (case.rubric and not failed and not a.no_judge) else rec.get("votes"))
-        s = checks.score_trial(hard, votes if not failed else None, case.pass_threshold)
-        rec.update(hard=hard, votes=votes, outcome=s["outcome"], score=s["score"],
-                   passed=s["passed"], reason=s["reason"], rubric=s.get("rubric"))
+        regraded += 1
+        if case.rubric and not failed and not a.no_judge:
+            votes = judge.judge(case, traj, suite.judge_model, suite.votes, suite.repo, suite.commit)
+            judged += 1
+            judge_usd += sum(v.get("cost_usd", 0) for v in votes)
+            unknown += sum(v.get("cost_unknown_attempts", 0) for v in votes)
+            rec["judge_models"] = sorted({m for v in votes for m in v.get("models", [])})
+            rec["metrics"]["judge_tokens_by_model"] = runner._sum_tokens(v.get("tokens_by_model") or {} for v in votes)
+        else:
+            votes = rec.get("votes")
+        used = judge.usable_votes(votes, len(votes) // 2 + 1) if votes and not failed else None
+        if votes and not failed and used is None:        # same rule as the runner: a broken judge excludes, never scores 0
+            rec.update(hard=hard, votes=votes, outcome="infra_error", score=None, passed=None, rubric=None, grader_error=True,
+                       reason=f"grader error: {sum(bool(v.get('grader_error')) for v in votes)}/{len(votes)} judge votes invalid")
+            rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes)
+            continue
+        s = checks.score_trial(hard, used, case.pass_threshold)
+        rec.update(hard=hard, votes=votes, outcome=s["outcome"], score=s["score"], passed=s["passed"], reason=s["reason"],
+                   rubric=s.get("rubric"), grader_error=any(v.get("grader_error") for v in votes or []))
+        rec.pop("grader_exception", None)
         rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes or [])
     arms = list(data["meta"]["arms"])
     data["aggregate"] = stats.aggregate(data["trials"], arms, list(data["meta"]["cases"]), suite.compare, suite.sensitivity)
-    data["meta"]["regraded"] = datetime.now().isoformat(timespec="seconds")
+    m = data["meta"]
+    m["regraded"] = datetime.now().isoformat(timespec="seconds")
+    if was != checks.GRADING_VERSION:
+        m["graded_first_with"] = m.get("graded_first_with", was)
+    m["grading_version"] = checks.GRADING_VERSION
+    # the run summary follows the new grades; spent_usd keeps every dollar (the run plus each re-grade's judge calls)
+    m["counts"] = runner.run_counts(data["trials"], m["counts"]["expected"])
+    m["spent_usd"] = round(m.get("spent_usd", 0) + judge_usd, 4)
+    m["cost_unknown_attempts"] = m.get("cost_unknown_attempts", 0) + unknown
+    m["regrades"] = m.get("regrades", []) + [{
+        "at": m["regraded"], "grading_version": checks.GRADING_VERSION, "trials_regraded": regraded, "judge_calls": judged,
+        "judge_usd": round(judge_usd, 4), "judge_version": judge.JUDGE_VERSION if judged else None,
+        "judge_model": suite.judge_model if judged else None}]
+    if judged:
+        m["judge_version"], m["judge_model"] = judge.JUDGE_VERSION, suite.judge_model
+    m["judge_models_seen"] = sorted({x for r in data["trials"] for x in r.get("judge_models", [])})
+    m["grader_exceptions"] = sorted(r["trial_id"] for r in data["trials"] if r.get("grader_exception"))
     (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
     html_path, text = report.write_reports(data, out)
     print(text)
@@ -193,6 +273,10 @@ def main(argv=None):
     st.add_argument("-v", "--verbose", action="store_true")
     st.add_argument("--repo", help="repo clone (default: repo.path in the suite, e.g. ${MY_REPO})")
     st.set_defaults(fn=cmd_selftest)
+    kc = sub.add_parser("keycheck", help="do the answer keys point at real commits, files and lines? ($0)")
+    kc.add_argument("suite")
+    kc.add_argument("--repo", help="repo clone (default: repo.path in the suite)")
+    kc.set_defaults(fn=cmd_keycheck)
     fz = sub.add_parser("freeze", help="write FROZEN.json before any v1 result")
     fz.add_argument("suite")
     fz.add_argument("--reason", help="required when FROZEN.json exists")
@@ -214,7 +298,11 @@ def main(argv=None):
     r.add_argument("--keep-workspaces", action="store_true")
     r.add_argument("--seed", type=int, default=0, help="arm order shuffle seed")
     r.add_argument("--repo", help="repo clone (default: repo.path in the suite)")
-    r.add_argument("--unfrozen", action="store_true", help="dev only: run although FROZEN.json does not match")
+    r.add_argument("--dev", "--unfrozen", dest="unfrozen", action="store_true",
+                   help="dev only: run without FROZEN.json or although it does not match")
+    r.add_argument("--stop-after-denials", type=int, default=3, metavar="N",
+                   help="stop the run after N trials with permission denials (0 = never; default 3)")
+    r.add_argument("--no-canary", action="store_true", help="skip the 1-trial-per-arm canary before the rest")
     r.set_defaults(fn=cmd_run)
     rp = sub.add_parser("report", help="rebuild reports from results.json")
     rp.add_argument("run_dir")
@@ -223,6 +311,7 @@ def main(argv=None):
     g.add_argument("run_dir")
     g.add_argument("--no-judge", action="store_true", help="keep stored judge votes")
     g.add_argument("--repo", help="repo clone (default: repo.path in the suite)")
+    g.add_argument("--new-grading", action="store_true", help="allow re-grading a run graded with an older grading version")
     g.set_defaults(fn=cmd_grade)
     ex = sub.add_parser("extract", help="report-only per-trial extract for one case (pre-registered; not grading)")
     ex.add_argument("run_dir")

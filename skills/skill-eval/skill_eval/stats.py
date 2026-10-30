@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import random
-from math import comb, isfinite
+from math import ceil, comb, isfinite, sqrt
 
 
 def _check(n, c, k):
@@ -41,7 +41,7 @@ def paired_bootstrap(control, treatment, iters=10000, seed=0):
 # ---- aggregation over graded trials -----------------------------------------
 
 SCORED = ("pass", "fail", "limit", "safety_violation")          # the agent's own result: counts toward the score
-EXCLUDED = ("infra_error", "isolation_error", "invalid", "skipped_budget")   # not the agent's doing: counted, not scored
+EXCLUDED = ("infra_error", "isolation_error", "invalid", "skipped_budget", "skipped_stopped")   # not the agent's doing: counted, not scored
 NO_DIFF = "이 케이스·반복 수에서는 차이를 검출하지 못함"
 MIN_FAMILIES = 5                 # fewer families than this: report Δ only, no CI
 
@@ -80,8 +80,9 @@ def aggregate(trials: list[dict], arms: list[str], case_ids: list[str], pairs=((
                 "n": n, "passes": c, "attempted": len(ts),
                 "excluded": len([t for t in ts if t["outcome"] not in SCORED]),
                 "mean_score": _mean([t["score"] for t in scored]),
-                "pass_at_k": pass_at_k(n, c, n) if n else None,
-                "pass_hat_k": pass_hat_k(n, c, n) if n else None,
+                # pass@k / pass^k need every planned repeat scored: with 1 of 3 left, pass^3 would read as pass^1
+                "pass_at_k": pass_at_k(n, c, n) if n and n == len(ts) else None,
+                "pass_hat_k": pass_hat_k(n, c, n) if n and n == len(ts) else None,
                 "exact_rate": _mean([float(x) for x in exact]),
                 "recall": _mean([h.get("recall") for h in set_m]),
                 "precision": _mean([h.get("precision") for h in set_m]),
@@ -104,7 +105,9 @@ def aggregate(trials: list[dict], arms: list[str], case_ids: list[str], pairs=((
             "any_skill_loaded_in_none": any(t["skill_loaded"] for t in scored_all) if arm == "none" else None,
             "mean_seconds": _mean([t["metrics"]["seconds"] for t in scored_all]),
             "mean_seconds_passed": _mean([t["metrics"]["seconds"] for t in passed]),
-            "mean_tokens": _mean([t["metrics"]["tokens_total"] for t in scored_all]),
+            "mean_tokens": _mean([t["metrics"]["tokens_total"] for t in scored_all]),          # the graded attempt
+            "mean_tokens_all_attempts": _mean([t["metrics"].get("tokens_total_all_attempts", t["metrics"]["tokens_total"])
+                                               for t in scored_all]),                          # incl. infra retries
             "mean_output_tokens": _mean([t["metrics"]["tokens"]["output"] for t in scored_all]),
             "mean_usd": _mean([t["metrics"]["agent_usd"] for t in scored_all]),
             "mean_tool_calls": _mean([t["metrics"]["tool_calls"] for t in scored_all]),
@@ -129,6 +132,23 @@ def aggregate(trials: list[dict], arms: list[str], case_ids: list[str], pairs=((
     return out
 
 
+def mde_80(diffs: list[float]) -> float | None:
+    """Rough smallest difference this many families would detect 80% of the time (two-sided 5%, paired normal
+    approximation: 2.8 x sd / sqrt(n)). A rough guide for "how many more cases", not a test. None when the
+    families did not differ at all (sd 0) or there are too few."""
+    n = len(diffs)
+    if n < MIN_FAMILIES:
+        return None
+    m = sum(diffs) / n
+    sd = sqrt(sum((d - m) ** 2 for d in diffs) / (n - 1))
+    return 2.8 * sd / sqrt(n) if sd > 0 else None
+
+
+def families_for(mde: float | None, n: int, target: float) -> int | None:
+    """Families needed for the same rough detection at `target` (same spread, same k): n x (mde / target)^2."""
+    return None if mde is None else ceil(n * (mde / target) ** 2)
+
+
 def _compare(cells, family, a, b, subsets) -> list[dict]:
     comparisons = []
     for name, ids in subsets:
@@ -140,13 +160,16 @@ def _compare(cells, family, a, b, subsets) -> list[dict]:
             fams.setdefault(family[cid], []).append(cid)
         ctrl = {f: _mean([cells[f"{c}|{a}"]["mean_score"] for c in cs]) for f, cs in fams.items()}
         trt = {f: _mean([cells[f"{c}|{b}"]["mean_score"] for c in cs]) for f, cs in fams.items()}
+        mde = None
         if len(fams) >= MIN_FAMILIES:
             delta, ci = paired_bootstrap(ctrl, trt)
             verdict_text = verdict(delta, ci)
+            mde = mde_80([trt[f] - ctrl[f] for f in sorted(fams)])
         else:
             delta = _mean([trt[f] - ctrl[f] for f in fams])
             ci, verdict_text = None, f"가족 {len(fams)}개라 CI 생략(Δ만 보고)"
         comparisons.append({"control": a, "treatment": b, "subset": name, "cases": len(common), "families": len(fams),
-                            "delta": delta, "ci95": ci, "verdict": verdict_text,
+                            "delta": delta, "ci95": ci, "verdict": verdict_text, "mde_80": mde,
+                            "families_for_delta_0_05": families_for(mde, len(fams), 0.05),
                             "control_mean": _mean(list(ctrl.values())), "treatment_mean": _mean(list(trt.values()))})
     return comparisons

@@ -54,7 +54,7 @@ def extract(run_dir: Path, case_id: str) -> list[dict]:
     data = json.loads((run_dir / "results.json").read_text())
     rows = []
     for rec in data["trials"]:
-        if rec["case"] != case_id or rec["outcome"] == "skipped_budget":
+        if rec["case"] != case_id or rec["outcome"].startswith("skipped"):
             continue
         tj = run_dir / "trials" / rec["trial_id"] / "trajectory.jsonl"
         traj = parse_stream(tj) if tj.exists() else {"tool_calls": [], "final": rec.get("final_excerpt", "")}

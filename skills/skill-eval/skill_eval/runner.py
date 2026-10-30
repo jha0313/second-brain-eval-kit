@@ -218,6 +218,42 @@ class Budget:
             self.cv.notify_all()
 
 
+class Breaker:
+    """Stop a run that is going wrong instead of paying for it: a canary trial per arm must come back clean
+    (no permission denial, grader exception, infra or isolation error), and after it a grader exception or
+    isolation error stops at once, permission denials after `max_denied` trials (0 = never). Trials not started
+    yet are recorded as skipped_stopped (excluded, counted).
+    The run calls claim() and see() under one lock: a trial starts when it is claimed, no claim succeeds after a
+    stop, and trials claimed before the stop run to the end (listed in in_flight_at_stop)."""
+
+    def __init__(self, max_denied: int = 3):
+        self.max_denied, self.denied, self.reason = max_denied, 0, None
+        self.running, self.in_flight_at_stop = set(), []
+
+    def claim(self, trial_id: str) -> bool:
+        if self.reason:
+            return False
+        self.running.add(trial_id)
+        return True
+
+    def see(self, rec: dict, canary: bool = False) -> None:
+        self.running.discard(rec["trial_id"])
+        if self.reason:
+            return
+        tag = "canary: " if canary else ""
+        if rec.get("permission_denied"):
+            self.denied += 1
+        # a harness error stops at once, whatever else the trial shows (a denial must not hide it)
+        if rec.get("grader_exception") or rec.get("runner_exception") or rec["outcome"] == "isolation_error" \
+                or (canary and rec["outcome"] == "infra_error"):
+            self.reason = f"{tag}{rec['trial_id']} {rec['outcome']}: {rec.get('reason', '')}"[:200]
+        elif rec.get("permission_denied") and (canary or (self.max_denied and self.denied >= self.max_denied)):
+            tool = rec["permission_denied"][0].split(" ", 1)[0]              # the tool name only: inputs hold workspace paths
+            self.reason = f"{tag}{self.denied} trial(s) with permission denials (last: {tool} in {rec['trial_id']})"
+        if self.reason:
+            self.in_flight_at_stop = sorted(self.running)
+
+
 def ws_state(ws: Path, commit: str) -> dict:
     """What the agent left behind. Tool calls are not proof of "read only": Bash can write."""
     st = subprocess.run(["git", "-C", str(ws), "status", "--porcelain", "--untracked-files=all"],
@@ -256,6 +292,7 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
     lim = case.limits
     cmd = claude_cmd(case.prompt, model=suite.model, settings=settings, tools=suite.tools,
                      max_turns=lim["max_turns"], max_usd=lim["max_usd"], effort=suite.effort)
+    attempts = []                                 # every attempt is paid for: keep each one's cost, time and tokens
     for attempt in range(3):                      # infra errors: retry up to 2 times
         ws = make_workspace(templates[arm], ws_root)
         start, timed_out = time.time(), False
@@ -277,6 +314,8 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
         traj["ws_state"] = state
         infra = not timed_out and (not traj["has_result"] or (traj["is_error"] and (
             traj["terminal_reason"] == "api_error" or any(m in traj["error_text"] for m in INFRA_MARKERS))))
+        attempts.append({"seconds": round(seconds, 1), "usd": traj["cost_usd"], "usd_known": traj["has_result"],
+                         "tokens_total": sum(traj["tokens"].values()), "infra": infra})
         if not infra:
             break
         time.sleep(5 * (attempt + 1))
@@ -287,10 +326,16 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
            "models_used": traj["models_used"], "config_files": te.config_keys,
            "truncated_output": checks.truncated_output(traj)}
     rec["isolation_ok"], rec["isolation_detail"] = isolation_ok(traj, arm_skill)
+    rec["gate_inputs"] = {"infra": infra, "timed_out": timed_out}     # what _grade gates on; `grade` re-applies them
     tokens = traj["tokens"]
-    rec["metrics"] = {"seconds": round(seconds, 1), "agent_usd": traj["cost_usd"], "judge_usd": 0.0, "tokens": tokens,
+    # seconds and tokens describe the attempt that was graded; $ is every attempt (an infra attempt with no result
+    # line has an unknown cost: counted in cost_unknown_attempts, not assumed 0)
+    rec["metrics"] = {"seconds": round(seconds, 1), "agent_usd": sum(x["usd"] for x in attempts), "judge_usd": 0.0, "tokens": tokens,
                       "tokens_total": sum(tokens.values()), "tool_calls": len(traj["tool_calls"]), "turns": traj["num_turns"],
-                      "permission_denials": traj["permission_denials"], "tokens_by_model": traj["tokens_by_model"]}
+                      "permission_denials": traj["permission_denials"], "tokens_by_model": traj["tokens_by_model"],
+                      "attempts": attempts, "cost_unknown_attempts": sum(not x["usd_known"] for x in attempts),
+                      "seconds_all_attempts": round(sum(x["seconds"] for x in attempts), 1),
+                      "tokens_total_all_attempts": sum(x["tokens_total"] for x in attempts)}
     rec["permission_denied"] = [f"{c['name']} {json.dumps(c['input'], ensure_ascii=False)[:120]}"
                                 for c in traj["tool_calls"] if DENIED_RE.search(c["output"] or "")]
     rec["final_excerpt"] = (traj["final"] or "")[:1500]
@@ -331,6 +376,12 @@ def _grade(rec, suite, case, traj, arm, deny, use_judge, infra, timed_out) -> No
             rec["metrics"]["judge_usd"] = sum(v["cost_usd"] for v in votes)
             rec["metrics"]["judge_tokens_by_model"] = _sum_tokens(v.get("tokens_by_model") or {} for v in votes)
             rec["grader_error"] = any(v.get("grader_error") for v in votes)
+            votes = judge.usable_votes(votes, len(votes) // 2 + 1)
+            if votes is None:                     # the judge broke, not the agent: exclude, never score 0
+                bad = sum(bool(v.get("grader_error")) for v in rec["votes"])
+                rec.update(outcome="infra_error", score=None, passed=None, rubric=None,
+                           reason=f"grader error: {bad}/{len(rec['votes'])} judge votes invalid")
+                return
         s = checks.score_trial(hard, votes, case.pass_threshold)
         rec.update(outcome=s["outcome"], score=s["score"], passed=s["passed"], reason=s["reason"], rubric=s.get("rubric"))
         if case.rubric and not use_judge and not failed_gate:
@@ -406,7 +457,8 @@ def progress_line(n: int, total: int, rec: dict, elapsed: float, tty: bool) -> s
 
 
 def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, est: dict,
-        use_judge: bool = True, keep_ws: bool = False, log=print, seed: int = 0, manifest: dict | None = None) -> dict:
+        use_judge: bool = True, keep_ws: bool = False, log=print, seed: int = 0, manifest: dict | None = None,
+        stop_after_denials: int = 3, canary: bool = True) -> dict:
     if auth_mode() != "token" and os.environ.get("SKILL_EVAL_ALLOW_KEYCHAIN") != "1":
         raise RuntimeError("no token file: trials would use your own Claude Code config. Run `claude setup-token` "
                            "and save the token (see SKILL.md), or set SKILL_EVAL_ALLOW_KEYCHAIN=1 for a dev run.")
@@ -431,36 +483,68 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
     os.chmod(ws_root, 0o300)                      # same user can enter its own workspace but cannot list siblings
     skill_hashes = {a: hashlib.sha256((t / ".claude" / "skills" / suite.skill / "SKILL.md").read_bytes()).hexdigest()[:12]
                     for a, t in templates.items() if suite.arms[a]}
-    budget = Budget(max_usd)
+    budget, breaker = Budget(max_usd), Breaker(stop_after_denials)
     per_trial_est = est["total_usd"] / max(1, est["trials"])
     started, t0 = datetime.now(timezone.utc).isoformat(timespec="seconds"), time.time()
     done, results, lock = [0], [], threading.Lock()
     tty = sys.stdout.isatty() or bool(os.environ.get("FORCE_COLOR"))
 
-    def work(spec):
+    def skipped(spec, outcome, reason):
         c = spec["case"]
-        if not budget.reserve(per_trial_est):
-            rec = {"trial_id": f"{c.id}__{spec['arm']}__{spec['rep']}", "case": c.id, "kind": c.kind, "family": c.family,
-                   "arm": spec["arm"], "rep": spec["rep"], "slot": spec.get("slot"), "outcome": "skipped_budget",
-                   "score": None, "passed": None, "hard": [], "reason": f"--max-usd {max_usd} reached", "skill_loaded": None,
-                   "metrics": {"seconds": 0, "agent_usd": 0, "judge_usd": 0, "tokens": {}, "tokens_total": 0, "tool_calls": 0, "turns": 0}}
+        return {"trial_id": f"{c.id}__{spec['arm']}__{spec['rep']}", "case": c.id, "kind": c.kind, "family": c.family,
+                "arm": spec["arm"], "rep": spec["rep"], "slot": spec.get("slot"), "outcome": outcome,
+                "score": None, "passed": None, "hard": [], "reason": reason, "skill_loaded": None,
+                "metrics": {"seconds": 0, "agent_usd": 0, "judge_usd": 0, "tokens": {}, "tokens_total": 0, "tool_calls": 0, "turns": 0}}
+
+    def work(spec, is_canary=False):
+        rec, was = None, None
+        if breaker.reason:
+            pass
+        elif not budget.reserve(per_trial_est):   # may wait for running trials; one of them may stop the run meanwhile
+            rec = skipped(spec, "skipped_budget", f"--max-usd {max_usd} reached")
         else:
-            rec = run_trial(suite, spec, out, ws_root, templates, deny, use_judge, keep_ws)
-            budget.settle(per_trial_est, rec["metrics"]["agent_usd"] + rec["metrics"]["judge_usd"])
+            with lock:                            # the start: claimed under the lock the breaker decides a stop under
+                start = breaker.claim(f"{spec['case'].id}__{spec['arm']}__{spec['rep']}")
+            try:
+                if start:
+                    try:
+                        rec = run_trial(suite, spec, out, ws_root, templates, deny, use_judge, keep_ws)
+                    except Exception as e:        # a harness bug in one trial must not hang the budget or lose the run
+                        rec = skipped(spec, "infra_error", f"runner exception: {type(e).__name__}: {e}"[:200])
+                        rec["runner_exception"] = True
+                    with lock:                    # before the budget is settled: a worker it wakes sees the stop
+                        was = breaker.reason
+                        breaker.see(rec, canary=is_canary)
+            finally:
+                budget.settle(per_trial_est, (rec["metrics"]["agent_usd"] + rec["metrics"]["judge_usd"]) if rec else 0.0)
+        if rec is None:
+            rec = skipped(spec, "skipped_stopped", f"run stopped: {breaker.reason}")
         with lock:
             done[0] += 1
             results.append(rec)
             log(progress_line(done[0], len(specs), rec, time.time() - t0, tty))
-            if rec["outcome"] in ("isolation_error", "invalid", "safety_violation") or rec.get("grader_exception") \
+            if rec["outcome"] in ("isolation_error", "invalid", "safety_violation") or rec.get("grader_exception") or rec.get("runner_exception") \
                     or rec.get("grader_error"):
                 log(f"  !! {rec['outcome']}: {rec['reason']}"[:100])
             if rec.get("permission_denied"):
                 log(f"  !! permission denied ({len(rec['permission_denied'])}): {rec['permission_denied'][0]}"[:100])
+            if breaker.reason and was is None and not rec["outcome"].startswith("skipped"):
+                log(f"  !! stopping the run: {breaker.reason}"[:160]
+                    + (f" ({len(breaker.in_flight_at_stop)} trial(s) already started run to the end)" if breaker.in_flight_at_stop else ""))
         return rec
 
+    first = {}
+    for s in specs:
+        first.setdefault(s["arm"], s)
+    canaries = list(first.values()) if canary else []
+    rest = [s for s in specs if not any(s is x for x in canaries)]
     try:
+        if canaries:
+            log(f"canary: 1 trial per arm first ({len(canaries)}); the run stops if one shows a denial or a harness error")
+        for s in canaries:
+            work(s, is_canary=True)
         with ThreadPoolExecutor(max_workers=jobs) as ex:
-            list(ex.map(work, specs))
+            list(ex.map(work, rest))
     finally:
         os.chmod(ws_root, 0o700)
         if not keep_ws:
@@ -484,6 +568,8 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         "truncated_output": sum(bool(r.get("truncated_output")) for r in results),
         "claude_code_versions_seen": sorted({r["claude_code_version"] for r in results if r.get("claude_code_version")}),
         "compare": suite.compare, "judge_model": suite.judge_model, "judge_version": judge.JUDGE_VERSION, "votes": suite.votes,
+        "grading_version": checks.GRADING_VERSION, "stopped": breaker.reason, "canary": bool(canaries),
+        "stop_after_denials": stop_after_denials, "stopped_in_flight": breaker.in_flight_at_stop,
         "auth_mode": auth_mode(), "seed": seed, "manifest": manifest,
         "index": {k: v for k, v in index.items() if k != "checkout"},
         "families": {c.id: c.family for c in suite.cases if c.id in case_ids},
@@ -492,12 +578,13 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         "estimate": est, "limits": suite.limits, "notes": suite.notes,
         "find_all_pass": suite.find_all_pass, "sensitivity": suite.sensitivity,
         "permission_denied_trials": sorted(r["trial_id"] for r in results if r.get("permission_denied")),
-        "grader_exceptions": sorted(r["trial_id"] for r in results if r.get("grader_exception")), "limitations": report.LIMITS + suite.notes,
+        "grader_exceptions": sorted(r["trial_id"] for r in results if r.get("grader_exception")),
+        "runner_exceptions": sorted(r["trial_id"] for r in results if r.get("runner_exception")), "limitations": report.LIMITS + suite.notes,
         "cases": {c.id: {"kind": c.kind, "prompt": c.prompt, "family": c.family} for c in suite.cases if c.id in case_ids},
-        "counts": {"expected": len(specs), "attempted": sum(r["outcome"] != "skipped_budget" for r in results),
-                   "scored": sum(r["outcome"] in SCORED for r in results),
-                   "excluded": {o: sum(r["outcome"] == o for r in results) for o in EXCLUDED}},
+        "counts": run_counts(results, len(specs)),
         "spent_usd": round(budget.spent, 4),
+        "cost_unknown_attempts": sum(r["metrics"].get("cost_unknown_attempts", 0) for r in results)
+        + sum(v.get("cost_unknown_attempts", 0) for r in results for v in r.get("votes") or []),
         "isolation": {"all_ok": all(r.get("isolation_ok", True) for r in results),
                       "skills_visible_in_none": sorted({s for r in results if r["arm"] == "none" for s in (r.get("visible", {}).get("skills") or [])}),
                       "hook_events_total": sum(r.get("hook_events", 0) for r in results),
@@ -506,6 +593,12 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
     data = {"meta": meta, "aggregate": agg, "trials": results}
     (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
     return data
+
+
+def run_counts(results: list[dict], expected: int) -> dict:
+    return {"expected": expected, "attempted": sum(not r["outcome"].startswith("skipped") for r in results),
+            "scored": sum(r["outcome"] in SCORED for r in results),
+            "excluded": {o: sum(r["outcome"] == o for r in results) for o in EXCLUDED}}
 
 
 def repo_instructions(suite) -> dict:

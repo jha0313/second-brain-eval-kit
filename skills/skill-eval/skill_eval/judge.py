@@ -11,12 +11,13 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .checks import citations
+from .checks import resolved_citations
 from .isolation import TrialEnv, claude_cmd, trial_settings
 from .suite import load_sources
 from .trajectory import model_tokens
 
-JUDGE_VERSION = "judge-v3"   # v3: why cases get the key's facts/forbidden as a judge-only reference
+JUDGE_VERSION = "judge-v4"   # v3: why cases get the key's facts/forbidden as a judge-only reference
+                             # v4: excerpts follow the grading-v2 resolver (shortened paths, ambiguous names, bad ranges)
 SCHEMA = {
     "type": "object",
     "properties": {"items": {"type": "array", "items": {
@@ -59,11 +60,15 @@ def excerpt(repo: Path, commit: str, cite: dict, before: int = 2, after: int = 8
     if "commit" in cite:
         r = git("show", "--stat", "--date=short", "--format=commit %H%nDate: %ad%n%n%s%n%n%b", f"{cite['commit']}^{{commit}}")
         return "\n".join(r.stdout.splitlines()[:cap]) if r.returncode == 0 else "(no such commit)"
+    if cite.get("ambiguous"):
+        return f"(ambiguous: {cite['ambiguous']} files at this commit end with this path)"
     r = git("show", f"{commit}:{cite['path']}")
     if r.returncode != 0:
         return "(no such file at this commit)"
     lines = r.stdout.splitlines()
     a, b = cite["lines"] or (1, 1)
+    if not (1 <= a <= b <= max(1, len(lines))):
+        return f"(cited lines {a}-{b} are outside the file, which has {len(lines)} lines)"
     lo, hi = max(1, a - before), min(len(lines), max(b, a) + after, max(1, a - before) + cap - 1)
     return "\n".join(f"{i:>5}  {lines[i - 1]}" for i in range(lo, hi + 1)) or "(empty)"
 
@@ -72,8 +77,9 @@ def _excerpts(case, traj, repo, commit, max_cites: int = 10, budget: int = 24000
     if repo is None or not any("cites_exist" in chk or "sources_hit" in chk for chk in case.hard):
         return ""
     blocks, used = [], 0
-    for c in citations(traj["final"] or "")[:max_cites]:
-        label = c.get("commit") or c["path"] + (f":{c['lines'][0]}-{c['lines'][1]}" if c["lines"] else "")
+    for c in resolved_citations(traj["final"] or "", repo, commit)[:max_cites]:
+        label = c.get("commit") or (c["as_written"] + " → " if c.get("as_written") else "") + c["path"] + (
+            f":{c['lines'][0]}-{c['lines'][1]}" if c["lines"] else "")
         text = f"--- {label}\n{excerpt(repo, commit, c)[:3000]}"
         if used + len(text) > budget:
             break
@@ -106,21 +112,41 @@ def one_vote(prompt: str, model: str, ids: list[str], timeout_s: int = 300) -> d
     settings = trial_settings(None, [])
     cmd = claude_cmd(prompt, model=model, settings=settings, tools="", max_turns=3, max_usd=1.0, output="json")
     cmd += ["--json-schema", json.dumps(SCHEMA)]
+    cost, unknown, tokens = 0.0, 0, {}           # every attempt is paid for and uses tokens, not only the one that worked
     for attempt in range(2):                     # grader_error: re-run the grader, never the agent
         with tempfile.TemporaryDirectory(prefix="skill-eval-judge-") as d, TrialEnv() as env:
-            p = subprocess.run(cmd, cwd=d, env=env, stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True, timeout=timeout_s)
+            p = _call(cmd, d, env, timeout_s)
+        out = None
         try:
             out = json.loads(p.stdout)
+            cost += float(out.get("total_cost_usd") or 0)
+            for m, t in model_tokens(out.get("modelUsage")).items():
+                row = tokens.setdefault(m, {})
+                for k, n in t.items():
+                    row[k] = row.get(k, 0) + n
             data = out.get("structured_output") or json.loads(out.get("result", ""))
             items = [i for i in data["items"] if i.get("id") in ids and i.get("verdict") in ("PASS", "FAIL")]
-            if {i["id"] for i in items} == set(ids):
-                return {"items": items, "cost_usd": float(out.get("total_cost_usd") or 0), "attempts": attempt + 1,
-                        "models": sorted(out.get("modelUsage") or {}), "tokens_by_model": model_tokens(out.get("modelUsage"))}
-        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
-            pass
+            if len(items) == len(ids) and {i["id"] for i in items} == set(ids):
+                return {"items": items, "cost_usd": cost, "cost_unknown_attempts": unknown, "attempts": attempt + 1,
+                        "models": sorted(tokens), "tokens_by_model": tokens}
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError, ValueError):
+            unknown += not isinstance(out, dict)
     return {"items": [{"id": i, "verdict": "FAIL", "reason": "grader_error: invalid judge output"} for i in ids],
-            "cost_usd": 0.0, "grader_error": True, "attempts": 2}
+            "cost_usd": cost, "cost_unknown_attempts": unknown, "grader_error": True, "attempts": 2, "tokens_by_model": tokens}
+
+
+def _call(cmd, cwd, env, timeout_s):
+    try:
+        return subprocess.run(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, -9, "", "timeout")
+
+
+def usable_votes(votes: list[dict], needed: int) -> list[dict] | None:
+    """Votes without grader_error, or None if fewer than `needed` are left. A broken judge is the harness's
+    failure: those votes must not count as FAIL items, and too few good votes exclude the trial (infra), never score it 0."""
+    good = [v for v in votes if not v.get("grader_error")]
+    return good if len(good) >= needed else None
 
 
 def judge(case, traj: dict, model: str, votes: int = 3, repo: Path | None = None, commit: str = "") -> list[dict]:

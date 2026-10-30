@@ -14,7 +14,9 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .checks import GRADING_VERSION
 from .isolation import BUNDLED_SKILLS
+from .judge import JUDGE_VERSION
 
 CODE = ("checks.py", "judge.py", "suite.py", "stats.py", "runner.py", "isolation.py", "extract.py")
 WHY_PASS = ("why: hard gates = cites_exist (at least 1 citation, every cited path/line/commit exists at the commit) and "
@@ -27,7 +29,13 @@ STOP_RULE = ("Pre-registered: run every frozen case for every arm k times, once.
              "seeing results. Infra errors are retried up to 2 times, then excluded and counted. Trials that name a "
              "denied path are invalid and counted. The v1 vs v2 primary metric is the find-all mean score difference "
              "(v2-edit-plan.md); none vs v1 is reported for all cases and per kind. The main result uses every case; the "
-             "same comparisons without rules.sensitivity.exclude are reported next to it. CIs are exploratory.")
+             "same comparisons without rules.sensitivity.exclude are reported next to it. CIs are exploratory. "
+             "Early stop: each arm runs one canary trial first (unless --no-canary; meta.canary); a canary with a permission denial or an infra, "
+             "isolation, grader or runner error stops the run. After the canaries, a grader or runner exception or an "
+             "isolation error stops the run at once, "
+             "and N trials with permission denials stop it (--stop-after-denials, default 3; results.json "
+             "meta.stop_after_denials). Trials already started run to the end (meta.stopped_in_flight); trials not "
+             "started after a stop are skipped_stopped, excluded and counted.")
 
 
 def _sha(p: Path) -> str:
@@ -61,6 +69,7 @@ def manifest(suite) -> dict:
         "skills": {a: {"SKILL.md": _sha(p / "SKILL.md"), "tree": _tree(p, suite.skill_exclude)}
                    for a, p in suite.arms.items() if p},
         "grading_code": {f: _sha(here / f) for f in CODE},
+        "grading_version": GRADING_VERSION, "judge_version": JUDGE_VERSION,
         "rules": {"model": suite.model, "effort": suite.effort, "tools": suite.tools, "limits": suite.limits,
                   "judge_model": suite.judge_model, "votes": suite.votes, "k": suite.k,
                   "pass_threshold": suite.pass_threshold, "compare": suite.compare, "strip": suite.strip,
@@ -112,5 +121,6 @@ def verify(suite) -> tuple[dict | None, list[str]]:
     frozen = json.loads(path.read_text())
     now = manifest(suite)
     diffs = [k for k in now if json.dumps(now[k], sort_keys=True) != json.dumps(frozen.get(k), sort_keys=True)]
-    summary = {"frozen_at": frozen["frozen_at"], "sha256": _sha(path), "changes_after_first": len(frozen.get("history", []))}
+    summary = {"frozen_at": frozen["frozen_at"], "sha256": _sha(path), "changes_after_first": len(frozen.get("history", [])),
+               "grading_version": frozen.get("grading_version", "grading-v1")}
     return summary, diffs
