@@ -144,11 +144,11 @@ function cite(ch) {
 // What a citation's text names that an agent might cite in turn: SHA-shaped strings (a build or deploy ID is
 // not a commit) and file names (a file the text names may be gone). Display only: ranking never looks at it.
 const SHA_RE = /(?<![\w-])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?!\w)/g;
-const FILE_RE = /(?<![\w@./-])(?:\.\/|\/)?((?:[\w@.-]+\/)*[\w@-][\w@.-]*\.(?:tsx?|jsx?|mjs|cjs|mdx?|json|ya?ml|sql|py|sh|css|scss|html|toml))(?![\w/-])/g;
+const FILE_RE = /(?<![\w@./[\]-])(?:\.\/|\/)?((?:[\w@.[\]-]+\/)*[\w@-][\w@.-]*\.(?:tsx?|jsx?|mjs|cjs|mdx?|json|ya?ml|sql|py|sh|css|scss|html|toml))(?!\.?[\w/(-])/g;   // not res.json(), not a.test.ts.snap
 function mentions(ch) {
   const text = `${ch.title ?? ''}\n${ch.body ?? ''}`.replace(/\bhttps?:\/\/\S+/g, '');
   return { shas: [...new Set(text.match(SHA_RE) || [])],
-    files: [...new Set([...text.matchAll(FILE_RE)].map((m) => m[1]))] };
+    files: [...new Set([...text.matchAll(FILE_RE)].map((m) => m[1]))].filter((f) => !/^[A-Z]\w*\.js$/.test(f)) };   // Next.js, Node.js: names, not files
 }
 
 // marks each citation with the SHAs that are not commits and the files that are not in the checkout's tree

@@ -91,7 +91,7 @@ const text = (...args) => sh(brain, args, { BRAIN_DB: db, NO_COLOR: '1' });
 check('why marks a SHA-shaped build ID and a file that is not in the tree (display only)', () => {
   const ch = w.citations.find((c) => c.source === 'change');
   assert.deepEqual(ch.notCommits, ['4e5f6a7b']);
-  assert.deepEqual(ch.notInTree, ['src/lib/legacy-credits.ts']);
+  assert.deepEqual(ch.notInTree, ['src/lib/legacy-credits.ts', 'app/api/run/[id]/route.ts']);   // whole, [param] included
   assert.deepEqual(w.citations.find((c) => c.source === 'doc').notInTree, []);       // src/lib/credits.ts exists
   const t = text('why', 'why does reserve throw InsufficientCredits instead of returning false?');
   assert.match(t, /4e5f6a7b \(not a commit\)/);
