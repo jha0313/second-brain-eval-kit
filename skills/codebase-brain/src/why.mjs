@@ -2,6 +2,7 @@
 // No LLM call. The agent reads the cited lines and does the reasoning.
 import { resolveTarget } from './query.mjs';
 import { git } from './files.mjs';
+import { MAX_NAME_OWNERS } from './index-knowledge.mjs';
 
 const STOP = new Set(('a an the is are was were be been do does did why how what when where which who whom whose this that these those ' +
   'it its of in on at to for from by with without and or not no yes we our you your they their i me my should would could can ' +
@@ -51,7 +52,7 @@ export function why(db, question, { limit = 8, perSource = 3 } = {}) {
   for (const n of t.names) {
     const r = resolveTarget(db, n);
     if (r.node) seeds.push(r.node);
-    else if (r.candidates?.length && r.candidates.length <= 3) seeds.push(...r.candidates);
+    else if (r.candidates?.length && r.candidates.length <= MAX_NAME_OWNERS) seeds.push(...r.candidates);
   }
   if (seeds.length) {
     const ids = new Set(seeds.flatMap((s) => [s.id, ...(s.kind !== 'file' && s.path ? [fileNode(db, s.path)?.id] : [])]).filter(Boolean));

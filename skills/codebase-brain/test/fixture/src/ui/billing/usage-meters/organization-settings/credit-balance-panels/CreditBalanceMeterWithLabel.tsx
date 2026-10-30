@@ -4,3 +4,4 @@ import { Meter } from '@/ui/Meter';
 export function CreditBalanceMeterWithLabel({ value }: { value: number }) {
   return <label>credits <Meter value={value} /> <Meter value={value * 2} /></label>;
 }
+export const displayName = 'CreditBalanceMeterWithLabel';

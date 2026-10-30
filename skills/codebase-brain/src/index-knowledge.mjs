@@ -10,6 +10,10 @@ const PR_RE = /(?<![\w/#])#(\d{2,6})\b/g;
 const PATH_RE = /(?<![\w/.-])(?:@\/)?((?:[\w.-]+\/)+(?:[\w.-]*\w)?)(?!\w)/g;   // a/b/c.ts, services/billing/, @/lib/x
 const PATH_TRIES = ['', '.ts', '.tsx', '/index.ts', '/index.tsx', '.mjs', '.js'];
 const IDENT_RE = /\b([A-Za-z_][A-Za-z0-9_]*[a-z0-9][A-Z][A-Za-z0-9_]*|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|[A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g;
+// A name in a doc links to its exported symbols only if 1–3 of them have it. With more (a `displayName` in every
+// component, a `handler` in every route) the name says nothing about which one the text means, and linking all
+// of them would point `why` at unrelated code. Skipped names are counted (brain status) so the cut is visible.
+export const MAX_NAME_OWNERS = 3;
 const MAX_LINES = 40;
 const BULK_FILES = 300;
 
@@ -18,12 +22,13 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const insLink = db.prepare('INSERT INTO links(chunk, node, kind, evidence) VALUES (?, ?, ?, ?)');
   const nodeByKey = db.prepare('SELECT id FROM nodes WHERE key = ?');
-  const symbolsByName = db.prepare(`SELECT id FROM nodes WHERE name = ? AND kind != 'file' AND exported = 1 LIMIT 4`);
+  const symbolsByName = db.prepare(`SELECT id FROM nodes WHERE name = ? AND kind != 'file' AND exported = 1 LIMIT ${MAX_NAME_OWNERS + 1}`);
   const insDir = db.prepare(`INSERT OR IGNORE INTO nodes(key, kind, name, path, lang) VALUES (?, 'dir', ?, ?, 'dir')`);
   const known = new Set(tracked);
   const dirs = new Set(tracked.flatMap((p) => p.split('/').slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join('/'))));
   const byBase = new Map();
   for (const p of tracked) { const b = p.split('/').pop(); byBase.set(b, byBase.has(b) ? null : p); }   // null = ambiguous
+  const tooCommon = new Set();
   const stats = { docs: 0, changes: 0, changelog: 0, commits: 0, bulkCommits: 0, vault: 0, vaultSkippedNewer: 0, chunks: 0,
     links: { 'mentions-path': 0, 'mentions-symbol': 0, 'area-doc': 0, touches: 0 } };
 
@@ -52,7 +57,8 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
       if (seen.has(name) || name.length < 6) continue;
       seen.add(name);
       const hits = symbolsByName.all(name);
-      if (hits.length && hits.length <= 3) for (const h of hits) link(chunk, h.id, 'mentions-symbol', name);
+      if (hits.length > MAX_NAME_OWNERS) tooCommon.add(name);
+      else for (const h of hits) link(chunk, h.id, 'mentions-symbol', name);
     }
   };
 
@@ -117,6 +123,7 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
 
   db.exec(`INSERT INTO chunks_fts(rowid, title, body) SELECT id, title, body FROM chunks`);
   db.exec(`INSERT INTO chunks_tri(rowid, title, body) SELECT id, title, body FROM chunks`);
+  stats.unlinkedNames = { count: tooCommon.size, examples: [...tooCommon].sort().slice(0, 5) };
   return stats;
 }
 

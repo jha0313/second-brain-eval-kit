@@ -97,6 +97,11 @@ check('why marks a SHA-shaped build ID and a file that is not in the tree (displ
   assert.match(t, /4e5f6a7b \(not a commit\)/);
   assert.match(t, /src\/lib\/legacy-credits\.ts \(not in the tree\)/);
 });
+check('a name with 4+ exported owners links to none of them, and status counts it', () => {
+  assert.deepEqual(st.stats.knowledge.unlinkedNames, { count: 1, examples: ['displayName'] });
+  assert.ok(st.stats.knowledge.links['mentions-symbol'] > 0);                    // InsufficientCredits: one owner, linked
+  assert.match(text('status'), /1 name with 4\+ exported owners not linked/);
+});
 check('a real commit SHA and a bare file name that exists are not marked', () => {
   const head = sh('git', ['rev-parse', 'HEAD']).trim().slice(0, 8);
   const r = { citations: [{ mentions: { shas: [head, '4e5f6a7b'], files: ['charge.ts', 'lib/credits.ts', 'gone.ts'] } }] };

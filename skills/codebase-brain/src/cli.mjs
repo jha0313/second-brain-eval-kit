@@ -7,6 +7,7 @@ import { build } from './build.mjs';
 import { openDb, defaultDbPath, getMeta } from './db.mjs';
 import { resolveTarget, find, refs, impact, deps, shared, freshness, freshnessOf, coverageFor } from './query.mjs';
 import { why, markMentions } from './why.mjs';
+import { MAX_NAME_OWNERS } from './index-knowledge.mjs';
 import { viz } from './viz.mjs';
 import { table, c, cut, cutLeft, plural, width, COLS } from './fmt.mjs';
 
@@ -145,7 +146,8 @@ const cmds = {
       ['head', f.head ? `@${f.head.slice(0, 8)} · ${plural(f.changed.length, 'file')} changed since the index` : 'unknown (not a git repo?)'],
       ['map', `${plural(counts.file || 0, 'code file')} · ${plural(Object.entries(counts).filter(([k]) => !['file', 'dir', 'doc'].includes(k)).reduce((a, [, n]) => a + n, 0), 'symbol')} · ${plural(edges, 'edge')}`],
       ['programs', s.ts ? `${plural(s.ts.programs, 'TS program')} · ${s.ts.configs.map((x) => `${x.config} ${x.files.toLocaleString('en-US')} files`).join(' · ')} · ${s.ts.orphans} in no tsconfig (nearest config's options; list: --json orphanFiles) · typescript ${s.ts.version}` : '—'],
-      ['memory', `${plural(counts.doc || 0, 'markdown file')} → ${Object.entries(chunks).map(([k, n]) => `${k} ${n}`).join(' · ')} chunks`],
+      ['memory', `${plural(counts.doc || 0, 'markdown file')} → ${Object.entries(chunks).map(([k, n]) => `${k} ${n}`).join(' · ')} chunks`
+        + (s.knowledge?.unlinkedNames?.count ? ` · ${plural(s.knowledge.unlinkedNames.count, 'name')} with ${MAX_NAME_OWNERS + 1}+ exported owners not linked (${s.knowledge.unlinkedNames.examples.join(', ')}${s.knowledge.unlinkedNames.count > 5 ? ', …' : ''})` : '')],
       ['coverage', `${plural(m.coverage.unresolvedLocal, 'unresolved local import')}${s.ts ? ` · ${s.ts.unresolvedBuildOutput ?? 0} into build output (ignored) · ${s.ts.assetImports} asset imports (css/svg, not tracked) · ${s.ts.externalImports} package imports` : ''}`],
     ]));
     if (f.changed.length) out(c.yellow(`\n  ${plural(f.changed.length, 'file')} changed since the index: ${f.changed.slice(0, 8).join(', ')}${f.changed.length > 8 ? ', …' : ''}`));
