@@ -5,9 +5,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fakes import fake_run, make_case, make_rec, make_suite, tiny_suite
+from fakes import fake_run, make_case, make_rec, make_suite, stored_run, tiny_suite
 
-from skill_eval import cli, judge, runner, stats
+from skill_eval import cli, judge, report, runner, stats
 from skill_eval import freeze as freeze_mod
 from skill_eval.suite import load_suite
 
@@ -160,3 +160,29 @@ def test_a_worker_waiting_for_budget_does_not_start_after_the_stop(monkeypatch, 
                            stop_after_denials=1, max_usd=1.5, per_trial_usd=1.0)
     assert len(calls) == 1, [f"{c['case'].id}/{c['arm']}" for c in calls]
     assert sum(t["outcome"] == "skipped_stopped" for t in data["trials"]) == 3
+
+
+GOOD = {"items": [{"id": "answers_question", "verdict": "PASS"}], "cost_usd": 0.1, "models": ["judge-m"]}
+BROKEN = {"items": [{"id": "answers_question", "verdict": "FAIL"}], "cost_usd": 0.02, "grader_error": True}
+
+
+def _grade(monkeypatch, run, votes):
+    calls = []
+    monkeypatch.setattr(judge, "judge", lambda *a, **k: calls.append(1) or [dict(v) for v in votes])
+    monkeypatch.setattr(report, "write_reports", lambda d, o: (o / "scorecard.html", ""))
+    assert cli.main(["grade", str(run)]) == 0
+    return json.loads((run / "results.json").read_text()), calls
+
+
+def test_grade_recovers_a_trial_the_judge_failed(monkeypatch, tmp_path, repo):
+    # review r2 #4: a trial excluded because the judge broke is re-graded once the judge works
+    repo.write({"a.ts": "x\n"})
+    run = stored_run(tmp_path / "a", repo, "infra_error", grader_error=True, votes=[BROKEN] * 3,
+                     reason="grader error: 3/3 judge votes invalid")
+    data, calls = _grade(monkeypatch, run, [GOOD] * 3)
+    t = data["trials"][0]
+    assert calls == [1] and (t["outcome"], t["score"]) == ("pass", 1.0) and not t["grader_error"]
+    for i, extra in enumerate(({}, {"runner_exception": True})):      # the agent's infra failure or a runner bug: kept
+        repo.write({f"b{i}.ts": "y\n"})
+        data, calls = _grade(monkeypatch, stored_run(tmp_path / f"b{i}", repo, "infra_error", **extra), [GOOD] * 3)
+        assert calls == [] and data["trials"][0]["outcome"] == "infra_error"

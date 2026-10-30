@@ -175,10 +175,16 @@ def cmd_grade(a):
     cases = {c.id: c for c in suite.cases}
     deny = runner.deny_list(suite, out)
     for rec in data["trials"]:
-        if rec["outcome"] not in ("pass", "fail", "safety_violation", "invalid") or rec["case"] not in cases:
-            continue                                   # limits, infra and isolation errors keep their outcome
+        # a trial excluded because the grader failed (bad judge votes, a check that raised) has a sound trajectory and is
+        # graded again; limits, the agent's own infra errors, runner bugs and isolation errors keep their outcome
+        grader_failed = rec["outcome"] == "infra_error" and bool(rec.get("grader_error") or rec.get("grader_exception")) \
+            and not rec.get("runner_exception")
+        path = out / "trials" / rec["trial_id"] / "trajectory.jsonl"
+        if (rec["outcome"] not in ("pass", "fail", "safety_violation", "invalid") and not grader_failed) \
+                or rec["case"] not in cases or not path.exists():
+            continue
         case = cases[rec["case"]]
-        traj = parse_stream(out / "trials" / rec["trial_id"] / "trajectory.jsonl")
+        traj = parse_stream(path)
         traj["ws_state"] = rec.get("ws_state")
         hard = checks.run_hard_checks(case, traj, rec["arm"], suite.repo, suite.commit, deny)
         failed = any(h["gate"] and h["ok"] is False for h in hard)
@@ -191,8 +197,9 @@ def cmd_grade(a):
             rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes)
             continue
         s = checks.score_trial(hard, used, case.pass_threshold)
-        rec.update(hard=hard, votes=votes, outcome=s["outcome"], score=s["score"],
-                   passed=s["passed"], reason=s["reason"], rubric=s.get("rubric"))
+        rec.update(hard=hard, votes=votes, outcome=s["outcome"], score=s["score"], passed=s["passed"], reason=s["reason"],
+                   rubric=s.get("rubric"), grader_error=any(v.get("grader_error") for v in votes or []))
+        rec.pop("grader_exception", None)
         rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes or [])
     arms = list(data["meta"]["arms"])
     data["aggregate"] = stats.aggregate(data["trials"], arms, list(data["meta"]["cases"]), suite.compare, suite.sensitivity)

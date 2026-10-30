@@ -498,7 +498,7 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
                         rec = run_trial(suite, spec, out, ws_root, templates, deny, use_judge, keep_ws)
                     except Exception as e:        # a harness bug in one trial must not hang the budget or lose the run
                         rec = skipped(spec, "infra_error", f"runner exception: {type(e).__name__}: {e}"[:200])
-                        rec["grader_exception"] = True
+                        rec["runner_exception"] = True
                     with lock:                    # before the budget is settled: a worker it wakes sees the stop
                         was = breaker.reason
                         breaker.see(rec, canary=is_canary)
@@ -510,7 +510,7 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
             done[0] += 1
             results.append(rec)
             log(progress_line(done[0], len(specs), rec, time.time() - t0, tty))
-            if rec["outcome"] in ("isolation_error", "invalid", "safety_violation") or rec.get("grader_exception") \
+            if rec["outcome"] in ("isolation_error", "invalid", "safety_violation") or rec.get("grader_exception") or rec.get("runner_exception") \
                     or rec.get("grader_error"):
                 log(f"  !! {rec['outcome']}: {rec['reason']}"[:100])
             if rec.get("permission_denied"):
@@ -563,7 +563,8 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         "estimate": est, "limits": suite.limits, "notes": suite.notes,
         "find_all_pass": suite.find_all_pass, "sensitivity": suite.sensitivity,
         "permission_denied_trials": sorted(r["trial_id"] for r in results if r.get("permission_denied")),
-        "grader_exceptions": sorted(r["trial_id"] for r in results if r.get("grader_exception")), "limitations": report.LIMITS + suite.notes,
+        "grader_exceptions": sorted(r["trial_id"] for r in results if r.get("grader_exception")),
+        "runner_exceptions": sorted(r["trial_id"] for r in results if r.get("runner_exception")), "limitations": report.LIMITS + suite.notes,
         "cases": {c.id: {"kind": c.kind, "prompt": c.prompt, "family": c.family} for c in suite.cases if c.id in case_ids},
         "counts": {"expected": len(specs), "attempted": sum(not r["outcome"].startswith("skipped") for r in results),
                    "scored": sum(r["outcome"] in SCORED for r in results),

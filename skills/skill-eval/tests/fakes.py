@@ -63,3 +63,34 @@ def tiny_suite(tmp_path, repo) -> Path:
     (d / "suite.yaml").write_text(f"name: tiny\nskill: demo\narms: {{none: null}}\nrepo: {{path: {repo.root}, commit: {head}}}\n"
                                   "cases: cases/*.yaml\ncompare: []\n")
     return d / "suite.yaml"
+
+
+WHY_CASE = ("id: W\nkind: why\nprompt: why?\nchecks:\n  hard:\n    - cites_exist: {min: 1}\n"
+            "  rubric:\n    - {id: answers_question, pass: p}\n")
+
+
+def stored_run(tmp_path, repo, outcome, **extra) -> Path:
+    """A finished run on disk: one why trial whose trajectory is clean ("See a.ts:1."), recorded as `outcome`.
+    The repo must already hold a.ts plus at least one uncommitted change (tiny_suite commits it)."""
+    import json
+
+    from skill_eval.checks import GRADING_VERSION
+    from skill_eval.stats import EXCLUDED, SCORED
+    suite_file = tiny_suite(tmp_path, repo)
+    (suite_file.parent / "cases" / "w.yaml").write_text(WHY_CASE)
+    run = tmp_path / "run"
+    t = run / "trials" / "W__none__1"
+    t.mkdir(parents=True)
+    (t / "trajectory.jsonl").write_text(json.dumps({"type": "result", "subtype": "success", "result": "See a.ts:1.",
+                                                    "total_cost_usd": 0.01}) + "\n")
+    rec = {"trial_id": "W__none__1", "case": "W", "kind": "why", "family": "W", "arm": "none", "rep": 1, "outcome": outcome,
+           "score": None, "passed": None, "hard": [], "reason": "", "skill_loaded": False, "isolation_ok": True,
+           "ws_state": {"tracked_changes": [], "untracked": [], "head": "", "head_ok": True},
+           "metrics": {"seconds": 1, "agent_usd": 0.01, "judge_usd": 0.0, "tokens": {"output": 1}, "tokens_total": 1,
+                       "tool_calls": 0, "turns": 1}, **extra}
+    counts = {"expected": 1, "attempted": 1, "scored": int(outcome in SCORED),
+              "excluded": {o: int(outcome == o) for o in EXCLUDED}}
+    meta = {"suite_file": str(suite_file), "arms": {"none": None}, "cases": {"W": {"kind": "why"}}, "counts": counts,
+            "grading_version": GRADING_VERSION, "spent_usd": 0.01, "judge_version": "judge-v3", "judge_models_seen": []}
+    (run / "results.json").write_text(json.dumps({"meta": meta, "trials": [rec]}))
+    return run
