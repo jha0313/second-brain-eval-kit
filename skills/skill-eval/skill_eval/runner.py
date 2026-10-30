@@ -555,6 +555,7 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         "claude_code_versions_seen": sorted({r["claude_code_version"] for r in results if r.get("claude_code_version")}),
         "compare": suite.compare, "judge_model": suite.judge_model, "judge_version": judge.JUDGE_VERSION, "votes": suite.votes,
         "grading_version": checks.GRADING_VERSION, "stopped": breaker.reason, "canary": bool(canaries),
+        "stop_after_denials": stop_after_denials,
         "auth_mode": auth_mode(), "seed": seed, "manifest": manifest,
         "index": {k: v for k, v in index.items() if k != "checkout"},
         "families": {c.id: c.family for c in suite.cases if c.id in case_ids},

@@ -29,7 +29,12 @@ STOP_RULE = ("Pre-registered: run every frozen case for every arm k times, once.
              "seeing results. Infra errors are retried up to 2 times, then excluded and counted. Trials that name a "
              "denied path are invalid and counted. The v1 vs v2 primary metric is the find-all mean score difference "
              "(v2-edit-plan.md); none vs v1 is reported for all cases and per kind. The main result uses every case; the "
-             "same comparisons without rules.sensitivity.exclude are reported next to it. CIs are exploratory.")
+             "same comparisons without rules.sensitivity.exclude are reported next to it. CIs are exploratory. "
+             "Early stop: each arm runs one canary trial first (unless --no-canary; meta.canary); a canary with a permission denial or an infra, "
+             "isolation, grader or runner error stops the run. After the canaries, a grader or runner exception or an "
+             "isolation error stops the run at once, "
+             "and N trials with permission denials stop it (--stop-after-denials, default 3; results.json "
+             "meta.stop_after_denials). Trials not started after a stop are skipped_stopped, excluded and counted.")
 
 
 def _sha(p: Path) -> str:

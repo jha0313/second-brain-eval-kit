@@ -52,6 +52,13 @@ def test_denials_after_the_canary_stop_after_n(monkeypatch, tmp_path):
     assert sum(t["outcome"] == "skipped_stopped" for t in data["trials"]) == 12 - len(calls)
 
 
+def test_the_stop_rule_names_the_breaker_and_meta_keeps_its_settings(monkeypatch, tmp_path):
+    # review r2 (optional): the pre-registered stop rule must say when a run stops early, and the run records the setting
+    assert "canary" in freeze_mod.STOP_RULE and "--stop-after-denials" in freeze_mod.STOP_RULE
+    data, _ = fake_run(monkeypatch, tmp_path, [make_case("W0")], lambda spec, n: make_rec(spec), stop_after_denials=2)
+    assert (data["meta"]["stop_after_denials"], data["meta"]["canary"]) == (2, True)
+
+
 def test_runner_exception_is_excluded_and_releases_the_budget(monkeypatch, tmp_path):
     cases = [make_case("W1")]
 
