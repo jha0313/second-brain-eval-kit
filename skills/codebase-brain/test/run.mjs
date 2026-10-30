@@ -1,4 +1,4 @@
-// Fixture test: the cases a real repo throws at the TS adapter, in 18 files.
+// Fixture test: the cases a real repo throws at the TS adapter, in 19 files.
 // two tsconfigs with different `paths` · alias imports · a barrel with a renamed re-export · `const X` + `type X`
 // · dynamic import() destructuring · a file in no tsconfig · a generated file · vi.mock · node_modules committed to git · a path over 100 chars
 import { cpSync, mkdtempSync, existsSync, appendFileSync, readFileSync } from 'node:fs';
@@ -135,5 +135,12 @@ check('build --if-stale rebuilds a stale index, and the edit it indexed is no lo
   assert.equal(rebuild().skipped, false);
   assert.equal(q('status').state, 'fresh');
   assert.equal(rebuild().skipped, true);
+});
+check('a file with a Korean name: an edit after each build is "changed", under its real name', () => {
+  appendFileSync(join(repo, 'notes/메모.txt'), '한 줄 더\n');
+  assert.deepEqual(q('status').changed, ['notes/메모.txt']);
+  assert.equal(rebuild().skipped, false);
+  appendFileSync(join(repo, 'notes/메모.txt'), '또 한 줄\n');
+  assert.equal(q('status').state, 'stale');
 });
 console.log(`${n} checks passed (fixture at ${repo})`);

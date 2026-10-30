@@ -25,9 +25,16 @@ export function headCommit(repo) {
 
 // Tracked files with uncommitted edits. The build reads the working tree, so it records their content
 // hashes: an edit the index already holds is not "changed since the index".
+// -z: paths are not quoted (Korean names, spaces). A rename is "R  new\0old\0": both paths changed
 export function dirtyFiles(repo) {
-  return git(repo, ['status', '--porcelain', '--untracked-files=no']).split('\n').filter(Boolean)
-    .map((l) => l.slice(3).replace(/^.* -> /, ''));                // "R  old -> new": the new path
+  const parts = git(repo, ['status', '--porcelain', '-z', '--untracked-files=no']).split('\0');
+  const out = [];
+  for (let i = 0; i < parts.length; i++) {
+    if (!parts[i]) continue;
+    out.push(parts[i].slice(3));
+    if (/[RC]/.test(parts[i].slice(0, 2))) out.push(parts[++i]);
+  }
+  return out;
 }
 
 export function contentHashes(repo, paths) {

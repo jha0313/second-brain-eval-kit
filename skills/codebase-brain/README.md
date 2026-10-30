@@ -65,7 +65,7 @@ brain why "how is IOBuf meant to be used?"     # 문서 1건뿐: 지식 공백
 | find-all 14건 vs 독립 정답 (dependency-cruiser · LanguageService) | 정확히 같은 집합 14/14 · 2,215개 항목 recall 1.000 · precision 1.000 (grep 한 번: 3/13 · 0.64 / 0.75) |
 | 무작위 심볼 60개 표본 | recall 0.993 · precision 1.000 |
 | why 9건 (git log/grep으로 만든 정답) | hit@3 9/9 · recall@8 0.97 · 인용 71/71 유효 |
-| fixture 테스트 (`npm test`) | 27/27: tsconfig 2개·alias·barrel 재export·동적 import 구조분해·생성 파일·vi.mock·커밋된 node_modules·긴 경로·freshness·why 인용 표시·route 안내 |
+| fixture 테스트 (`npm test`) | 28/28: tsconfig 2개·alias·barrel 재export·동적 import 구조분해·생성 파일·vi.mock·커밋된 node_modules·긴 경로·freshness(한글 파일 이름 포함)·why 인용 표시·route 안내 |
 
 측정에 쓴 케이스·정답·세부 기록은 비공개 repo의 내용이라 이 공개본에 넣지 않았습니다.
 
@@ -89,5 +89,5 @@ src/index-knowledge.mjs   문서·CHANGELOG·changes/·git log·vault → FTS5 +
 src/query.mjs             find · refs · impact(역방향 BFS) · deps · shared · freshness
 src/why.mjs               하이브리드 검색 → RRF → 1 hop → 인용
 src/viz.mjs               2-hop 레이아웃(노드 측에서 계산) + HTML
-test/                     fixture repo + 검사 27개
+test/                     fixture repo + 검사 28개
 ```
