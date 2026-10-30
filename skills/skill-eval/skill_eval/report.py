@@ -169,7 +169,7 @@ def terminal(data: dict, color: bool = False, per_case: bool = False) -> str:
     retried = [a for a in arms if (agg["arms"][a].get("mean_tokens_all_attempts") or 0) > (agg["arms"][a]["mean_tokens"] or 0)]
     if retried:
         lines.append("  tokens incl. retried attempts: " + " · ".join(
-            f"{a} {agg['arms'][a]['mean_tokens_all_attempts']:,.0f}" for a in arms) + " (table: the graded attempt; $ = all attempts)")
+            f"{a} {_f(agg['arms'][a]['mean_tokens_all_attempts'], '{:,.0f}', 'N/A')}" for a in arms) + " (table: the graded attempt; $ = all attempts)")
     mdes = [c for c in agg["comparisons"] if c["subset"] == "all" and c.get("mde_80")]
     if mdes:
         lines.append("  검출력(어림값, 80%): " + " · ".join(f"{c['control']}→{c['treatment']} ±{c['mde_80']:.2f}" for c in mdes)

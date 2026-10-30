@@ -46,3 +46,17 @@ def test_spend_with_unknown_attempt_costs_reads_as_a_lower_bound(monkeypatch, tm
     assert data["meta"]["cost_unknown_attempts"] == 1
     html_path, text = report.write_reports(data, tmp_path / "out")
     assert "≥$" in text and "1 attempt(s) of unknown cost" in text and "≥$" in html_path.read_text()
+
+
+def test_an_arm_with_no_scored_trial_reads_na(monkeypatch, tmp_path):
+    # review r3 #3: none is fully excluded and v1 has retried attempts; the token line must show N/A, not raise
+    def trial(spec, n):
+        if spec["arm"] == "none":
+            return make_rec(spec, outcome="infra_error", score=None)
+        r = make_rec(spec)
+        r["metrics"]["tokens_total_all_attempts"] = 30
+        return r
+    data, _ = fake_run(monkeypatch, tmp_path, [make_case("W0"), make_case("W1")], trial, canary=False)
+    assert data["aggregate"]["arms"]["none"]["mean_tokens_all_attempts"] is None
+    html_path, text = report.write_reports(data, tmp_path / "out")
+    assert "none N/A" in text and "v1 30" in text and html_path.exists()
