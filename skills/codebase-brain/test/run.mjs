@@ -1,7 +1,7 @@
 // Fixture test: the cases a real repo throws at the TS adapter, in 18 files.
 // two tsconfigs with different `paths` · alias imports · a barrel with a renamed re-export · `const X` + `type X`
 // · dynamic import() destructuring · a file in no tsconfig · a generated file · vi.mock · node_modules committed to git · a path over 100 chars
-import { cpSync, mkdtempSync, existsSync, appendFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, existsSync, appendFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -107,6 +107,13 @@ check('a real commit SHA and a bare file name that exists are not marked', () =>
   const r = { citations: [{ mentions: { shas: [head, '4e5f6a7b'], files: ['charge.ts', 'lib/credits.ts', 'gone.ts'] } }] };
   markMentions(repo, r);
   assert.deepEqual([r.citations[0].notCommits, r.citations[0].notInTree], [['4e5f6a7b'], ['gone.ts']]);
+});
+check('SKILL.md: description fits 1,024 chars, routes Korean questions, and names only flags brain has', () => {
+  const skill = readFileSync(join(here, '..', 'SKILL.md'), 'utf8');
+  const desc = skill.match(/^description: (.*)$/m)[1];
+  assert.ok(desc.length <= 1024 && /[가-힣]/.test(desc));
+  const help = sh(brain, ['--help']);
+  for (const flag of new Set(skill.match(/--[a-z][a-z-]+/g))) assert.ok(help.includes(flag), flag);
 });
 check('viz writes one HTML file', () => assert.ok(existsSync(sh(brain, ['viz', 'src/lib/credits.ts', '--out', join(repo, '..', 'v.html')], { BRAIN_DB: db }).trim().replace(/^~(?=\/)/, homedir()))));
 

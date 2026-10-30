@@ -26,7 +26,7 @@ const HELP = `brain — codebase map + memory (prototype)
 
   common: --db F (or BRAIN_DB) · --repo DIR · --json · --limit N · --cursor N
           --filter test,page,route,server-action,client,script,generated · --exclude test
-          --kind call,renders,type,…  · --no-types · --no-mocks · --files (one row per file)`;
+          --kind call,renders,type,…  · --no-types · --no-mocks · --files (one row per file) · --list (every path)`;
 
 // notices show $HOME as ~ (build progress, status header, viz file); query results keep repo-relative paths
 const HOME = homedir();
