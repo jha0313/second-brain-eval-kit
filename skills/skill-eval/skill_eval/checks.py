@@ -5,9 +5,16 @@ import json
 import os
 import re
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 from .suite import load_key, load_sources, normalize_path
+
+# Bump when a check can give a different verdict on the same answer. FROZEN.json and results.json record it, so a
+# suite frozen (or a run graded) under an older version is never re-graded by the new rules without saying so.
+# v1 = seminar-2026-10-31. v2: one citation resolver for cites_exist, sources_hit and the judge (a unique shortened
+# path counts everywhere; "failure.ts" no longer matches job-failure.ts) and line ranges must be 1 <= start <= end <= length.
+GRADING_VERSION = "grading-v2"
 
 # What a failed check means. routing checks are diagnostics for skill arms only (the none arm would fail them by
 # construction), so they never change the score. integrity = the trial touched answer keys: it is thrown out.
@@ -222,49 +229,102 @@ def _git(repo, *a):
     return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
 
 
+# ---- citations: one resolver for cites_exist, sources_hit and the judge's excerpts (grading-v2) ------------------
+
+@lru_cache(maxsize=16)
+def tracked_files(repo, commit: str) -> frozenset[str]:
+    return frozenset(_git(repo, "ls-tree", "-r", "--name-only", commit).stdout.split())
+
+
+@lru_cache(maxsize=16)
+def deleted_files(repo, commit: str) -> frozenset[str]:
+    """Paths deleted somewhere in the history of `commit`: a citation of one is history, not this tree."""
+    out = _git(repo, "log", "--diff-filter=D", "--name-only", "--format=", commit).stdout.split()
+    return frozenset(out) - tracked_files(repo, commit)
+
+
+@lru_cache(maxsize=4096)
+def line_count(repo, commit: str, path: str) -> int:
+    return len(_git(repo, "show", f"{commit}:{path}").stdout.splitlines())
+
+
+def resolve_path(p: str, files) -> list[str]:
+    """Files a cited path can mean: itself, or files it is the tail of ("billing/CLAUDE.md" for
+    services/billing/CLAUDE.md). A bare name also matches a date- or number-prefixed note ("retry-rule.md" for
+    changes/20261001-retry-rule.md), never a longer name ("failure.ts" is not job-failure.ts). One match = resolved;
+    more = ambiguous: it exists, but which file is meant cannot be told."""
+    if p in files:
+        return [p]
+    hits = sorted(t for t in files if t.endswith("/" + p))
+    if not hits and "/" not in p:
+        pre = re.compile(r"\d{6,14}[-_]" + re.escape(p))
+        hits = sorted(t for t in files if pre.fullmatch(t.rsplit("/", 1)[-1]))
+    return hits
+
+
+def _path_cites(answer: str) -> list[tuple[int, dict]]:
+    """(position, {"path", "lines": (start, end) | None}). "a.ts:3-7" is lines 3-7; "a.ts:3:7" is line 3, column 7."""
+    found = []
+    for m in PATH_RE.finditer(answer):
+        rng = re.match(r":(\d+)(?:([-:])(\d+))?", m.group(0)[len(m.group(1)):])
+        lines = None
+        if rng:
+            a = int(rng.group(1))
+            lines = (a, int(rng.group(3)) if rng.group(2) == "-" else a)
+        found.append((m.start(), {"path": normalize_path(clean_match(m.group(1))), "lines": lines}))
+    return found
+
+
+def lines_ok(lines, n: int) -> bool:
+    return lines is None or 1 <= lines[0] <= lines[1] <= n
+
+
 def check_cites_exist(args, traj, repo, commit, **_):
     answer = traj["final"] or ""
     for pat in args.get("ignore", []):            # e.g. 'vault:[^\s)`]+' for notes that live outside the repo
         answer = re.sub(pat, " ", answer)
-    tracked = set(_git(repo, "ls-tree", "-r", "--name-only", commit).stdout.split())
-    paths, bad = [], []
-    for m in PATH_RE.finditer(answer):
-        p = normalize_path(clean_match(m.group(1)))
-        line = re.search(r":(\d+)", m.group(0))
-        # A shortened form of a real file counts ("billing/CLAUDE.md" for services/billing/CLAUDE.md,
-        # "retry-rule.md" for changes/20261001-retry-rule.md). A bare name with no line that matches no file is
-        # code, not a citation (`res.json(...)`); a path with a "/" or a line that matches no file is missing.
-        match = [p] if p in tracked else sorted(t for t in tracked if t.endswith("/" + p)
-                                               or ("/" not in p and t.rsplit("/", 1)[-1].endswith(p)))
+    tracked = tracked_files(repo, commit)
+    paths, bad, labeled = [], [], []
+
+    def miss(text, kind, **extra):
+        bad.append(text)
+        labeled.append({"cite": text, "kind": kind, **extra})
+
+    for _, c in _path_cites(answer):
+        p, lines = c["path"], c["lines"]
+        match = resolve_path(p, tracked)
+        # A bare name with no line that matches no file is code, not a citation (`res.json(...)`);
+        # a path with a "/" or a line that matches no file is missing.
         if not match:
-            if "/" in p or line:
+            if "/" in p or lines:
                 paths.append(p)
-                bad.append(p)
+                miss(p, "deleted_file" if resolve_path(p, deleted_files(repo, commit)) else "no_such_file")
             continue
         paths.append(p)
-        if line:
-            n = max(len(_git(repo, "show", f"{commit}:{t}").stdout.splitlines()) for t in match[:5])
-            if int(line.group(1)) > n:
-                bad.append(f"{p}:{line.group(1)} (file has {n} lines)")
+        if lines:
+            ns = [line_count(repo, commit, t) for t in match[:5]]
+            if not any(lines_ok(lines, n) for n in ns):     # 1 <= start <= end <= file length (an ambiguous name: any match)
+                span = f"{lines[0]}" if lines[0] == lines[1] else f"{lines[0]}-{lines[1]}"
+                miss(f"{p}:{span} (file has {max(ns)} lines)", "bad_line_range")
     shas = set()
     for _, s, claimed in commit_tokens(answer):
         if _git(repo, "cat-file", "-e", f"{s}^{{commit}}").returncode == 0:
             shas.add(s)
         elif claimed:                              # called a commit but is not one: a made-up citation
             shas.add(s)
-            bad.append(f"commit {s}")
+            miss(f"commit {s}", "not_a_commit", in_repo_text=_git(repo, "grep", "-q", "-F", s, commit, "--").returncode == 0)
     n = len(set(paths)) + len(set(shas))
     ok = not bad and n >= args.get("min", 1)
-    return {"ok": ok, "detail": f"{n} citation(s), {len(bad)} missing" + (f": {bad[:3]}" if bad else ""), "n_cites": n, "missing": bad[:10]}
+    kinds: dict[str, int] = {}
+    for x in labeled:
+        kinds[x["kind"]] = kinds.get(x["kind"], 0) + 1
+    return {"ok": ok, "detail": f"{n} citation(s), {len(bad)} missing" + (f": {bad[:3]}" if bad else ""), "n_cites": n,
+            "missing": bad[:10], "missing_kinds": kinds, "missing_labeled": labeled[:10]}
 
 
 def citations(answer: str) -> list[dict]:
-    """Citations in the order they appear: {"path", "lines": (a, b) | None} or {"commit"}."""
-    found = []
-    for m in PATH_RE.finditer(answer):
-        rng = re.match(r":(\d+)(?:[-:](\d+))?", m.group(0)[len(m.group(1)):])
-        lines = (int(rng.group(1)), int(rng.group(2) or rng.group(1))) if rng else None
-        found.append((m.start(), {"path": normalize_path(clean_match(m.group(1))), "lines": lines}))
+    """Citations in the order they appear, as written: {"path", "lines": (a, b) | None} or {"commit"}."""
+    found = _path_cites(answer)
     for pos, sha, _ in commit_tokens(answer):
         found.append((pos, {"commit": sha}))
     out, seen = [], set()
@@ -276,21 +336,39 @@ def citations(answer: str) -> list[dict]:
     return out
 
 
+def resolved_citations(answer: str, repo, commit: str) -> list[dict]:
+    """citations() with each path resolved at the commit: a unique match becomes the full path ("as_written" keeps the
+    original); an ambiguous one keeps its text and gets "ambiguous": the number of files it could mean."""
+    files = tracked_files(repo, commit)
+    out = []
+    for c in citations(answer):
+        if "path" in c:
+            match = resolve_path(c["path"], files)
+            if len(match) == 1 and match[0] != c["path"]:
+                c = {**c, "path": match[0], "as_written": c["path"]}
+            elif len(match) > 1:
+                c = {**c, "ambiguous": len(match)}
+        out.append(c)
+    return out
+
+
 def _hits(src: dict, cite: dict) -> bool:
     if "commit" in src:
         return "commit" in cite and (cite["commit"].startswith(src["commit"][:7]) or src["commit"].startswith(cite["commit"]))
-    if cite.get("path") != src["path"]:
+    if cite.get("path") != src["path"] or cite.get("ambiguous"):
         return False
     if not src.get("lines"):
         return True
     return cite["lines"] is not None and cite["lines"][0] <= src["lines"][1] and src["lines"][0] <= cite["lines"][1]
 
 
-def check_sources_hit(args, traj, **_):
+def check_sources_hit(args, traj, repo=None, commit=None, **_):
     """why: does the answer cite at least `min` of the answer-key sources? A source with a line range needs an
-    overlapping cited range. hit@3 (a source among the first 3 citations) and recall are reported, not gated."""
+    overlapping cited range. Cited paths are resolved at the commit like cites_exist does (a unique shortened path
+    counts; an ambiguous one does not). hit@3 (a source among the first 3 citations) and recall are reported, not gated."""
     srcs = load_sources(args["key"])
-    cites = citations(traj["final"] or "")
+    final = traj["final"] or ""
+    cites = resolved_citations(final, repo, commit) if repo is not None and commit else citations(final)
     hit = [s for s in srcs if any(_hits(s, c) for c in cites)]
     hit3 = any(_hits(s, c) for s in srcs for c in cites[:3])
     ok = len(hit) >= args.get("min", 1)

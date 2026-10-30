@@ -143,6 +143,10 @@ def cmd_report(a):
 def cmd_grade(a):
     out = Path(a.run_dir).resolve()
     data = json.loads((out / "results.json").read_text())
+    was = data["meta"].get("grading_version", "grading-v1")      # runs before the field existed: seminar-2026-10-31 rules
+    if was != checks.GRADING_VERSION and not a.new_grading:
+        raise SuiteError(f"this run was graded with {was}; re-grading would apply {checks.GRADING_VERSION} rules. "
+                         "Pass --new-grading to do that on purpose (results.json then records both versions).")
     suite = load_suite(os.path.expanduser(data["meta"]["suite_file"]), a.repo)
     cases = {c.id: c for c in suite.cases}
     deny = runner.deny_list(suite, out)
@@ -163,6 +167,9 @@ def cmd_grade(a):
     arms = list(data["meta"]["arms"])
     data["aggregate"] = stats.aggregate(data["trials"], arms, list(data["meta"]["cases"]), suite.compare, suite.sensitivity)
     data["meta"]["regraded"] = datetime.now().isoformat(timespec="seconds")
+    if was != checks.GRADING_VERSION:
+        data["meta"]["graded_first_with"] = data["meta"].get("graded_first_with", was)
+    data["meta"]["grading_version"] = checks.GRADING_VERSION
     (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
     html_path, text = report.write_reports(data, out)
     print(text)
@@ -223,6 +230,7 @@ def main(argv=None):
     g.add_argument("run_dir")
     g.add_argument("--no-judge", action="store_true", help="keep stored judge votes")
     g.add_argument("--repo", help="repo clone (default: repo.path in the suite)")
+    g.add_argument("--new-grading", action="store_true", help="allow re-grading a run graded with an older grading version")
     g.set_defaults(fn=cmd_grade)
     ex = sub.add_parser("extract", help="report-only per-trial extract for one case (pre-registered; not grading)")
     ex.add_argument("run_dir")

@@ -66,6 +66,12 @@ def answers(case, suite) -> list[tuple[str, str, bool]]:
             good = "The reason is described in " + ", ".join(_cite(s) for s in srcs) + "."
             out.append(("cites every key source", good, True))
             out.append(("cites one key source", f"See {_cite(srcs[-1])}.", True))
+            files = checks.tracked_files(suite.repo, suite.commit)
+            for s in srcs:                              # agents shorten paths; a unique tail must still hit (grading-v2)
+                tail = s.get("path", "").rsplit("/", 1)[-1]
+                if "/" in s.get("path", "") and checks.resolve_path(tail, files) == [s["path"]]:
+                    out.append(("cites a key source by file name", f"See {_cite({**s, 'path': tail})}.", True))
+                    break
             out.append(("cites an unrelated real file", "See package.json:1.", False))
             out.append(("cites a made-up file", f"See {_cite(srcs[0])} and lib/made-up-zz.ts:3.", False))
         elif name == "answer_regex" and args.get("source_key"):

@@ -14,7 +14,9 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .checks import GRADING_VERSION
 from .isolation import BUNDLED_SKILLS
+from .judge import JUDGE_VERSION
 
 CODE = ("checks.py", "judge.py", "suite.py", "stats.py", "runner.py", "isolation.py", "extract.py")
 WHY_PASS = ("why: hard gates = cites_exist (at least 1 citation, every cited path/line/commit exists at the commit) and "
@@ -61,6 +63,7 @@ def manifest(suite) -> dict:
         "skills": {a: {"SKILL.md": _sha(p / "SKILL.md"), "tree": _tree(p, suite.skill_exclude)}
                    for a, p in suite.arms.items() if p},
         "grading_code": {f: _sha(here / f) for f in CODE},
+        "grading_version": GRADING_VERSION, "judge_version": JUDGE_VERSION,
         "rules": {"model": suite.model, "effort": suite.effort, "tools": suite.tools, "limits": suite.limits,
                   "judge_model": suite.judge_model, "votes": suite.votes, "k": suite.k,
                   "pass_threshold": suite.pass_threshold, "compare": suite.compare, "strip": suite.strip,
@@ -112,5 +115,6 @@ def verify(suite) -> tuple[dict | None, list[str]]:
     frozen = json.loads(path.read_text())
     now = manifest(suite)
     diffs = [k for k in now if json.dumps(now[k], sort_keys=True) != json.dumps(frozen.get(k), sort_keys=True)]
-    summary = {"frozen_at": frozen["frozen_at"], "sha256": _sha(path), "changes_after_first": len(frozen.get("history", []))}
+    summary = {"frozen_at": frozen["frozen_at"], "sha256": _sha(path), "changes_after_first": len(frozen.get("history", [])),
+               "grading_version": frozen.get("grading_version", "grading-v1")}
     return summary, diffs

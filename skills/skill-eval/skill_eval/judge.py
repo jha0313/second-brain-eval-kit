@@ -11,12 +11,13 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .checks import citations
+from .checks import resolved_citations
 from .isolation import TrialEnv, claude_cmd, trial_settings
 from .suite import load_sources
 from .trajectory import model_tokens
 
-JUDGE_VERSION = "judge-v3"   # v3: why cases get the key's facts/forbidden as a judge-only reference
+JUDGE_VERSION = "judge-v4"   # v3: why cases get the key's facts/forbidden as a judge-only reference
+                             # v4: excerpts follow the grading-v2 resolver (shortened paths, ambiguous names, bad ranges)
 SCHEMA = {
     "type": "object",
     "properties": {"items": {"type": "array", "items": {
@@ -59,11 +60,15 @@ def excerpt(repo: Path, commit: str, cite: dict, before: int = 2, after: int = 8
     if "commit" in cite:
         r = git("show", "--stat", "--date=short", "--format=commit %H%nDate: %ad%n%n%s%n%n%b", f"{cite['commit']}^{{commit}}")
         return "\n".join(r.stdout.splitlines()[:cap]) if r.returncode == 0 else "(no such commit)"
+    if cite.get("ambiguous"):
+        return f"(ambiguous: {cite['ambiguous']} files at this commit end with this path)"
     r = git("show", f"{commit}:{cite['path']}")
     if r.returncode != 0:
         return "(no such file at this commit)"
     lines = r.stdout.splitlines()
     a, b = cite["lines"] or (1, 1)
+    if not (1 <= a <= b <= max(1, len(lines))):
+        return f"(cited lines {a}-{b} are outside the file, which has {len(lines)} lines)"
     lo, hi = max(1, a - before), min(len(lines), max(b, a) + after, max(1, a - before) + cap - 1)
     return "\n".join(f"{i:>5}  {lines[i - 1]}" for i in range(lo, hi + 1)) or "(empty)"
 
@@ -72,8 +77,9 @@ def _excerpts(case, traj, repo, commit, max_cites: int = 10, budget: int = 24000
     if repo is None or not any("cites_exist" in chk or "sources_hit" in chk for chk in case.hard):
         return ""
     blocks, used = [], 0
-    for c in citations(traj["final"] or "")[:max_cites]:
-        label = c.get("commit") or c["path"] + (f":{c['lines'][0]}-{c['lines'][1]}" if c["lines"] else "")
+    for c in resolved_citations(traj["final"] or "", repo, commit)[:max_cites]:
+        label = c.get("commit") or (c["as_written"] + " → " if c.get("as_written") else "") + c["path"] + (
+            f":{c['lines'][0]}-{c['lines'][1]}" if c["lines"] else "")
         text = f"--- {label}\n{excerpt(repo, commit, c)[:3000]}"
         if used + len(text) > budget:
             break
