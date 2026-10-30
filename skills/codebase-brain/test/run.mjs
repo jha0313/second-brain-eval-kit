@@ -1,7 +1,7 @@
 // Fixture test: the cases a real repo throws at the TS adapter, in 17 files.
 // two tsconfigs with different `paths` · alias imports · a barrel with a renamed re-export · `const X` + `type X`
 // · dynamic import() destructuring · a file in no tsconfig · a generated file · vi.mock · node_modules committed to git
-import { cpSync, mkdtempSync, existsSync } from 'node:fs';
+import { cpSync, mkdtempSync, existsSync, appendFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -61,4 +61,25 @@ check('why cites the doc and the change note, with the PR number', () => {
   assert.ok(w.citations.some((c) => c.prs.includes('#12')));
 });
 check('viz writes one HTML file', () => assert.ok(existsSync(sh(brain, ['viz', 'src/lib/credits.ts', '--out', join(repo, '..', 'v.html')], { BRAIN_DB: db }).trim().replace(/^~(?=\/)/, homedir()))));
+
+// freshness: every answer says whether the index still matches the checkout (these checks edit the fixture, so they run last)
+const text = (...args) => sh(brain, args, { BRAIN_DB: db, NO_COLOR: '1' });
+const rebuild = () => JSON.parse(sh(brain, ['build', '.', '--db', db, '--if-stale', '--json']));
+check('JSON answers carry freshness: fresh right after the build', () => {
+  for (const r of [q('impact', 'src/lib/credits.ts'), q('refs', 'src/lib/credits.ts#reserve'), q('why', 'why reserve first?'), q('find', 'reserve')])
+    assert.equal(r.freshness.state, 'fresh');
+});
+check('build --if-stale skips a fresh index', () => assert.equal(rebuild().skipped, true));
+appendFileSync(join(repo, 'src/lib/charge.ts'), '// edited after the build\n');
+check('an uncommitted edit makes JSON and why answers stale', () => {
+  const r = q('why', 'why does reserve throw InsufficientCredits instead of returning false?');
+  assert.equal(r.freshness.state, 'stale');
+  assert.deepEqual(r.freshness.files, ['src/lib/charge.ts']);
+  assert.match(text('why', 'why does reserve throw InsufficientCredits?'), /stale: .*1 file changed since the index/);
+});
+check('build --if-stale rebuilds a stale index, and the edit it indexed is no longer "changed"', () => {
+  assert.equal(rebuild().skipped, false);
+  assert.equal(q('status').state, 'fresh');
+  assert.equal(rebuild().skipped, true);
+});
 console.log(`${n} checks passed (fixture at ${repo})`);

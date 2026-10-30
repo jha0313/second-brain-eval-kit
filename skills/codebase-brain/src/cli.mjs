@@ -1,17 +1,18 @@
 // brain — a map (code graph) and a memory (docs + history) for coding agents.
 import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { build } from './build.mjs';
 import { openDb, defaultDbPath, getMeta } from './db.mjs';
-import { resolveTarget, find, refs, impact, deps, shared, freshness, coverageFor } from './query.mjs';
+import { resolveTarget, find, refs, impact, deps, shared, freshness, freshnessOf, coverageFor } from './query.mjs';
 import { why } from './why.mjs';
 import { viz } from './viz.mjs';
 import { table, c, cut, cutLeft, plural, width, COLS } from './fmt.mjs';
 
 const HELP = `brain — codebase map + memory (prototype)
 
-  brain build <repo> [--db F] [--vault DIR] [--include-root DIR] [--no-knowledge]
+  brain build <repo> [--db F] [--vault DIR] [--include-root DIR] [--no-knowledge] [--if-stale]
   brain status                         index commit, age, files changed since, coverage
   brain find <name|path>               symbols and files → IDs (path#Name)
   brain refs <target>                  every use site (file targets: every importer)
@@ -30,7 +31,7 @@ const HELP = `brain — codebase map + memory (prototype)
 const HOME = homedir();
 const tilde = (p) => (p && HOME && (p === HOME || p.startsWith(HOME + '/')) ? '~' + p.slice(HOME.length) : p);
 
-const BOOL = new Set(['json', 'files', 'no-types', 'no-mocks', 'no-knowledge', 'list', 'open', 'imports', 'help']);
+const BOOL = new Set(['json', 'files', 'no-types', 'no-mocks', 'no-knowledge', 'if-stale', 'list', 'open', 'imports', 'help']);
 
 function parse(argv) {
   const pos = [], opt = { 'include-root': [] };
@@ -79,14 +80,18 @@ function target(db, q, opt) {
   process.exit(2);
 }
 
+// JSON answers carry it as `freshness`; text answers print the stale line only when the checkout moved on
+const fresh = (db) => freshnessOf(freshness(db, checkout));
+function staleNote(f) {
+  if (f.state === 'stale') out(c.yellow(`  stale: HEAD @${f.head.slice(0, 8)}, ${plural(f.changed, 'file')} changed since the index — grep those, or brain build`));
+}
+
 function footer(db, cov, extra = '') {
-  const f = freshness(db, checkout);
+  const f = fresh(db);
   const covText = cov.state === 'complete' ? c.green('complete')
     : cov.state === 'truncated' ? c.yellow('truncated') : c.yellow(`partial (${plural(cov.unresolvedLocal, 'unresolved local import')})`);
   out(c.dim(`  coverage: `) + covText + c.dim(` · index @${f.commit?.slice(0, 8)}${extra}`));
-  if (f.head && (f.head !== f.commit || f.changed.length)) {
-    out(c.yellow(`  stale: HEAD @${f.head.slice(0, 8)}, ${plural(f.changed.length, 'file')} changed since the index — grep those, or brain build`));
-  }
+  staleNote(f);
 }
 
 function describe(n) {
@@ -97,8 +102,17 @@ const cmds = {
   build({ pos, opt }) {
     const repo = resolve(pos[0] || opt.repo || '.');
     const dbPath = opt.db ? resolve(opt.db) : process.env.BRAIN_DB ? resolve(process.env.BRAIN_DB) : defaultDbPath(repo);
+    // --if-stale: keep an index of this repo (same --vault) that still matches the checkout. Vault edits are not tracked
+    if (opt['if-stale'] && existsSync(dbPath)) {
+      const db = openDb(dbPath), f = freshness(db, repo);
+      db.close();
+      if (f.state === 'fresh' && f.meta.repo === repo && f.meta.vault === (opt.vault ?? null)) {
+        console.error(`brain build: index @${f.commit.slice(0, 8)} is fresh — skipped (drop --if-stale to rebuild)`);
+        return opt.json && out(JSON.stringify({ db: dbPath, skipped: true, freshness: freshnessOf(f) }));
+      }
+    }
     const r = build({ repo, dbPath, vault: opt.vault, includeRoots: opt['include-root'], noKnowledge: opt['no-knowledge'], tilde });
-    if (opt.json) out(JSON.stringify({ db: dbPath, ...r }));
+    if (opt.json) out(JSON.stringify({ db: dbPath, skipped: false, ...r }));
   },
 
   status({ opt }) {
@@ -124,7 +138,7 @@ const cmds = {
   find({ pos, opt }) {
     const db = openDb(dbPathFor(opt));
     const r = find(db, pos[0], { limit: +(opt.limit || 20), kind: opt.kind });
-    if (opt.json) return out(JSON.stringify({ ...r, rows: r.rows.map((n) => ({ id: n.key, kind: n.kind, line: n.line, exported: !!n.exported, uses: n.uses })) }));
+    if (opt.json) return out(JSON.stringify({ ...r, freshness: fresh(db), rows: r.rows.map((n) => ({ id: n.key, kind: n.kind, line: n.line, exported: !!n.exported, uses: n.uses })) }));
     // an ID is never cut (it is the next command's argument): one wider than the room goes on its own line under the row
     const head = ['ID', 'KIND', 'USES', 'LINE'];
     const rows = r.rows.map((n) => [n.key, n.kind + (n.exported || ['file', 'dir'].includes(n.kind) ? '' : ' (local)'), n.uses, n.line ?? '']);
@@ -134,6 +148,7 @@ const cmds = {
     rows.forEach((x, i) => { if (long(x[0])) lines[2 + i] += '\n  ' + x[0]; });
     out(lines.join('\n'));
     if (r.truncated) out(c.yellow(`  more matches — narrow the name or add --kind`));
+    staleNote(fresh(db));
   },
 
   refs({ pos, opt }, mode = 'refs') {
@@ -143,7 +158,7 @@ const cmds = {
     const r = refs(db, node, { kinds, filter: list(opt.filter), exclude: list(opt.exclude), includeImports: opt.imports,
       limit: opt.files ? 1e9 : +(opt.limit || 50), cursor: +(opt.cursor || 0) });
     const cov = coverageFor(db, { truncated: r.next !== null });
-    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total: r.total, files: r.files, next: r.next, coverage: cov,
+    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total: r.total, files: r.files, next: r.next, coverage: cov, freshness: fresh(db),
       sites: r.rows.map((x) => ({ kind: x.kind, site: `${x.path}:${x.line}:${x.col}`, in: x.in_kind === 'file' ? null : x.in_name, flags: x.flags || '' })) }));
     const where = node.path && node.kind !== 'file' ? c.dim(`defined ${node.path}:${node.line}`) : '';
     const head = `${mode} ${describe(node)}`;
@@ -177,7 +192,7 @@ const cmds = {
     const hops = r.hops.map((h) => ({ ...h, paths: h.paths.filter(keep) })).map((h) => ({ ...h, files: h.paths.length, tests: h.paths.filter((p) => r.flagsOf.get(p).includes('test')).length })).filter((h) => h.files);
     const total = hops.reduce((a, h) => a + h.files, 0), tests = hops.reduce((a, h) => a + h.tests, 0);
     const cov = coverageFor(db, { truncated: false });
-    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total, tests, coverage: cov,
+    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total, tests, coverage: cov, freshness: fresh(db),
       hops: hops.map((h) => ({ hop: h.hop, files: h.files, tests: h.tests, paths: h.paths })) }));
     const level = node.kind === 'file' || node.kind === 'dir' ? 'file level · import edges' : 'symbol level · use edges';
     out(`impact ${describe(node)}  ${c.dim(level)}${filter ? c.dim(` · only ${filter.join(',')}`) : ''}${exclude ? c.dim(` · without ${exclude.join(',')}`) : ''}`);
@@ -197,7 +212,7 @@ const cmds = {
     const node = target(db, pos[0], opt);
     const r = deps(db, node, { hops: +(opt.hops || 99), noTypes: opt['no-types'] });
     const rows = [...r.hopOf].filter(([, h]) => h > 0).sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]));
-    if (opt.json) return out(JSON.stringify({ target: node.key, total: rows.length, coverage: coverageFor(db, { truncated: false }), files: rows.map(([p, h]) => ({ path: p, hop: h })) }));
+    if (opt.json) return out(JSON.stringify({ target: node.key, total: rows.length, coverage: coverageFor(db, { truncated: false }), freshness: fresh(db), files: rows.map(([p, h]) => ({ path: p, hop: h })) }));
     out(`deps ${describe(node)}: ${plural(rows.length, 'file')} pulled in`);
     if (opt.list) for (const [p, h] of rows) out(`  ${h}\t${p}`);
     else out(table(['HOP', 'FILES'], Object.entries(rows.reduce((a, [, h]) => ({ ...a, [h]: (a[h] || 0) + 1 }), {})), { align: ['l', 'r'] }));
@@ -209,7 +224,7 @@ const cmds = {
     const a = target(db, pos[0], opt), b = target(db, pos[1], opt);
     const r = shared(db, a, b, { noTypes: opt['no-types'] });
     const byTop = r.both.reduce((m, p) => m.set(p.split('/').slice(0, 2).join('/'), (m.get(p.split('/').slice(0, 2).join('/')) || 0) + 1), new Map());
-    if (opt.json) return out(JSON.stringify({ a: a.key, b: b.key, total: r.both.length, coverage: coverageFor(db, { truncated: false }), files: r.both }));
+    if (opt.json) return out(JSON.stringify({ a: a.key, b: b.key, total: r.both.length, coverage: coverageFor(db, { truncated: false }), freshness: fresh(db), files: r.both }));
     out(`shared ${describe(a)} ∩ ${describe(b)}`);
     out(c.dim(`  ${a.path} pulls in ${r.a} files · ${b.path} pulls in ${r.b} · both: `) + c.bold(r.both.length));
     out(table(['AREA', 'FILES'], [...byTop].sort((x, y) => y[1] - x[1]).slice(0, opt.list ? 1e9 : 12), { align: ['l', 'r'] }));
@@ -222,13 +237,13 @@ const cmds = {
     const t0 = performance.now();
     const r = why(db, pos.join(' '), { limit: +(opt.limit || 8) });
     const ms = Math.round(performance.now() - t0);
-    if (opt.json) return out(JSON.stringify({ ...r, ms }));
+    if (opt.json) return out(JSON.stringify({ ...r, ms, freshness: fresh(db) }));
     out(`why ${c.bold(`"${cut(r.question, COLS - 36)}"`)}  ${c.dim(`FAST · no LLM · ${ms} ms`)}`);
     if (r.seeds.length) out(c.dim(`  names → code: ${r.seeds.join(', ')}`));
     if (r.gap) {
       out(c.yellow(`  no doc, change note or commit mentions ${r.terms.names.join(', ') || 'these terms'} — a knowledge gap.`));
       out(c.dim('  read the code itself (the header / the definition), and consider writing the doc'));
-      return;
+      return staleNote(fresh(db));
     }
     // a cite is never cut. Under 120 columns SOURCE and DATE go (the cite's shape says commit / changes/ / doc).
     // A cite wider than 40% of the screen goes on its own line under the row, so TITLE keeps its room
@@ -244,6 +259,7 @@ const cmds = {
     if (r.related.length) out(cut(c.dim('  related code (1 hop): ') + r.related.slice(0, 6).map((x) => `${x.path} ×${x.citations}`).join(' · '), COLS));
     for (const h of r.history.filter((h) => h.commits.length)) out(c.dim(`  history of ${h.seed}: `) + h.commits.map((x) => `${x.sha.slice(0, 8)} ${x.prs.split(' ')[0] || ''}`.trim()).join(' · '));
     out(c.dim('  read the cited lines before you answer; cite path:line or SHA'));
+    staleNote(fresh(db));
   },
 
   viz({ pos, opt }) {

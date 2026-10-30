@@ -2,7 +2,7 @@
 import { resolve } from 'node:path';
 import { statSync } from 'node:fs';
 import { createDb, setMeta, inTransaction } from './db.mjs';
-import { trackedFiles, headCommit, git, TS_EXT, CPP_EXT, PY_EXT } from './files.mjs';
+import { trackedFiles, headCommit, git, dirtyFiles, contentHashes, TS_EXT, CPP_EXT, PY_EXT } from './files.mjs';
 import { loadTypeScript, indexTypeScript } from './index-ts.mjs';
 import { indexGeneric } from './index-generic.mjs';
 import { indexKnowledge } from './index-knowledge.mjs';
@@ -52,6 +52,7 @@ export function build({ repo, dbPath, vault, includeRoots = [], noKnowledge = fa
     setMeta(db, 'built_at', new Date().toISOString());
     setMeta(db, 'tracked_files', tracked.length);
     setMeta(db, 'vault', vault ?? null);
+    if (commit) setMeta(db, 'worktree', contentHashes(repo, dirtyFiles(repo)));
     setMeta(db, 'stats', stats);
     setMeta(db, 'coverage', { unresolvedLocal, programs: stats.ts?.programs ?? 0, orphans: stats.ts?.orphans ?? 0 });
     timings.total = lap(t0);
