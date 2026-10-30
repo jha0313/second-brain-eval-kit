@@ -113,3 +113,16 @@ def test_old_freeze_refuses_new_grading_rules(monkeypatch, tmp_path, repo, capsy
     monkeypatch.setattr(runner, "run", lambda *a, **k: pytest.fail("must not run"))
     assert cli.main(["run", str(suite)]) == 1
     assert "frozen with grading-v1, this harness is grading-v2" in capsys.readouterr().err
+
+
+def test_sources_hit_ignores_citations_with_bad_line_ranges(repo, tmp_path):
+    # review r2 #3: a YAML case may gate on sources_hit alone; an impossible range must not hit the key either
+    _, head = _tree(repo)
+    key = tmp_path / "W.json"
+    key.write_text(json.dumps({"sources": [{"path": "src/lib/credits.ts", "lines": [1, 5]}]}))
+    hit = lambda text: check_sources_hit({"key": str(key)}, {"final": text}, repo=repo.root, commit=head)["ok"]  # noqa: E731
+    assert hit("See credits.ts:3-4.") and hit("See src/lib/credits.ts:5.")
+    for bad in ("credits.ts:3-999999", "credits.ts:5-3", "src/lib/credits.ts:0-2", "src/lib/credits.ts:11"):
+        assert not hit(f"See {bad}."), bad
+    c = checks.resolved_citations("src/lib/credits.ts:5-3", repo.root, head)[0]
+    assert c["bad_range"] is True

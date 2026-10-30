@@ -338,14 +338,16 @@ def citations(answer: str) -> list[dict]:
 
 def resolved_citations(answer: str, repo, commit: str) -> list[dict]:
     """citations() with each path resolved at the commit: a unique match becomes the full path ("as_written" keeps the
-    original); an ambiguous one keeps its text and gets "ambiguous": the number of files it could mean."""
+    original) and gets "bad_range" when its lines are not 1 <= start <= end <= length; an ambiguous one keeps its
+    text and gets "ambiguous": the number of files it could mean."""
     files = tracked_files(repo, commit)
     out = []
     for c in citations(answer):
         if "path" in c:
             match = resolve_path(c["path"], files)
-            if len(match) == 1 and match[0] != c["path"]:
-                c = {**c, "path": match[0], "as_written": c["path"]}
+            if len(match) == 1:
+                c = {**c, "path": match[0], **({"as_written": c["path"]} if match[0] != c["path"] else {}),
+                     "bad_range": not lines_ok(c["lines"], line_count(repo, commit, match[0]))}
             elif len(match) > 1:
                 c = {**c, "ambiguous": len(match)}
         out.append(c)
@@ -355,7 +357,7 @@ def resolved_citations(answer: str, repo, commit: str) -> list[dict]:
 def _hits(src: dict, cite: dict) -> bool:
     if "commit" in src:
         return "commit" in cite and (cite["commit"].startswith(src["commit"][:7]) or src["commit"].startswith(cite["commit"]))
-    if cite.get("path") != src["path"] or cite.get("ambiguous"):
+    if cite.get("path") != src["path"] or cite.get("ambiguous") or cite.get("bad_range"):
         return False
     if not src.get("lines"):
         return True
