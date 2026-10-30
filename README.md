@@ -11,6 +11,7 @@
 
 ```bash
 git clone https://github.com/jha0313/second-brain-eval-kit
+mkdir -p ~/.claude/skills                # 폴더가 없으면 cp가 이름을 바꿔 복사함
 cp -r second-brain-eval-kit/skills/codebase-brain second-brain-eval-kit/skills/skill-eval ~/.claude/skills/
 cd ~/.claude/skills/codebase-brain && npm install      # Node 22.13 이상
 ```
@@ -22,7 +23,8 @@ skill-eval은 Python 3.11 이상과 [uv](https://docs.astral.sh/uv/)가 필요�
 ```bash
 # codebase-brain
 export PATH="$HOME/.claude/skills/codebase-brain/bin:$PATH"
-brain build /path/to/repo                # git repo. 대상 repo에는 아무것도 쓰지 않음
+cd /path/to/repo                         # 쿼리는 지금 있는 git repo의 인덱스를 씀
+brain build . --if-stale                 # 대상 repo에는 아무것도 쓰지 않음. 인덱스가 맞으면 건너뜀
 brain find reserve                       # → ID (path#Name)
 brain impact src/lib/credits.ts#reserve  # 영향받을 수 있는 파일을 hop별로
 brain why "why reserve credits first"    # 문서·changes·커밋 인용 묶음
@@ -32,13 +34,31 @@ brain why "why reserve credits first"    # 문서·changes·커밋 인용 묶음
 SE=~/.claude/skills/skill-eval
 cd $SE && export MY_REPO=/path/to/repo
 uv run --project $SE skill-eval probe --out runs/probe              # 격리 점검 21개 전부 PASS여야 함
+uv run --project $SE skill-eval keycheck suites/my-suite/suite.yaml # 정답표·빈 <…> 자리 점검 ($0)
 uv run --project $SE skill-eval selftest suites/my-suite/suite.yaml # 채점기 점검 ($0)
-uv run --project $SE skill-eval freeze suites/my-suite/suite.yaml
+uv run --project $SE skill-eval freeze suites/my-suite/suite.yaml   # 고정해야 run이 시작함
 uv run --project $SE skill-eval run suites/my-suite/suite.yaml --dry-run
 uv run --project $SE skill-eval run suites/my-suite/suite.yaml -k 3 -j 6 --max-usd 20
 ```
 
 자세한 명령과 규칙은 각 폴더의 README.md·SKILL.md에 있습니다.
+
+## 세미나 버전과 그 뒤 바뀐 것
+
+세미나 화면의 코드와 줄 번호는 태그 [`seminar-2026-10-31`](https://github.com/jha0313/second-brain-eval-kit/tree/seminar-2026-10-31) 기준입니다. main은 세미나 뒤에 고친 버전입니다.
+
+- **codebase-brain:**
+  - 모든 답에 freshness(fresh·stale)를 붙이고, `build --if-stale`을 더했습니다.
+  - why는 커밋이 아닌 SHA와 지금 없는 파일을 표시합니다.
+  - route 파일에는 URL grep 안내를 냅니다.
+  - 출력 버그 3개를 고쳤고, SKILL.md에 한국어 질문 예를 넣었습니다.
+- **skill-eval:**
+  - 채점 버전 grading-v2: 인용 해석 규칙을 하나로 하고, 줄 범위를 검사하고, 실패 사유에 라벨을 붙입니다.
+  - freeze 없이는 run이 시작하지 않습니다. canary와 권한 거부 정지를 넣었고, judge가 고장 나면 0점이 아니라 제외합니다.
+  - 재시도 비용을 모두 더합니다. `keycheck`를 더했고, 보고서에 실패 원인 표와 검출력 한 줄을 넣었습니다.
+- 아래 세미나 숫자는 grading-v1로 잰 값입니다. grading-v2 숫자와 바로 비교할 수 없습니다.
+
+자세한 내용은 각 폴더 README의 "…바뀐 동작" 절에 있습니다.
 
 ## 세미나 결과 요약
 
