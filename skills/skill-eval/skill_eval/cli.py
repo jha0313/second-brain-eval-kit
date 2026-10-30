@@ -105,7 +105,8 @@ def cmd_run(a):
                          "before any result is seen), or pass --dev for a dev run")
     if diffs and not a.unfrozen:
         rules = (f" Grading rules changed: frozen with {frozen['grading_version']}, this harness is {checks.GRADING_VERSION}."
-                 if "grading_version" in diffs or "grading_code" in diffs else "")
+                 if frozen["grading_version"] != checks.GRADING_VERSION else
+                 " The grading code changed since the freeze (same grading version)." if "grading_code" in diffs else "")
         raise SuiteError(f"changed since FROZEN.json ({frozen['frozen_at']}): {diffs}.{rules} Re-freeze with --reason, or --dev for a dev run")
     if a.max_usd is not None and est["total_usd"] > a.max_usd:
         print(f"\nnote: estimate ${est['total_usd']:.2f} is above --max-usd {a.max_usd:.2f}; trials past the cap are skipped.")

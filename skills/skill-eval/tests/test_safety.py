@@ -8,6 +8,7 @@ import pytest
 from fakes import fake_run, make_case, make_rec, make_suite, tiny_suite
 
 from skill_eval import cli, judge, runner, stats
+from skill_eval import freeze as freeze_mod
 from skill_eval.suite import load_suite
 
 
@@ -101,6 +102,7 @@ def test_pass_hat_k_is_na_when_repeats_are_missing():
 
 
 def test_run_needs_a_freeze_unless_dev(monkeypatch, tmp_path, repo, capsys):
+    orig_sha = freeze_mod._sha
     repo.write({"a.ts": "x\n"})
     suite = tiny_suite(tmp_path, repo)
 
@@ -117,6 +119,10 @@ def test_run_needs_a_freeze_unless_dev(monkeypatch, tmp_path, repo, capsys):
         cli.main(["run", str(suite), "--dev"])
     with pytest.raises(Reached):
         cli.main(["run", str(suite), "--unfrozen"])                     # the old name still works
+    assert cli.main(["freeze", str(suite)]) == 0
+    monkeypatch.setattr(freeze_mod, "_sha", lambda p: "changed" if p.name == "runner.py" else orig_sha(p))
+    assert cli.main(["run", str(suite)]) == 1
+    assert "grading code changed since the freeze (same grading version)" in capsys.readouterr().err
 
 
 def test_yaml_sources_hit_key_is_relative_to_the_case_file(tmp_path, repo):
