@@ -176,10 +176,13 @@ def cmd_grade(a):
     deny = runner.deny_list(suite, out)
     regraded, judged, judge_usd, unknown = 0, 0, 0.0, 0
     for rec in data["trials"]:
-        # a trial excluded because the grader failed (bad judge votes, a check that raised) has a sound trajectory and is
-        # graded again; limits, the agent's own infra errors, runner bugs and isolation errors keep their outcome
-        grader_failed = rec["outcome"] == "infra_error" and bool(rec.get("grader_error") or rec.get("grader_exception")) \
-            and not rec.get("runner_exception")
+        # a trial excluded because the grader failed is graded again by the runner's own _grade, with the gates the run
+        # recorded (infra, isolation, answer-key access, limits). Bad judge votes come after every gate passed; a check
+        # that raised came before them, so it needs gate_inputs (runs recorded without them keep the exclusion).
+        # The agent's own infra errors, runner bugs and isolation errors keep their outcome, and so does every grader
+        # failure under --no-judge (the other trials keep their votes; a rubric-less score would not compare).
+        grader_failed = rec["outcome"] == "infra_error" and not rec.get("runner_exception") and not a.no_judge and bool(
+            rec.get("grader_error") or (rec.get("grader_exception") and "gate_inputs" in rec))
         path = out / "trials" / rec["trial_id"] / "trajectory.jsonl"
         if (rec["outcome"] not in ("pass", "fail", "safety_violation", "invalid") and not grader_failed) \
                 or rec["case"] not in cases or not path.exists():
@@ -187,6 +190,17 @@ def cmd_grade(a):
         case = cases[rec["case"]]
         traj = parse_stream(path)
         traj["ws_state"] = rec.get("ws_state")
+        if grader_failed:
+            for k in ("votes", "grader_error", "grader_exception", "rubric"):
+                rec.pop(k, None)
+            g = rec.get("gate_inputs") or {"infra": False, "timed_out": False}
+            runner._grade(rec, suite, case, traj, rec["arm"], deny, not a.no_judge, g["infra"], g["timed_out"])
+            regraded += 1
+            if rec.get("votes"):
+                judged += 1
+                judge_usd += sum(v.get("cost_usd", 0) for v in rec["votes"])
+                unknown += sum(v.get("cost_unknown_attempts", 0) for v in rec["votes"])
+            continue
         hard = checks.run_hard_checks(case, traj, rec["arm"], suite.repo, suite.commit, deny)
         failed = any(h["gate"] and h["ok"] is False for h in hard)
         regraded += 1

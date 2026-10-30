@@ -17,6 +17,9 @@
 - 채점 버전은 `FROZEN.json`과 `results.json`에 적힙니다.
   - 옛 버전으로 고정한 suite는 `run`이 거부합니다.
   - 옛 버전으로 채점된 run은 `grade --new-grading`을 줄 때만 다시 채점합니다.
+- `grade`는 채점기 탓으로 제외된 trial(judge 표가 깨졌거나 체크가 예외를 낸 trial)도 다시 채점합니다.
+  - 실행 때 기록한 게이트(infra·격리·정답 파일 접근·제한)를 runner와 같은 순서로 먼저 적용합니다. 격리가 깨진 trial은 PASS가 되지 않고 `isolation_error`가 됩니다.
+  - 게이트 기록(`gate_inputs`)이 없는 옛 trial과 `--no-judge` 재채점에서는 복구하지 않습니다.
 
 **실행**
 - `FROZEN.json`이 없으면 `run`이 시작하지 않습니다. dev run에만 `--dev`(옛 이름 `--unfrozen`)를 씁니다.

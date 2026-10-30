@@ -224,6 +224,33 @@ def test_grade_recovers_a_trial_the_judge_failed(monkeypatch, tmp_path, repo):
         assert calls == [] and data["trials"][0]["outcome"] == "infra_error"
 
 
+def test_grade_recovery_applies_the_gates_the_run_recorded(monkeypatch, tmp_path, repo):
+    # review r3 #2: a hard check that raised before the gates saved infra_error/grader_exception; once the check works,
+    # re-grading must still apply the run's isolation, infra and limit gates instead of scoring a PASS
+    repo.write({"a.ts": "x\n"})
+    ran = {"infra": False, "timed_out": False}
+    for i, (extra, want) in enumerate((
+            ({"isolation_ok": False, "isolation_detail": "MCP servers visible: ['x']"}, "isolation_error"),
+            ({"gate_inputs": {**ran, "infra": True}}, "infra_error"),
+            ({"gate_inputs": {**ran, "timed_out": True}}, "limit"))):
+        repo.write({f"g{i}.ts": "y\n"})
+        run = stored_run(tmp_path / f"g{i}", repo, "infra_error", grader_exception=True, reason="grader exception: E",
+                         **{"gate_inputs": ran, **extra})
+        data, calls = _grade(monkeypatch, run, [GOOD] * 3)
+        assert (data["trials"][0]["outcome"], calls) == (want, []), extra
+    repo.write({"old.ts": "z\n"})                       # recorded before gate_inputs existed: the exclusion is kept
+    data, calls = _grade(monkeypatch, stored_run(tmp_path / "old", repo, "infra_error", grader_exception=True), [GOOD] * 3)
+    assert calls == [] and data["trials"][0]["outcome"] == "infra_error"
+    repo.write({"ok.ts": "z\n"})                        # clean gates: recovered and judged
+    data, calls = _grade(monkeypatch, stored_run(tmp_path / "ok", repo, "infra_error", grader_exception=True, gate_inputs=ran),
+                         [GOOD] * 3)
+    assert calls == [1] and data["trials"][0]["outcome"] == "pass" and "grader_exception" not in data["trials"][0]
+    repo.write({"nj.ts": "z\n"})                        # --no-judge keeps the other trials' votes: no rubric-less recovery
+    run = stored_run(tmp_path / "nj", repo, "infra_error", grader_exception=True, gate_inputs=ran)
+    assert cli.main(["grade", str(run), "--no-judge"]) == 0
+    assert json.loads((run / "results.json").read_text())["trials"][0]["outcome"] == "infra_error"
+
+
 def test_grade_updates_counts_cost_and_judge_metadata(monkeypatch, tmp_path, repo):
     # review r2 #5: a re-grade that turns a pass into an exclusion must show in meta.counts, and its judge cost in spent_usd
     repo.write({"a.ts": "x\n"})

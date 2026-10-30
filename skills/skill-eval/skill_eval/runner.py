@@ -326,6 +326,7 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
            "models_used": traj["models_used"], "config_files": te.config_keys,
            "truncated_output": checks.truncated_output(traj)}
     rec["isolation_ok"], rec["isolation_detail"] = isolation_ok(traj, arm_skill)
+    rec["gate_inputs"] = {"infra": infra, "timed_out": timed_out}     # what _grade gates on; `grade` re-applies them
     tokens = traj["tokens"]
     # seconds and tokens describe the attempt that was graded; $ is every attempt (an infra attempt with no result
     # line has an unknown cost: counted in cost_unknown_attempts, not assumed 0)
