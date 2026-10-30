@@ -34,7 +34,8 @@ STOP_RULE = ("Pre-registered: run every frozen case for every arm k times, once.
              "isolation, grader or runner error stops the run. After the canaries, a grader or runner exception or an "
              "isolation error stops the run at once, "
              "and N trials with permission denials stop it (--stop-after-denials, default 3; results.json "
-             "meta.stop_after_denials). Trials not started after a stop are skipped_stopped, excluded and counted.")
+             "meta.stop_after_denials). Trials already started run to the end (meta.stopped_in_flight); trials not "
+             "started after a stop are skipped_stopped, excluded and counted.")
 
 
 def _sha(p: Path) -> str:

@@ -26,6 +26,7 @@
   - 권한 거부가 있는 trial이 `--stop-after-denials N`(기본 3, 0이면 멈추지 않음)개가 되면 멈춥니다.
   - 남은 trial은 `skipped_stopped`로 남기고, 멈춘 이유는 `meta.stopped`에 적습니다. `results.json`은 그래도 씁니다.
   - N 값은 `meta.stop_after_denials`에 적힙니다. 이 정지 규칙은 `FROZEN.json`의 `stop_rule`에도 들어갑니다.
+  - trial 시작과 멈춤 결정은 같은 lock 안에서 정합니다. 멈추기 전에 시작한 trial은 끝까지 돌고 `meta.stopped_in_flight`에 적힙니다. 멈춘 뒤에는 새 trial을 시작하지 않습니다.
 - `--no-canary`로 canary를 끌 수 있습니다.
 - 비용은 재시도한 시도까지 모두 더합니다.
   - agent 시도는 `metrics.attempts`에 하나씩 남습니다. 결과 줄이 없는 시도는 $0으로 치지 않고 `cost_unknown_attempts`로 셉니다. 그런 시도가 있으면 보고서 금액은 `≥$X`(확인된 비용 이상)로 나옵니다.

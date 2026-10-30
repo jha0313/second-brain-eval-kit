@@ -222,12 +222,22 @@ class Breaker:
     """Stop a run that is going wrong instead of paying for it: a canary trial per arm must come back clean
     (no permission denial, grader exception, infra or isolation error), and after it a grader exception or
     isolation error stops at once, permission denials after `max_denied` trials (0 = never). Trials not started
-    yet are recorded as skipped_stopped (excluded, counted)."""
+    yet are recorded as skipped_stopped (excluded, counted).
+    The run calls claim() and see() under one lock: a trial starts when it is claimed, no claim succeeds after a
+    stop, and trials claimed before the stop run to the end (listed in in_flight_at_stop)."""
 
     def __init__(self, max_denied: int = 3):
         self.max_denied, self.denied, self.reason = max_denied, 0, None
+        self.running, self.in_flight_at_stop = set(), []
+
+    def claim(self, trial_id: str) -> bool:
+        if self.reason:
+            return False
+        self.running.add(trial_id)
+        return True
 
     def see(self, rec: dict, canary: bool = False) -> None:
+        self.running.discard(rec["trial_id"])
         if self.reason:
             return
         tag = "canary: " if canary else ""
@@ -240,6 +250,8 @@ class Breaker:
         elif rec.get("permission_denied") and (canary or (self.max_denied and self.denied >= self.max_denied)):
             tool = rec["permission_denied"][0].split(" ", 1)[0]              # the tool name only: inputs hold workspace paths
             self.reason = f"{tag}{self.denied} trial(s) with permission denials (last: {tool} in {rec['trial_id']})"
+        if self.reason:
+            self.in_flight_at_stop = sorted(self.running)
 
 
 def ws_state(ws: Path, commit: str) -> dict:
@@ -490,8 +502,8 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         elif not budget.reserve(per_trial_est):   # may wait for running trials; one of them may stop the run meanwhile
             rec = skipped(spec, "skipped_budget", f"--max-usd {max_usd} reached")
         else:
-            with lock:                            # start only if no stop was decided (the breaker decides under this lock)
-                start = not breaker.reason
+            with lock:                            # the start: claimed under the lock the breaker decides a stop under
+                start = breaker.claim(f"{spec['case'].id}__{spec['arm']}__{spec['rep']}")
             try:
                 if start:
                     try:
@@ -516,7 +528,8 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
             if rec.get("permission_denied"):
                 log(f"  !! permission denied ({len(rec['permission_denied'])}): {rec['permission_denied'][0]}"[:100])
             if breaker.reason and was is None and not rec["outcome"].startswith("skipped"):
-                log(f"  !! stopping the run: {breaker.reason}"[:160])
+                log(f"  !! stopping the run: {breaker.reason}"[:160]
+                    + (f" ({len(breaker.in_flight_at_stop)} trial(s) already started run to the end)" if breaker.in_flight_at_stop else ""))
         return rec
 
     first = {}
@@ -555,7 +568,7 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         "claude_code_versions_seen": sorted({r["claude_code_version"] for r in results if r.get("claude_code_version")}),
         "compare": suite.compare, "judge_model": suite.judge_model, "judge_version": judge.JUDGE_VERSION, "votes": suite.votes,
         "grading_version": checks.GRADING_VERSION, "stopped": breaker.reason, "canary": bool(canaries),
-        "stop_after_denials": stop_after_denials,
+        "stop_after_denials": stop_after_denials, "stopped_in_flight": breaker.in_flight_at_stop,
         "auth_mode": auth_mode(), "seed": seed, "manifest": manifest,
         "index": {k: v for k, v in index.items() if k != "checkout"},
         "families": {c.id: c.family for c in suite.cases if c.id in case_ids},

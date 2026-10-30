@@ -169,6 +169,35 @@ def test_a_worker_waiting_for_budget_does_not_start_after_the_stop(monkeypatch, 
     assert sum(t["outcome"] == "skipped_stopped" for t in data["trials"]) == 3
 
 
+def test_a_trial_counts_as_started_when_it_is_claimed_under_the_breaker_lock(monkeypatch, tmp_path):
+    # review r3 #1: a worker can pass the start check, pause, and call the trial after another worker stopped the run.
+    # The order is fixed: a trial starts when it is claimed under the lock the stop is decided under. A trial claimed
+    # before the stop runs to the end and is listed in meta.stopped_in_flight; no trial is claimed after the stop.
+    import threading
+    stop, lock, n = threading.Event(), threading.Lock(), [0]
+    see = runner.Breaker.see
+
+    def see_and_signal(self, rec, canary=False):
+        see(self, rec, canary)
+        if self.reason:
+            stop.set()
+    monkeypatch.setattr(runner.Breaker, "see", see_and_signal)
+
+    def trial(spec, _):
+        with lock:
+            n[0] += 1
+            i = n[0]
+        if i == 1:                                   # claimed, then paused: the call body runs after the stop
+            assert stop.wait(5)
+            return make_rec(spec)
+        return make_rec(spec, permission_denied=["Bash x"])
+    data, calls = fake_run(monkeypatch, tmp_path, [make_case("W0"), make_case("W1")], trial, canary=False,
+                           stop_after_denials=1)
+    first = next(t for t in data["trials"] if t["outcome"] == "pass" and not t.get("permission_denied"))
+    assert len(calls) == 2 and data["meta"]["stopped_in_flight"] == [first["trial_id"]]
+    assert sum(t["outcome"] == "skipped_stopped" for t in data["trials"]) == 2
+
+
 GOOD = {"items": [{"id": "answers_question", "verdict": "PASS"}], "cost_usd": 0.1, "models": ["judge-m"]}
 BROKEN = {"items": [{"id": "answers_question", "verdict": "FAIL"}], "cost_usd": 0.02, "grader_error": True}
 
