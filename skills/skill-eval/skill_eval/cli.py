@@ -6,7 +6,8 @@
   skill-eval run SUITE --dry-run                     print the plan and the estimated cost; no model calls
   skill-eval run SUITE [-k 3] [-j 4] [--max-usd 20]  run, grade, write results.json + scorecard.html
   skill-eval report RUN_DIR                          rebuild the terminal table and scorecard.html
-  skill-eval grade RUN_DIR                           re-grade stored trajectories (hard checks + judge; no agent runs)
+  skill-eval grade RUN_DIR [--new-grading]           re-grade stored trajectories (hard checks + judge; no agent runs)
+  skill-eval keycheck SUITE                          do the answer keys point at real commits, files and lines? ($0)
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from pathlib import Path
 from . import checks, extract, judge, report, runner, stats
 from .freeze import freeze, verify
 from .isolation import scan_saved
+from .keycheck import check_keys
 from .probe import format_probe, run_probe
 from .selftest import run_selftest
 from .suite import SuiteError, load_suite
@@ -48,8 +50,21 @@ def cmd_selftest(a):
     return 0 if not bad else 2
 
 
+def cmd_keycheck(a):
+    suite = load_suite(a.suite, a.repo)
+    problems = check_keys(suite)
+    for p in problems:
+        print(f"  BAD {p['where']:<14} {p['problem']}")
+    print(f"keycheck: {len(suite.cases)} cases @{suite.commit[:8]}, {len(problems)} problem(s)")
+    return 0 if not problems else 2
+
+
 def cmd_freeze(a):
     suite = load_suite(a.suite, a.repo)
+    problems = check_keys(suite)
+    if problems:
+        raise SuiteError(f"keycheck finds {len(problems)} problem(s), e.g. {problems[0]['where']}: {problems[0]['problem']}. "
+                         "Run `skill-eval keycheck SUITE` and fix the keys before freezing")
     bad = [r for r in run_selftest(suite) if not r["ok"]]
     if bad:
         raise SuiteError(f"selftest fails on {len(bad)} answers; fix grading before freezing")
@@ -214,6 +229,10 @@ def main(argv=None):
     st.add_argument("-v", "--verbose", action="store_true")
     st.add_argument("--repo", help="repo clone (default: repo.path in the suite, e.g. ${MY_REPO})")
     st.set_defaults(fn=cmd_selftest)
+    kc = sub.add_parser("keycheck", help="do the answer keys point at real commits, files and lines? ($0)")
+    kc.add_argument("suite")
+    kc.add_argument("--repo", help="repo clone (default: repo.path in the suite)")
+    kc.set_defaults(fn=cmd_keycheck)
     fz = sub.add_parser("freeze", help="write FROZEN.json before any v1 result")
     fz.add_argument("suite")
     fz.add_argument("--reason", help="required when FROZEN.json exists")
