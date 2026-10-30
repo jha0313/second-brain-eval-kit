@@ -88,4 +88,3 @@ def check_keys(suite) -> list[dict]:
                 if k.get("file"):
                     path_at(c.id, k["file"])
     return problems
-
