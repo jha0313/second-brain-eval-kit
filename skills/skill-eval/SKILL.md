@@ -21,12 +21,12 @@ description: Claude Code 스킬(SKILL.md)을 숫자로 평가한다. 스킬 없�
 1. **인증 준비 (한 번)** — 일반 터미널에서 `claude setup-token`을 실행하고, 출력된 토큰을 `~/.config/skill-eval/oauth-token`(권한 0600, 다른 곳이면 `SKILL_EVAL_TOKEN_FILE`)에 저장한다. 하네스는 이 경로를 화면·기록에 찍지 않는다. trial은 빈 설정 폴더로 돌기 때문에 내 로그인을 쓰지 않는다. 토큰을 화면이나 대화에 붙여 넣지 않는다.
 2. **격리 probe** — `skill-eval probe --out runs/probe`. 21개 항목이 전부 PASS여야 비교 실행을 한다(haiku 몇 번, 약 $0.02). trial과 같은 도구 목록(Bash·Read·Grep·Glob·Skill)으로 돌린다. 평범한 Bash 명령(변수 실행·반복문·`$TMPDIR` 쓰기)이 권한 확인에 막히지 않는지, `~/.claude`·토큰 파일·정답 경로가 Bash(`head`)·Read·Grep·Glob 어느 쪽으로도 안 읽히는지, 에이전트 env에 토큰이 안 보이는지, 저장 파일에 토큰 문자열이 없는지, 빈 설정 폴더에 자동으로 생기는 파일(`remote-settings.json`·`policy-limits.json`)에 동작 키가 없는지도 본다(키 이름만 기록). 항목별 범위와 근거는 `probe.json`에 남는다.
 3. **케이스 작성** — 아래 형식. 정답·rubric은 workspace 밖에 둔다. 로더가 프롬프트에 정답 항목이 섞이면 거부한다.
-4. **채점기 selftest** — `skill-eval selftest suite.yaml`($0). 정답 자체·순서를 섞은 답·기준선 위의 답은 통과하고, 기준선 아래 recall·precision·잘린 JSON·없는 인용·틀린 값은 실패해야 한다(exact set은 하나만 빠져도 2차 지표에서 실패로 기록). 하나라도 틀리게 채점하면 여기서 고친다.
+4. **채점기 selftest** — `skill-eval selftest suite.yaml`($0). 정답 자체·순서를 섞은 답·기준선 위의 답은 통과하고, 기준선 아래 recall·precision·잘린 JSON·없는 인용·틀린 값은 실패해야 한다(exact set은 하나만 빠져도 2차 지표에서 실패로 기록). 하나라도 틀리게 채점하면 여기서 고친다. 이어서 `skill-eval keycheck suite.yaml`($0)로 정답이 그 커밋의 실제 파일·줄·커밋을 가리키는지, 채우지 않은 `<…>` 자리가 없는지 본다.
 5. **v2 편집 계획을 먼저 기록** — 어떤 줄을 왜 지우는지, 1차 지표와 멈춤 규칙을 v1 결과를 보기 전에 파일로 남긴다(시각 포함).
-6. **freeze** — `skill-eval freeze suite.yaml`. 케이스·정답·채점 코드·v2 diff·스킬 폴더·실행 규칙의 sha256을 `FROZEN.json`에 적는다. `run`은 해시가 다르면 시작하지 않는다. 다시 고정하려면 `--reason`을 적어야 하고, 이전 기록은 `history`에 남는다.
+6. **freeze** — `skill-eval freeze suite.yaml`. 케이스·정답·채점 코드·v2 diff·스킬 폴더·실행 규칙의 sha256을 `FROZEN.json`에 적는다. keycheck가 실패하면 고정하지 않는다. `run`은 `FROZEN.json`이 없거나 해시가 다르면 시작하지 않는다(dev run만 `--dev`). 다시 고정하려면 `--reason`을 적어야 하고, 이전 기록은 `history`에 남는다.
 7. **dry-run** — `skill-eval run suite.yaml --dry-run`. trial 수, judge 호출 상한, 재시도·probe를 포함한 예상 $·시간을 보여 주고 승인을 받는다. `--calibrate runs/<dir>/results.json`이면 실측 단가를 쓴다.
-8. **pilot** — freeze 뒤에 `--cases <2개> -k 1`(arm 4개 = 8 trial). freeze 전에 하네스를 시험할 때는 dev suite만 쓴다(본 케이스에 맞춰 스킬을 고치지 않도록). trial을 직접 읽고 채점이 맞는지 확인한다. 체크를 고쳤으면 `skill-eval grade <run>`으로 agent를 다시 돌리지 않고 재채점한다.
-9. **본 실행** — `skill-eval run suite.yaml -k 3 -j 6 --max-usd <상한>`. 진행 줄: `[ 37/300] FA01 · v1 · #2 · PASS · 12:31`. 출력이 잘린 trial에는 `truncated_output`이 붙는다. 결과: `results.json`, `scorecard.html`, `summary.txt`, trial별 `trials/<id>/trajectory.jsonl`.
+8. **pilot** — freeze 뒤에 `--cases <2개> -k 1`(arm 4개 = 8 trial). freeze 전에 하네스를 시험할 때는 dev suite만 `--dev`로 쓴다(본 케이스에 맞춰 스킬을 고치지 않도록). trial을 직접 읽고 채점이 맞는지 확인한다. 체크를 고쳤으면 `skill-eval grade <run>`으로 agent를 다시 돌리지 않고 재채점한다. 다른 채점 버전으로 채점된 run은 `--new-grading`을 줘야 재채점한다.
+9. **본 실행** — `skill-eval run suite.yaml -k 3 -j 6 --max-usd <상한>`. arm마다 trial 하나(canary)가 먼저 돈다. canary에 권한 거부·채점기 예외·infra 오류가 있으면 나머지를 돌리지 않는다. 그 뒤에도 채점기 예외는 바로, 권한 거부는 `--stop-after-denials`(기본 3) trial에서 멈춘다. 진행 줄: `[ 37/300] FA01 · v1 · #2 · PASS · 12:31`. 출력이 잘린 trial에는 `truncated_output`이 붙는다. 결과: `results.json`, `scorecard.html`, `summary.txt`, trial별 `trials/<id>/trajectory.jsonl`.
 10. **보고** — 세 질문의 답을 숫자로, expected·attempted·scored·excluded 개수와 함께. CI가 0을 지나면 "이 케이스·반복 수에서는 차이를 검출하지 못함"이라고 쓴다.
 
 ## suite.yaml
