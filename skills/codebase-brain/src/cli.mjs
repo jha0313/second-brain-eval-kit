@@ -6,7 +6,7 @@ import { homedir } from 'node:os';
 import { build } from './build.mjs';
 import { openDb, defaultDbPath, getMeta } from './db.mjs';
 import { resolveTarget, find, refs, impact, deps, shared, freshness, freshnessOf, coverageFor } from './query.mjs';
-import { why } from './why.mjs';
+import { why, markMentions } from './why.mjs';
 import { viz } from './viz.mjs';
 import { table, c, cut, cutLeft, plural, width, COLS } from './fmt.mjs';
 
@@ -237,13 +237,15 @@ const cmds = {
     const t0 = performance.now();
     const r = why(db, pos.join(' '), { limit: +(opt.limit || 8) });
     const ms = Math.round(performance.now() - t0);
-    if (opt.json) return out(JSON.stringify({ ...r, ms, freshness: fresh(db) }));
+    const f = freshness(db, checkout);
+    markMentions(f.repo, r);
+    if (opt.json) return out(JSON.stringify({ ...r, ms, freshness: freshnessOf(f) }));
     out(`why ${c.bold(`"${cut(r.question, COLS - 36)}"`)}  ${c.dim(`FAST · no LLM · ${ms} ms`)}`);
     if (r.seeds.length) out(c.dim(`  names → code: ${r.seeds.join(', ')}`));
     if (r.gap) {
       out(c.yellow(`  no doc, change note or commit mentions ${r.terms.names.join(', ') || 'these terms'} — a knowledge gap.`));
       out(c.dim('  read the code itself (the header / the definition), and consider writing the doc'));
-      return staleNote(fresh(db));
+      return staleNote(freshnessOf(f));
     }
     // a cite is never cut. Under 120 columns SOURCE and DATE go (the cite's shape says commit / changes/ / doc).
     // A cite wider than 40% of the screen goes on its own line under the row, so TITLE keeps its room
@@ -256,10 +258,15 @@ const cmds = {
     r.citations.forEach((x, i) => { if (long(x)) lines[2 + i] += '\n' + ' '.repeat(at) + x.cite; });
     out(lines.join('\n'));
     for (const [i, x] of r.citations.slice(0, 3).entries()) out(c.dim(`  ${i + 1}. `) + cut(x.snippet, COLS - 6));
+    // a citation's text can name a build ID or a file that is gone: say so, so neither is cited as evidence
+    for (const [i, x] of r.citations.entries()) {
+      const bad = [...x.notCommits.map((s) => `${s} (not a commit)`), ...x.notInTree.map((p) => `${p} (not in the tree)`)];
+      if (bad.length) out(c.yellow(`  #${i + 1} mentions ${bad.slice(0, 4).join(', ')}${bad.length > 4 ? `, +${bad.length - 4} more` : ''} — do not cite these`));
+    }
     if (r.related.length) out(cut(c.dim('  related code (1 hop): ') + r.related.slice(0, 6).map((x) => `${x.path} ×${x.citations}`).join(' · '), COLS));
     for (const h of r.history.filter((h) => h.commits.length)) out(c.dim(`  history of ${h.seed}: `) + h.commits.map((x) => `${x.sha.slice(0, 8)} ${x.prs.split(' ')[0] || ''}`.trim()).join(' · '));
     out(c.dim('  read the cited lines before you answer; cite path:line or SHA'));
-    staleNote(fresh(db));
+    staleNote(freshnessOf(f));
   },
 
   viz({ pos, opt }) {

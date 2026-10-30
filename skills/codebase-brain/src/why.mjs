@@ -1,6 +1,7 @@
 // why (FAST mode): question -> hybrid search -> one hop across doc <-> code <-> commit -> citations.
 // No LLM call. The agent reads the cited lines and does the reasoning.
 import { resolveTarget } from './query.mjs';
+import { git } from './files.mjs';
 
 const STOP = new Set(('a an the is are was were be been do does did why how what when where which who whom whose this that these those ' +
   'it its of in on at to for from by with without and or not no yes we our you your they their i me my should would could can ' +
@@ -128,7 +129,7 @@ export function why(db, question, { limit = 8, perSource = 3 } = {}) {
   const history = seeds.slice(0, 3).map((s) => ({ seed: s.key, commits: touchedBy.all(s.kind === 'file' ? s.id : fileNode(db, s.path)?.id ?? -1) }));
 
   return { question, terms: t, seeds: seeds.map((s) => s.key), lists: lists.map((l) => `${l.name}:${l.ids.length}`), gap: !picked.length,
-    citations: picked.map(cite), related: [...related.values()].sort((a, b) => b.citations - a.citations).slice(0, 10)
+    citations: picked.map((ch) => ({ ...cite(ch), mentions: mentions(ch) })), related: [...related.values()].sort((a, b) => b.citations - a.citations).slice(0, 10)
       .map((r) => ({ ...r, kinds: [...r.kinds] })), history };
 }
 
@@ -137,6 +138,42 @@ function cite(ch) {
   return { source: ch.source, cite: loc, sha: ch.sha, path: ch.path, lines: ch.path ? [ch.start_line, ch.end_line] : null,
     date: ch.date, prs: ch.prs || '', title: ch.title, snippet: snippet(ch.body), via: ch.via, score: +ch.score.toFixed(4),
     links: (ch.links || []).slice(0, 6).map((l) => l.kind === 'dir' ? `${l.path}/` : l.kind === 'file' ? l.path : `${l.path}#${l.name}`) };
+}
+
+// What a citation's text names that an agent might cite in turn: SHA-shaped strings (a build or deploy ID is
+// not a commit) and file names (a file the text names may be gone). Display only: ranking never looks at it.
+const SHA_RE = /(?<![\w-])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?!\w)/g;
+const FILE_RE = /(?<![\w@./-])(?:\.\/|\/)?((?:[\w@.-]+\/)*[\w@-][\w@.-]*\.(?:tsx?|jsx?|mjs|cjs|mdx?|json|ya?ml|sql|py|sh|css|scss|html|toml))(?![\w/-])/g;
+function mentions(ch) {
+  const text = `${ch.title ?? ''}\n${ch.body ?? ''}`.replace(/\bhttps?:\/\/\S+/g, '');
+  return { shas: [...new Set(text.match(SHA_RE) || [])],
+    files: [...new Set([...text.matchAll(FILE_RE)].map((m) => m[1]))] };
+}
+
+// marks each citation with the SHAs that are not commits and the files that are not in the checkout's tree
+// (a bare name counts if some tracked path ends with it). Fails open: no git, no marks
+export function markMentions(repo, r) {
+  const all = r.citations.map((c) => c.mentions ?? { shas: [], files: [] });
+  const shas = [...new Set(all.flatMap((m) => m.shas))], files = all.flatMap((m) => m.files);
+  let isCommit = () => true, inTree = () => true;
+  try {
+    if (shas.length) {
+      const types = git(repo, ['cat-file', '--batch-check'], { input: shas.join('\n') + '\n' }).trim().split('\n');
+      const commits = new Set(shas.filter((_, i) => types[i]?.split(' ')[1] === 'commit'));
+      isCommit = (x) => commits.has(x);
+    }
+    if (files.length) {
+      const suffixes = new Set(git(repo, ['ls-files', '-z']).split('\0').filter(Boolean)
+        .flatMap((p) => p.split('/').map((_, i, parts) => parts.slice(i).join('/'))));
+      inTree = (x) => suffixes.has(x);
+    }
+  } catch { /* not a git checkout: no marks */ }
+  r.citations.forEach((c, i) => {
+    delete c.mentions;
+    c.notCommits = all[i].shas.filter((x) => !isCommit(x));
+    c.notInTree = all[i].files.filter((x) => !inTree(x));
+  });
+  return r;
 }
 
 const snippet = (body) => body.replace(/^---[\s\S]*?---\s*/, '').replace(/^files: .*$/m, '').replace(/^#{1,6}\s.*$/gm, '')

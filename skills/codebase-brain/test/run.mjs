@@ -7,6 +7,7 @@ import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
+import { markMentions } from '../src/why.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const brain = join(here, '..', 'bin', 'brain');
@@ -60,10 +61,25 @@ check('why cites the doc and the change note, with the PR number', () => {
   assert.match(cites, /changes\/20261001-reserve-first\.md/);
   assert.ok(w.citations.some((c) => c.prs.includes('#12')));
 });
+const text = (...args) => sh(brain, args, { BRAIN_DB: db, NO_COLOR: '1' });
+check('why marks a SHA-shaped build ID and a file that is not in the tree (display only)', () => {
+  const ch = w.citations.find((c) => c.source === 'change');
+  assert.deepEqual(ch.notCommits, ['4e5f6a7b']);
+  assert.deepEqual(ch.notInTree, ['src/lib/legacy-credits.ts']);
+  assert.deepEqual(w.citations.find((c) => c.source === 'doc').notInTree, []);       // src/lib/credits.ts exists
+  const t = text('why', 'why does reserve throw InsufficientCredits instead of returning false?');
+  assert.match(t, /4e5f6a7b \(not a commit\)/);
+  assert.match(t, /src\/lib\/legacy-credits\.ts \(not in the tree\)/);
+});
+check('a real commit SHA and a bare file name that exists are not marked', () => {
+  const head = sh('git', ['rev-parse', 'HEAD']).trim().slice(0, 8);
+  const r = { citations: [{ mentions: { shas: [head, '4e5f6a7b'], files: ['charge.ts', 'lib/credits.ts', 'gone.ts'] } }] };
+  markMentions(repo, r);
+  assert.deepEqual([r.citations[0].notCommits, r.citations[0].notInTree], [['4e5f6a7b'], ['gone.ts']]);
+});
 check('viz writes one HTML file', () => assert.ok(existsSync(sh(brain, ['viz', 'src/lib/credits.ts', '--out', join(repo, '..', 'v.html')], { BRAIN_DB: db }).trim().replace(/^~(?=\/)/, homedir()))));
 
 // freshness: every answer says whether the index still matches the checkout (these checks edit the fixture, so they run last)
-const text = (...args) => sh(brain, args, { BRAIN_DB: db, NO_COLOR: '1' });
 const rebuild = () => JSON.parse(sh(brain, ['build', '.', '--db', db, '--if-stale', '--json']));
 check('JSON answers carry freshness: fresh right after the build', () => {
   for (const r of [q('impact', 'src/lib/credits.ts'), q('refs', 'src/lib/credits.ts#reserve'), q('why', 'why reserve first?'), q('find', 'reserve')])
