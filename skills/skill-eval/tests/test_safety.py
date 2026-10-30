@@ -144,3 +144,19 @@ def test_a_denial_does_not_hide_a_fatal_error():
         b = runner.Breaker(3)
         b.see(make_rec(spec, permission_denied=["Bash ls"], **fatal))
         assert b.reason and "permission denials" not in b.reason, (fatal, b.reason)
+
+
+def test_a_worker_waiting_for_budget_does_not_start_after_the_stop(monkeypatch, tmp_path):
+    # review r2 #2: 2 workers, $1 reserved per trial, cap $1.5: the second worker waits on the budget while the first
+    # trial runs; that trial stops the run, so the waiting worker must not start a paid trial when it wakes up
+    import time
+
+    def trial(spec, n):
+        if n == 1:
+            time.sleep(0.3)
+            return make_rec(spec, permission_denied=["Bash x"])
+        return make_rec(spec)
+    data, calls = fake_run(monkeypatch, tmp_path, [make_case("W0"), make_case("W1")], trial, canary=False,
+                           stop_after_denials=1, max_usd=1.5, per_trial_usd=1.0)
+    assert len(calls) == 1, [f"{c['case'].id}/{c['arm']}" for c in calls]
+    assert sum(t["outcome"] == "skipped_stopped" for t in data["trials"]) == 3

@@ -31,7 +31,7 @@ def make_rec(spec, outcome="pass", score=1.0, **kw):
     return rec
 
 
-def fake_run(monkeypatch, tmp_path, cases, trial, k=1, **kw):
+def fake_run(monkeypatch, tmp_path, cases, trial, k=1, max_usd=None, per_trial_usd=None, **kw):
     """runner.run with every expensive or host-touching step replaced; `trial(spec, n)` makes each record."""
     def template(suite, arm, root):
         t = root / arm
@@ -49,7 +49,8 @@ def fake_run(monkeypatch, tmp_path, cases, trial, k=1, **kw):
         monkeypatch.setattr(runner, name, fn)
     suite = make_suite(cases)
     specs = runner.plan(suite, ["none", "v1"], None, k)
-    data = runner.run(suite, specs, tmp_path / "out", 2, None, {"total_usd": 1.0, "trials": len(specs)}, log=lambda s: None, **kw)
+    est = {"total_usd": per_trial_usd * len(specs) if per_trial_usd else 1.0, "trials": len(specs)}
+    data = runner.run(suite, specs, tmp_path / "out", 2, max_usd, est, log=lambda s: None, **kw)
     return data, calls
 
 

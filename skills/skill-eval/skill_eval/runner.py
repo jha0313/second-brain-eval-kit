@@ -484,32 +484,38 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
                 "metrics": {"seconds": 0, "agent_usd": 0, "judge_usd": 0, "tokens": {}, "tokens_total": 0, "tool_calls": 0, "turns": 0}}
 
     def work(spec, is_canary=False):
+        rec, was = None, None
         if breaker.reason:
-            rec = skipped(spec, "skipped_stopped", f"run stopped: {breaker.reason}")
-        elif not budget.reserve(per_trial_est):
+            pass
+        elif not budget.reserve(per_trial_est):   # may wait for running trials; one of them may stop the run meanwhile
             rec = skipped(spec, "skipped_budget", f"--max-usd {max_usd} reached")
         else:
-            rec = None
+            with lock:                            # start only if no stop was decided (the breaker decides under this lock)
+                start = not breaker.reason
             try:
-                rec = run_trial(suite, spec, out, ws_root, templates, deny, use_judge, keep_ws)
-            except Exception as e:                # a harness bug in one trial must not hang the budget or lose the run
-                rec = skipped(spec, "infra_error", f"runner exception: {type(e).__name__}: {e}"[:200])
-                rec["grader_exception"] = True
+                if start:
+                    try:
+                        rec = run_trial(suite, spec, out, ws_root, templates, deny, use_judge, keep_ws)
+                    except Exception as e:        # a harness bug in one trial must not hang the budget or lose the run
+                        rec = skipped(spec, "infra_error", f"runner exception: {type(e).__name__}: {e}"[:200])
+                        rec["grader_exception"] = True
+                    with lock:                    # before the budget is settled: a worker it wakes sees the stop
+                        was = breaker.reason
+                        breaker.see(rec, canary=is_canary)
             finally:
                 budget.settle(per_trial_est, (rec["metrics"]["agent_usd"] + rec["metrics"]["judge_usd"]) if rec else 0.0)
+        if rec is None:
+            rec = skipped(spec, "skipped_stopped", f"run stopped: {breaker.reason}")
         with lock:
             done[0] += 1
             results.append(rec)
-            was = breaker.reason
-            if not rec["outcome"].startswith("skipped"):
-                breaker.see(rec, canary=is_canary)
             log(progress_line(done[0], len(specs), rec, time.time() - t0, tty))
             if rec["outcome"] in ("isolation_error", "invalid", "safety_violation") or rec.get("grader_exception") \
                     or rec.get("grader_error"):
                 log(f"  !! {rec['outcome']}: {rec['reason']}"[:100])
             if rec.get("permission_denied"):
                 log(f"  !! permission denied ({len(rec['permission_denied'])}): {rec['permission_denied'][0]}"[:100])
-            if breaker.reason and not was:
+            if breaker.reason and was is None and not rec["outcome"].startswith("skipped"):
                 log(f"  !! stopping the run: {breaker.reason}"[:160])
         return rec
 
