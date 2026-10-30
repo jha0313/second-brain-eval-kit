@@ -52,8 +52,13 @@ def test_unfilled_example_is_refused(tmp_path, repo, monkeypatch):
     repo.write({"a.ts": "x\n"})
     repo.commit()
     monkeypatch.setenv("MY_REPO", str(repo.root))
+    d = tmp_path / "example"
+    shutil.copytree(EXAMPLE, d)                       # the skill folder filled in, the commit left as the template has it
+    (tmp_path / "skill").mkdir()
+    (tmp_path / "skill" / "SKILL.md").write_text("---\nname: codebase-brain\n---\n")
+    (d / "suite.yaml").write_text((d / "suite.yaml").read_text().replace("../../../codebase-brain", str(tmp_path / "skill")))
     with pytest.raises(SuiteError, match="repo.commit is not a commit SHA"):
-        load_suite(EXAMPLE / "suite.yaml")
+        load_suite(d / "suite.yaml")
 
 
 def test_filled_example_passes_and_broken_keys_are_named(tmp_path, repo):
