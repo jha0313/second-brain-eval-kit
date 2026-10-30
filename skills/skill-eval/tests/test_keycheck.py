@@ -46,6 +46,7 @@ def test_placeholder_pattern_skips_code():
     assert PLACEHOLDER.findall("In <path/to/file.ts>, <40자 커밋 SHA>, <module or behavior>, <…>") == [
         "<path/to/file.ts>", "<40자 커밋 SHA>", "<module or behavior>", "<…>"]
     assert PLACEHOLDER.findall("returns Promise<void> or Map<string, number> and a <T>") == []
+    assert PLACEHOLDER.findall("renders <Meter /> inside </div> or <a href='/x'>, see <!-- a/b -->") == []
 
 
 def test_unfilled_example_is_refused(tmp_path, repo, monkeypatch):

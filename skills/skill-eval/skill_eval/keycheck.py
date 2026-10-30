@@ -13,8 +13,8 @@ from .checks import _git, line_count, lines_ok, tracked_files
 from .suite import load_key, load_sources
 
 # Template placeholders as suites/example writes them: <path/to/file.ts>, <40자 커밋 SHA>, <module or behavior>.
-# Code in a prompt such as Promise<void> or Map<string, number> has no "/", no Korean and no "…" inside.
-PLACEHOLDER = re.compile(r"<(?=[^<>\n]*(?:/|[가-힣]|…|\s(?:or|to)\s))[^<>\n]{1,80}>")
+# Code in a prompt such as Promise<void>, Map<string, number>, <Meter />, </div> or <a href="/x"> is not one.
+PLACEHOLDER = re.compile(r"<(?![/!])(?![^<>\n]*=)(?=[^<>\n]*(?:/|[가-힣]|…|\s(?:or|to)\s))[^<>\n]{1,80}(?<![/\s])>")
 
 
 def _site(item: str) -> tuple[str, tuple[int, int] | None]:
