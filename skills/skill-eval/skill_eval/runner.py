@@ -233,11 +233,13 @@ class Breaker:
         tag = "canary: " if canary else ""
         if rec.get("permission_denied"):
             self.denied += 1
-            if canary or (self.max_denied and self.denied >= self.max_denied):
-                tool = rec["permission_denied"][0].split(" ", 1)[0]          # the tool name only: inputs hold workspace paths
-                self.reason = f"{tag}{self.denied} trial(s) with permission denials (last: {tool} in {rec['trial_id']})"
-        elif rec.get("grader_exception") or rec["outcome"] == "isolation_error" or (canary and rec["outcome"] == "infra_error"):
+        # a harness error stops at once, whatever else the trial shows (a denial must not hide it)
+        if rec.get("grader_exception") or rec.get("runner_exception") or rec["outcome"] == "isolation_error" \
+                or (canary and rec["outcome"] == "infra_error"):
             self.reason = f"{tag}{rec['trial_id']} {rec['outcome']}: {rec.get('reason', '')}"[:200]
+        elif rec.get("permission_denied") and (canary or (self.max_denied and self.denied >= self.max_denied)):
+            tool = rec["permission_denied"][0].split(" ", 1)[0]              # the tool name only: inputs hold workspace paths
+            self.reason = f"{tag}{self.denied} trial(s) with permission denials (last: {tool} in {rec['trial_id']})"
 
 
 def ws_state(ws: Path, commit: str) -> dict:

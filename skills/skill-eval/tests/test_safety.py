@@ -135,3 +135,12 @@ def test_yaml_sources_hit_key_is_relative_to_the_case_file(tmp_path, repo):
     s = load_suite(suite)
     key = next(c for c in s.cases if c.id == "W").hard[0]["sources_hit"]["key"]
     assert Path(key) == cases / "keys" / "W.json"
+
+
+def test_a_denial_does_not_hide_a_fatal_error():
+    # review r2 #1: the same trial with a permission denial and a grader exception (or isolation error) stops at once
+    spec = {"case": make_case("W1"), "arm": "v1", "rep": 1}
+    for fatal in ({"grader_exception": True}, {"outcome": "isolation_error", "score": None}):
+        b = runner.Breaker(3)
+        b.see(make_rec(spec, permission_denied=["Bash ls"], **fatal))
+        assert b.reason and "permission denials" not in b.reason, (fatal, b.reason)
