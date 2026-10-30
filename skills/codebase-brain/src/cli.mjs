@@ -95,9 +95,10 @@ function footer(db, cov, extra = '') {
   staleNote(f);
 }
 
-// app/api/thumb/[id]/route.ts -> "/api/thumb": route groups (x) and slots @x are not in the URL; grep stops at the first [param]
-const routeUrl = (p) => '/' + p.replace(/^(.*\/)?app\//, '').split('/').slice(0, -1)
-  .filter((s) => !/^\(.*\)$/.test(s) && !s.startsWith('@')).join('/').replace(/\/?\[.*$/, '');
+// app/api/thumb/[id]/route.ts -> "/api/thumb": the first app/ is the routing root (app/api/app/… keeps its "app");
+// route groups (x) and slots @x are not in the URL; grep stops at the first [param]
+const routeUrl = (p, s = p.split('/')) => '/' + s.slice(s.indexOf('app') + 1, -1)
+  .filter((x) => !/^\(.*\)$/.test(x) && !x.startsWith('@')).join('/').replace(/\/?\[.*$/, '');
 
 // a path is never cut (the agent cites it or passes it on): one wider than its room goes whole on its own line under the row
 function tableWhole(head, rows, col, opts = {}) {

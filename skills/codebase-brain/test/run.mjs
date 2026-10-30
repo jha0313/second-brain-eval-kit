@@ -1,4 +1,4 @@
-// Fixture test: the cases a real repo throws at the TS adapter, in 19 files.
+// Fixture test: the cases a real repo throws at the TS adapter, in 20 files.
 // two tsconfigs with different `paths` · alias imports · a barrel with a renamed re-export · `const X` + `type X`
 // · dynamic import() destructuring · a file in no tsconfig · a generated file · vi.mock · node_modules committed to git · a path over 100 chars
 import { cpSync, mkdtempSync, existsSync, appendFileSync, readFileSync, rmSync } from 'node:fs';
@@ -60,6 +60,7 @@ check('a route file nothing imports: impact 0 says it is reached by URL and what
   assert.match(r.hint, /grep "\/api\/run"/);
   assert.match(sh(brain, ['impact', 'app/api/run/route.ts'], { BRAIN_DB: db, NO_COLOR: '1' }), /reached by URL.*grep "\/api\/run"/);
   assert.equal(q('impact', 'scripts/gen.mjs').hint, undefined);        // 0 importers, but not a route
+  assert.match(q('impact', 'app/api/app/status/route.ts').hint, /grep "\/api\/app\/status"/);   // only the first app/ is the root
 });
 
 const LONG = 'src/ui/billing/usage-meters/organization-settings/credit-balance-panels/CreditBalanceMeterWithLabel.tsx';
