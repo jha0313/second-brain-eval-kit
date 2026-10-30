@@ -12,9 +12,23 @@ from pathlib import Path
 from .checks import _git, line_count, lines_ok, tracked_files
 from .suite import load_key, load_sources
 
-# Template placeholders as suites/example writes them: <path/to/file.ts>, <40자 커밋 SHA>, <module or behavior>.
-# Code in a prompt such as Promise<void>, Map<string, number>, <Meter />, </div> or <a href="/x"> is not one.
-PLACEHOLDER = re.compile(r"<(?![/!])(?![^<>\n]*=)(?=[^<>\n]*(?:/|[가-힣]|…|\s(?:or|to)\s))[^<>\n]{1,80}(?<![/\s])>")
+# Template placeholders as suites/example writes them: <path/to/file.ts>, <40자 커밋 SHA>, <module or behavior>, and the
+# one-word slots <function> and <condition>. Code in a prompt such as Promise<void>, Map<string, number>, <Meter />,
+# </div>, <a href="/x"> or <!-- … --> is not one.
+SLOT = re.compile(r"<[^<>\n]{1,160}>")
+SIGNAL = re.compile(r"/|[가-힣]|…|\s(?:or|to)\s")
+TEMPLATE_WORDS = {"<function>", "<condition>"}          # one word, nothing else to tell them from code by
+TAG = re.compile(r"<[A-Za-z][\w.:-]*(?:\s+[\w:@.-]+\s*=|\s*/>$)")      # <a href=…>, <Meter />
+
+
+def find_placeholders(text: str) -> list[str]:
+    out = []
+    for m in SLOT.finditer(text):
+        s = m.group(0)
+        markup = s.startswith(("</", "<!")) or TAG.match(s)
+        if s in TEMPLATE_WORDS or (SIGNAL.search(s) and not markup):
+            out.append(s)
+    return out
 
 
 def _site(item: str) -> tuple[str, tuple[int, int] | None]:
@@ -39,8 +53,8 @@ def check_keys(suite) -> list[dict]:
         text = f.read_text()
         if f.suffix in (".yaml", ".yml"):
             text = re.sub(r"(?m)(^|\s)#.*$", "", text)       # comments may explain the placeholders
-        for m in PLACEHOLDER.finditer(text):
-            bad(f.name, f"unfilled placeholder {m.group(0)}")
+        for slot in find_placeholders(text):
+            bad(f.name, f"unfilled placeholder {slot}")
     if _git(suite.repo, "cat-file", "-e", f"{suite.commit}^{{commit}}").returncode != 0:
         bad("suite", f"repo.commit {suite.commit[:12]} is not a commit in {suite.label}")
         return problems
@@ -74,3 +88,4 @@ def check_keys(suite) -> list[dict]:
                 if k.get("file"):
                     path_at(c.id, k["file"])
     return problems
+

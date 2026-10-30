@@ -1,5 +1,6 @@
 """keycheck and unfilled template placeholders (E6). Offline: a temp repo and a copy of suites/example."""
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import pytest
 from conftest import lines
 
 from skill_eval import cli
-from skill_eval.keycheck import PLACEHOLDER, check_keys
+from skill_eval.keycheck import check_keys, find_placeholders
 from skill_eval.suite import SuiteError, load_suite
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "suites" / "example"
@@ -43,10 +44,10 @@ def _filled_example(tmp_path, repo):
 
 
 def test_placeholder_pattern_skips_code():
-    assert PLACEHOLDER.findall("In <path/to/file.ts>, <40자 커밋 SHA>, <module or behavior>, <…>") == [
+    assert find_placeholders("In <path/to/file.ts>, <40자 커밋 SHA>, <module or behavior>, <…>") == [
         "<path/to/file.ts>", "<40자 커밋 SHA>", "<module or behavior>", "<…>"]
-    assert PLACEHOLDER.findall("returns Promise<void> or Map<string, number> and a <T>") == []
-    assert PLACEHOLDER.findall("renders <Meter /> inside </div> or <a href='/x'>, see <!-- a/b -->") == []
+    assert find_placeholders("returns Promise<void> or Map<string, number> and a <T>") == []
+    assert find_placeholders("renders <Meter /> inside </div> or <a href='/x'>, see <!-- a/b -->") == []
 
 
 def test_unfilled_example_is_refused(tmp_path, repo, monkeypatch):
@@ -82,3 +83,18 @@ def test_filled_example_passes_and_broken_keys_are_named(tmp_path, repo):
     assert ("EX-FA1.json", "unfilled placeholder <path/to/importer-b.test.ts>") in found
     assert cli.main(["freeze", str(suite_file), "--repo", str(repo.root)]) == 1             # freeze refuses
     assert not (suite_file.parent / "FROZEN.json").exists()
+
+
+def test_every_slot_the_example_ships_is_found(tmp_path, repo):
+    # review r2 #7: <function> and <condition> in the control prompt were missed; every slot in suites/example must be found
+    for f in sorted(x for x in EXAMPLE.rglob("*") if x.is_file()):
+        text = f.read_text()
+        if f.suffix == ".yaml":
+            text = re.sub(r"(?m)(^|\s)#.*$", "", text)
+        slots = re.findall(r"<[^<>\n]+>", text)
+        assert slots and find_placeholders(text) == slots, (f.name, sorted(set(slots) - set(find_placeholders(text))))
+    suite_file, _ = _filled_example(tmp_path, repo)
+    c = suite_file.parent / "cases" / "controls.json"
+    c.write_text(c.read_text().replace("what does reserve return when the balance is short", "what does <function> return when <condition>"))
+    found = {p["problem"] for p in check_keys(load_suite(suite_file, str(repo.root)))}
+    assert {"unfilled placeholder <function>", "unfilled placeholder <condition>"} <= found
