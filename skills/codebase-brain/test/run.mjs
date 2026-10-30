@@ -1,7 +1,7 @@
 // Fixture test: the cases a real repo throws at the TS adapter, in 19 files.
 // two tsconfigs with different `paths` · alias imports · a barrel with a renamed re-export · `const X` + `type X`
 // · dynamic import() destructuring · a file in no tsconfig · a generated file · vi.mock · node_modules committed to git · a path over 100 chars
-import { cpSync, mkdtempSync, existsSync, appendFileSync, readFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, existsSync, appendFileSync, readFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -107,6 +107,10 @@ check('a real commit SHA and a bare file name that exists are not marked', () =>
   const r = { citations: [{ mentions: { shas: [head, '4e5f6a7b'], files: ['charge.ts', 'lib/credits.ts', 'gone.ts'] } }] };
   markMentions(repo, r);
   assert.deepEqual([r.citations[0].notCommits, r.citations[0].notInTree], [['4e5f6a7b'], ['gone.ts']]);
+  const none = { shas: [], files: [] };
+  const own = { citations: [{ source: 'doc', path: 'docs/removed.md', mentions: none }, { source: 'doc', path: 'docs/credits.md', mentions: none },
+    { source: 'commit', path: null, mentions: none }] };
+  assert.deepEqual(markMentions(repo, own).citations.map((c) => c.inTree), [false, true, undefined]);   // the cited file itself
 });
 check('SKILL.md: description fits 1,024 chars, routes Korean questions, and names only flags brain has', () => {
   const skill = readFileSync(join(here, '..', 'SKILL.md'), 'utf8');
@@ -153,5 +157,11 @@ check('a file with a Korean name: an edit after each build is "changed", under i
   assert.equal(rebuild().skipped, false);
   appendFileSync(join(repo, 'notes/메모.txt'), '또 한 줄\n');
   assert.equal(q('status').state, 'stale');
+});
+check('a cited doc that is gone from disk is marked, in JSON and text', () => {
+  rmSync(join(repo, 'docs/credits.md'));                   // still tracked, but there is nothing to open
+  const ask = 'why does reserve throw InsufficientCredits instead of returning false?';
+  assert.equal(q('why', ask).citations.find((c) => c.path === 'docs/credits.md').inTree, false);
+  assert.match(text('why', ask), /docs\/credits\.md:\d+-\d+: the cited file is not in the tree/);
 });
 console.log(`${n} checks passed (fixture at ${repo})`);

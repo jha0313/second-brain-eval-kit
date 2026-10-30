@@ -1,6 +1,8 @@
 // why (FAST mode): question -> hybrid search -> one hop across doc <-> code <-> commit -> citations.
 // No LLM call. The agent reads the cited lines and does the reasoning.
 import { resolveTarget } from './query.mjs';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { git } from './files.mjs';
 import { MAX_NAME_OWNERS } from './index-knowledge.mjs';
 
@@ -152,25 +154,30 @@ function mentions(ch) {
 }
 
 // marks each citation with the SHAs that are not commits and the files that are not in the checkout's tree
-// (a bare name counts if some tracked path ends with it). Fails open: no git, no marks
+// (a bare name counts if some tracked path ends with it), and says whether a cited doc is still there (`inTree`).
+// "In the tree" = tracked and on disk: a file the agent can open. Fails open: no git, no marks
+const OWN_FILE = new Set(['doc', 'change', 'changelog']);                // a vault note's path is outside the repo
 export function markMentions(repo, r) {
   const all = r.citations.map((c) => c.mentions ?? { shas: [], files: [] });
   const shas = [...new Set(all.flatMap((m) => m.shas))], files = all.flatMap((m) => m.files);
-  let isCommit = () => true, inTree = () => true;
+  const own = r.citations.filter((c) => OWN_FILE.has(c.source) && c.path);
+  let isCommit = () => true, inTree = () => true, isThere = () => true;
   try {
     if (shas.length) {
       const types = git(repo, ['cat-file', '--batch-check'], { input: shas.join('\n') + '\n' }).trim().split('\n');
       const commits = new Set(shas.filter((_, i) => types[i]?.split(' ')[1] === 'commit'));
       isCommit = (x) => commits.has(x);
     }
-    if (files.length) {
-      const suffixes = new Set(git(repo, ['ls-files', '-z']).split('\0').filter(Boolean)
-        .flatMap((p) => p.split('/').map((_, i, parts) => parts.slice(i).join('/'))));
+    if (files.length || own.length) {
+      const here = git(repo, ['ls-files', '-z']).split('\0').filter((p) => p && existsSync(join(repo, p)));
+      const full = new Set(here), suffixes = new Set(here.flatMap((p) => p.split('/').map((_, i, parts) => parts.slice(i).join('/'))));
       inTree = (x) => suffixes.has(x);
+      isThere = (x) => full.has(x);
     }
   } catch { /* not a git checkout: no marks */ }
   r.citations.forEach((c, i) => {
     delete c.mentions;
+    if (own.includes(c)) c.inTree = isThere(c.path);
     c.notCommits = all[i].shas.filter((x) => !isCommit(x));
     c.notInTree = all[i].files.filter((x) => !inTree(x));
   });

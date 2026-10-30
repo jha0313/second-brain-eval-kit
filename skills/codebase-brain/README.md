@@ -39,7 +39,7 @@ cd /path/to/repo && brain build . --if-stale                             # 대�
 ## 세미나(2026-10-31) 뒤 바뀐 동작
 
 - **freshness:** 모든 JSON 답에 `freshness`(`state: fresh | stale`, commit·HEAD·바뀐 파일)가 `coverage` 옆에 붙습니다. `complete`(다 찾았다)와 `fresh`(지금 코드와 맞다)는 다른 사실입니다. 일반 출력의 why·find에도 `stale:` 줄이 나옵니다. 빌드할 때 커밋 안 한 파일의 내용 해시를 적어 두므로, 인덱스가 이미 읽은 수정은 "바뀜"으로 세지 않습니다.
-- **why 인용 표시:** 인용된 글에 커밋이 아닌 SHA 모양 문자열(빌드·배포 ID)이나 지금 트리에 없는 파일이 있으면 `(not a commit)`·`(not in the tree)`로 표시합니다(JSON: `notCommits`·`notInTree`). 순위는 그대로입니다.
+- **why 인용 표시:** 인용된 글에 커밋이 아닌 SHA 모양 문자열(빌드·배포 ID)이나 지금 트리에 없는 파일이 있으면 `(not a commit)`·`(not in the tree)`로 표시합니다(JSON: `notCommits`·`notInTree`). 인용한 문서 자체가 지금 없으면(추적·디스크 둘 다 봄) `inTree: false`와 경고 줄이 나옵니다. 순위는 그대로입니다.
 - **route 안내:** import하는 파일이 없는 Next.js route 파일의 `impact`는 0 대신 "URL로 불림 → grep \"/api/…\"" 안내(`hint`)를 냅니다.
 - **버그 수정:** 표가 긴 경로를 자르지 않습니다(따로 한 줄). `refs --files --json`은 파일당 한 줄입니다. `deps <심볼 ID>`는 그 심볼이 있는 파일에서 시작합니다(전에는 조용히 0).
 - **이름 연결 규칙:** "같은 이름의 export가 1–3개일 때만 잇는다"를 `MAX_NAME_OWNERS`로 이름 붙였고, 건너뛴 이름 수를 `brain status`에 보입니다. 규칙은 그대로입니다.

@@ -289,6 +289,7 @@ const cmds = {
     for (const [i, x] of r.citations.slice(0, 3).entries()) out(c.dim(`  ${i + 1}. `) + cut(x.snippet, COLS - 6));
     // a citation's text can name a build ID or a file that is gone: say so, so neither is cited as evidence
     for (const [i, x] of r.citations.entries()) {
+      if (x.inTree === false) out(c.yellow(`  #${i + 1} ${x.cite}: the cited file is not in the tree now — cite the commit that removed it`));
       const bad = [...x.notCommits.map((s) => `${s} (not a commit)`), ...x.notInTree.map((p) => `${p} (not in the tree)`)];
       if (bad.length) out(c.yellow(`  #${i + 1} mentions ${bad.slice(0, 4).join(', ')}${bad.length > 4 ? `, +${bad.length - 4} more` : ''} — do not cite these`));
     }
