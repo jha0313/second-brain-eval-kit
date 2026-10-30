@@ -1,6 +1,10 @@
 // why (FAST mode): question -> hybrid search -> one hop across doc <-> code <-> commit -> citations.
 // No LLM call. The agent reads the cited lines and does the reasoning.
 import { resolveTarget } from './query.mjs';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { git } from './files.mjs';
+import { MAX_NAME_OWNERS } from './index-knowledge.mjs';
 
 const STOP = new Set(('a an the is are was were be been do does did why how what when where which who whom whose this that these those ' +
   'it its of in on at to for from by with without and or not no yes we our you your they their i me my should would could can ' +
@@ -50,7 +54,7 @@ export function why(db, question, { limit = 8, perSource = 3 } = {}) {
   for (const n of t.names) {
     const r = resolveTarget(db, n);
     if (r.node) seeds.push(r.node);
-    else if (r.candidates?.length && r.candidates.length <= 3) seeds.push(...r.candidates);
+    else if (r.candidates?.length && r.candidates.length <= MAX_NAME_OWNERS) seeds.push(...r.candidates);
   }
   if (seeds.length) {
     const ids = new Set(seeds.flatMap((s) => [s.id, ...(s.kind !== 'file' && s.path ? [fileNode(db, s.path)?.id] : [])]).filter(Boolean));
@@ -128,7 +132,7 @@ export function why(db, question, { limit = 8, perSource = 3 } = {}) {
   const history = seeds.slice(0, 3).map((s) => ({ seed: s.key, commits: touchedBy.all(s.kind === 'file' ? s.id : fileNode(db, s.path)?.id ?? -1) }));
 
   return { question, terms: t, seeds: seeds.map((s) => s.key), lists: lists.map((l) => `${l.name}:${l.ids.length}`), gap: !picked.length,
-    citations: picked.map(cite), related: [...related.values()].sort((a, b) => b.citations - a.citations).slice(0, 10)
+    citations: picked.map((ch) => ({ ...cite(ch), mentions: mentions(ch) })), related: [...related.values()].sort((a, b) => b.citations - a.citations).slice(0, 10)
       .map((r) => ({ ...r, kinds: [...r.kinds] })), history };
 }
 
@@ -137,6 +141,47 @@ function cite(ch) {
   return { source: ch.source, cite: loc, sha: ch.sha, path: ch.path, lines: ch.path ? [ch.start_line, ch.end_line] : null,
     date: ch.date, prs: ch.prs || '', title: ch.title, snippet: snippet(ch.body), via: ch.via, score: +ch.score.toFixed(4),
     links: (ch.links || []).slice(0, 6).map((l) => l.kind === 'dir' ? `${l.path}/` : l.kind === 'file' ? l.path : `${l.path}#${l.name}`) };
+}
+
+// What a citation's text names that an agent might cite in turn: SHA-shaped strings (a build or deploy ID is
+// not a commit) and file names (a file the text names may be gone). Display only: ranking never looks at it.
+const SHA_RE = /(?<![\w-])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?!\w)/g;
+const FILE_RE = /(?<![\w@./[\]-])(?:\.\/|\/)?((?:[\w@.[\]-]+\/)*[\w@-][\w@.-]*\.(?:tsx?|jsx?|mjs|cjs|mdx?|json|ya?ml|sql|py|sh|css|scss|html|toml))(?!\.?[\w/(-])/g;   // not res.json(), not a.test.ts.snap
+function mentions(ch) {
+  const text = `${ch.title ?? ''}\n${ch.body ?? ''}`.replace(/\bhttps?:\/\/\S+/g, '');
+  return { shas: [...new Set(text.match(SHA_RE) || [])],
+    files: [...new Set([...text.matchAll(FILE_RE)].map((m) => m[1]))].filter((f) => !/^[A-Z]\w*\.js$/.test(f)) };   // Next.js, Node.js: names, not files
+}
+
+// marks each citation with the SHAs that are not commits and the files that are not in the checkout's tree
+// (a bare name counts if some tracked path ends with it), and says whether a cited doc is still there (`inTree`).
+// "In the tree" = tracked and on disk: a file the agent can open. Fails open: no git, no marks
+const OWN_FILE = new Set(['doc', 'change', 'changelog']);                // a vault note's path is outside the repo
+export function markMentions(repo, r) {
+  const all = r.citations.map((c) => c.mentions ?? { shas: [], files: [] });
+  const shas = [...new Set(all.flatMap((m) => m.shas))], files = all.flatMap((m) => m.files);
+  const own = r.citations.filter((c) => OWN_FILE.has(c.source) && c.path);
+  let isCommit = () => true, inTree = () => true, isThere = () => true;
+  try {
+    if (shas.length) {
+      const types = git(repo, ['cat-file', '--batch-check'], { input: shas.join('\n') + '\n' }).trim().split('\n');
+      const commits = new Set(shas.filter((_, i) => types[i]?.split(' ')[1] === 'commit'));
+      isCommit = (x) => commits.has(x);
+    }
+    if (files.length || own.length) {
+      const here = git(repo, ['ls-files', '-z']).split('\0').filter((p) => p && existsSync(join(repo, p)));
+      const full = new Set(here), suffixes = new Set(here.flatMap((p) => p.split('/').map((_, i, parts) => parts.slice(i).join('/'))));
+      inTree = (x) => suffixes.has(x);
+      isThere = (x) => full.has(x);
+    }
+  } catch { /* not a git checkout: no marks */ }
+  r.citations.forEach((c, i) => {
+    delete c.mentions;
+    if (own.includes(c)) c.inTree = isThere(c.path);
+    c.notCommits = all[i].shas.filter((x) => !isCommit(x));
+    c.notInTree = all[i].files.filter((x) => !inTree(x));
+  });
+  return r;
 }
 
 const snippet = (body) => body.replace(/^---[\s\S]*?---\s*/, '').replace(/^files: .*$/m, '').replace(/^#{1,6}\s.*$/gm, '')

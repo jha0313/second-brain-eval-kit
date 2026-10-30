@@ -23,6 +23,26 @@ export function headCommit(repo) {
   try { return git(repo, ['rev-parse', 'HEAD']).trim(); } catch { return null; }
 }
 
+// Tracked files with uncommitted edits. The build reads the working tree, so it records their content
+// hashes: an edit the index already holds is not "changed since the index".
+// -z: paths are not quoted (Korean names, spaces). A rename is "R  new\0old\0": both paths changed
+export function dirtyFiles(repo) {
+  const parts = git(repo, ['status', '--porcelain', '-z', '--untracked-files=no']).split('\0');
+  const out = [];
+  for (let i = 0; i < parts.length; i++) {
+    if (!parts[i]) continue;
+    out.push(parts[i].slice(3));
+    if (/[RC]/.test(parts[i].slice(0, 2))) out.push(parts[++i]);
+  }
+  return out;
+}
+
+export function contentHashes(repo, paths) {
+  const live = paths.filter((p) => existsSync(join(repo, p)));
+  const hashes = live.length ? git(repo, ['hash-object', '--', ...live]).trim().split('\n') : [];
+  return Object.fromEntries(paths.map((p) => [p, live.includes(p) ? hashes[live.indexOf(p)] : 'deleted']));
+}
+
 // Roles an agent filters by: "every server action that…", "every page that…", "…excluding tests".
 export function fileFlags(path, head) {
   const f = [];

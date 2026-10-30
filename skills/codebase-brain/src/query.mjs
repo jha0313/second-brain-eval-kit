@@ -1,7 +1,7 @@
 // Map queries. Every answer says how complete it is: truncated by a limit, or partial because
 // the index could not resolve some local imports, or stale because HEAD moved since the build.
 import { getMeta } from './db.mjs';
-import { git } from './files.mjs';
+import { git, dirtyFiles, contentHashes } from './files.mjs';
 
 const MODULE_EDGES = ['imports', 'imports-type', 'reexports', 'dynamic-import', 'mocks', 'includes'];
 const USAGE_EDGES = ['call', 'new', 'renders', 'extends', 'implements', 'type', 'ref'];
@@ -137,8 +137,10 @@ export function deps(db, node, { hops = 99, noTypes = false } = {}) {
   const out = db.prepare(`SELECT DISTINCT e.dst AS id, n.path, e.kind FROM edges e JOIN nodes n ON n.id = e.dst
     WHERE e.src = ? AND e.kind IN (${MODULE_EDGES.filter((k) => k !== 'mocks').map(() => '?').join(',')})`);
   const kinds = MODULE_EDGES.filter((k) => k !== 'mocks' && !(noTypes && k === 'imports-type'));
+  // deps is file level: a symbol starts from the file that defines it (module edges leave files, not symbols)
   const starts = node.kind === 'dir'
-    ? db.prepare(`SELECT id, path FROM nodes WHERE kind = 'file' AND path LIKE ?`).all(`${node.path}/%`) : [{ id: node.id, path: node.path }];
+    ? db.prepare(`SELECT id, path FROM nodes WHERE kind = 'file' AND path LIKE ?`).all(`${node.path}/%`)
+    : [{ id: node.kind === 'file' ? node.id : db.prepare('SELECT id FROM nodes WHERE key = ?').get(node.path)?.id, path: node.path }];
   const hopOf = new Map(starts.map((s) => [s.path, 0]));
   let frontier = starts;
   for (let hop = 1; hop <= hops && frontier.length; hop++) {
@@ -168,14 +170,24 @@ export function freshness(db, checkout) {
   const meta = getMeta(db);
   const hasCommit = (r) => { try { git(r, ['cat-file', '-e', `${meta.commit}^{commit}`], { stdio: ['ignore', 'pipe', 'ignore'] }); return true; } catch { return false; } };
   const repo = [checkout, meta.repo].find((r) => r && meta.commit && hasCommit(r)) ?? meta.repo;
-  const out = { commit: meta.commit, builtAt: meta.built_at, repo, head: null, changed: [] };
+  const out = { commit: meta.commit, builtAt: meta.built_at, repo, head: null, changed: [], state: 'unknown' };
   try {
     out.head = git(repo, ['rev-parse', 'HEAD']).trim();
-    const committed = out.head !== meta.commit ? git(repo, ['diff', '--name-only', `${meta.commit}..HEAD`]).split('\n') : [];
-    const working = git(repo, ['status', '--porcelain', '--untracked-files=no']).split('\n').map((l) => l.slice(3));
+    const committed = out.head !== meta.commit ? git(repo, ['diff', '--name-only', '-z', `${meta.commit}..HEAD`]).split('\0') : [];   // -z: no quoting
+    // an uncommitted edit counts only if its content differs from what the build read (meta.worktree)
+    const indexed = meta.worktree ?? {};
+    const check = [...new Set([...dirtyFiles(repo), ...Object.keys(indexed)])];
+    const now = check.length ? contentHashes(repo, check) : {};
+    const working = check.filter((p) => now[p] !== indexed[p]);
     out.changed = [...new Set([...committed, ...working].filter(Boolean))];
+    out.state = out.head !== meta.commit || out.changed.length ? 'stale' : 'fresh';
   } catch { out.head = null; }
   return { ...out, meta };
+}
+
+// the freshness every JSON answer carries: `coverage` says what the index holds, this says whether it still matches the checkout
+export function freshnessOf(f) {
+  return { state: f.state, commit: f.commit, head: f.head, changed: f.changed.length, files: f.changed.slice(0, 20) };
 }
 
 export function coverageFor(db, { truncated, paths = [] }) {
