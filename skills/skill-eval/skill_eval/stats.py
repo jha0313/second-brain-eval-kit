@@ -105,7 +105,9 @@ def aggregate(trials: list[dict], arms: list[str], case_ids: list[str], pairs=((
             "any_skill_loaded_in_none": any(t["skill_loaded"] for t in scored_all) if arm == "none" else None,
             "mean_seconds": _mean([t["metrics"]["seconds"] for t in scored_all]),
             "mean_seconds_passed": _mean([t["metrics"]["seconds"] for t in passed]),
-            "mean_tokens": _mean([t["metrics"]["tokens_total"] for t in scored_all]),
+            "mean_tokens": _mean([t["metrics"]["tokens_total"] for t in scored_all]),          # the graded attempt
+            "mean_tokens_all_attempts": _mean([t["metrics"].get("tokens_total_all_attempts", t["metrics"]["tokens_total"])
+                                               for t in scored_all]),                          # incl. infra retries
             "mean_output_tokens": _mean([t["metrics"]["tokens"]["output"] for t in scored_all]),
             "mean_usd": _mean([t["metrics"]["agent_usd"] for t in scored_all]),
             "mean_tool_calls": _mean([t["metrics"]["tool_calls"] for t in scored_all]),

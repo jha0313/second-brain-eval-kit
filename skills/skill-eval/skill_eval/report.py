@@ -160,6 +160,10 @@ def terminal(data: dict, color: bool = False, per_case: bool = False) -> str:
         ci = f"[{c['ci95'][0]:+.2f},{c['ci95'][1]:+.2f}]" if c["ci95"] else "[no CI]"
         lines.append(paint(f"Δ{tag}{c['control']:>4}→{c['treatment']:<4} {c['subset']:<8} {c['delta']:+.2f} {ci:<15} "
                            f"{c['families']:>2} fam  {_short_verdict(c)}", code))
+    retried = [a for a in arms if (agg["arms"][a].get("mean_tokens_all_attempts") or 0) > (agg["arms"][a]["mean_tokens"] or 0)]
+    if retried:
+        lines.append("  tokens incl. retried attempts: " + " · ".join(
+            f"{a} {agg['arms'][a]['mean_tokens_all_attempts']:,.0f}" for a in arms) + " (table: the graded attempt; $ = all attempts)")
     mdes = [c for c in agg["comparisons"] if c["subset"] == "all" and c.get("mde_80")]
     if mdes:
         lines.append("  검출력(어림값, 80%): " + " · ".join(f"{c['control']}→{c['treatment']} ±{c['mde_80']:.2f}" for c in mdes)
@@ -359,7 +363,11 @@ def scorecard(data: dict) -> str:
                    f'<td class="num">{_f(s["mean_tool_calls"], "{:.1f}")}</td><td class="num">{s.get("limits_hit", 0)}</td>'
                    f'<td class="num">{s.get("safety_violations", 0)}</td></tr>')
     out.append('</table></div><div class="legend">find-all 통과 = recall·precision이 실행 전에 고정한 기준선 이상. exact set = 정답 목록과 '
-               '하나도 안 빠지고 하나도 안 더한 비율(보조 지표). 시간은 채점된 trial 전체 평균 / 성공한 trial 평균.</div>')
+               '하나도 안 빠지고 하나도 안 더한 비율(보조 지표). 시간은 채점된 trial 전체 평균 / 성공한 trial 평균. '
+               '시간·토큰은 채점한 시도, $는 재시도까지 모든 시도 기준'
+               + "".join(f' · {_e(a)} 재시도 포함 토큰 {agg["arms"][a]["mean_tokens_all_attempts"]:,.0f}' for a in arms
+                         if (agg["arms"][a].get("mean_tokens_all_attempts") or 0) > (agg["arms"][a]["mean_tokens"] or 0))
+               + '.</div>')
 
     for kind, ids in _by_kind(m):
         out.append(f'<h2>{_e(KIND_TITLE.get(kind, kind))} ({len(ids)})</h2>' + _heat(m, agg, ids, arms))

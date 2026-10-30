@@ -202,3 +202,26 @@ def test_grade_updates_counts_cost_and_judge_metadata(monkeypatch, tmp_path, rep
     data, _ = _grade(monkeypatch, run, [GOOD] * 3)                        # a second re-grade adds to the history
     assert len(data["meta"]["regrades"]) == 2 and data["meta"]["spent_usd"] == pytest.approx(0.07 + 0.3)
     assert data["meta"]["counts"]["scored"] == 1 and data["meta"]["judge_models_seen"] == ["judge-m"]
+
+
+def test_tokens_count_every_attempt(monkeypatch, tmp_path):
+    # review r2 #6: judge tokens add up over attempts; the report keeps the graded attempt and all attempts apart
+    use = lambda n: {"judge-m": {"inputTokens": n, "outputTokens": 1}}  # noqa: E731
+    outs = iter([json.dumps({"total_cost_usd": 0.2, "result": "not json", "modelUsage": use(100)}),
+                 json.dumps({"total_cost_usd": 0.3, "modelUsage": use(200),
+                             "structured_output": {"items": [{"id": "a", "verdict": "PASS", "reason": "r"}]}})])
+    monkeypatch.setattr(judge, "_call", lambda *a: SimpleNamespace(stdout=next(outs)))
+    v = judge.one_vote("p", "m", ["a"])
+    assert v["tokens_by_model"]["judge-m"]["input"] == 300 and v["tokens_by_model"]["judge-m"]["output"] == 2
+
+    def trial(spec, n):
+        r = make_rec(spec)
+        if spec["arm"] == "v1":
+            r["metrics"].update(tokens_total=220, tokens_total_all_attempts=330)
+        return r
+    data, _ = fake_run(monkeypatch, tmp_path, [make_case("W0")], trial, k=2, canary=False)
+    v1 = data["aggregate"]["arms"]["v1"]
+    assert v1["mean_tokens"] == 220 and v1["mean_tokens_all_attempts"] == 330
+    assert data["aggregate"]["arms"]["none"]["mean_tokens_all_attempts"] == 10
+    _, text = report.write_reports(data, tmp_path / "out")
+    assert "incl. retried attempts" in text

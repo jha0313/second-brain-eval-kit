@@ -112,7 +112,7 @@ def one_vote(prompt: str, model: str, ids: list[str], timeout_s: int = 300) -> d
     settings = trial_settings(None, [])
     cmd = claude_cmd(prompt, model=model, settings=settings, tools="", max_turns=3, max_usd=1.0, output="json")
     cmd += ["--json-schema", json.dumps(SCHEMA)]
-    cost, unknown = 0.0, 0                       # every attempt is paid for, not only the one that worked
+    cost, unknown, tokens = 0.0, 0, {}           # every attempt is paid for and uses tokens, not only the one that worked
     for attempt in range(2):                     # grader_error: re-run the grader, never the agent
         with tempfile.TemporaryDirectory(prefix="skill-eval-judge-") as d, TrialEnv() as env:
             p = _call(cmd, d, env, timeout_s)
@@ -120,15 +120,19 @@ def one_vote(prompt: str, model: str, ids: list[str], timeout_s: int = 300) -> d
         try:
             out = json.loads(p.stdout)
             cost += float(out.get("total_cost_usd") or 0)
+            for m, t in model_tokens(out.get("modelUsage")).items():
+                row = tokens.setdefault(m, {})
+                for k, n in t.items():
+                    row[k] = row.get(k, 0) + n
             data = out.get("structured_output") or json.loads(out.get("result", ""))
             items = [i for i in data["items"] if i.get("id") in ids and i.get("verdict") in ("PASS", "FAIL")]
             if len(items) == len(ids) and {i["id"] for i in items} == set(ids):
                 return {"items": items, "cost_usd": cost, "cost_unknown_attempts": unknown, "attempts": attempt + 1,
-                        "models": sorted(out.get("modelUsage") or {}), "tokens_by_model": model_tokens(out.get("modelUsage"))}
+                        "models": sorted(tokens), "tokens_by_model": tokens}
         except (json.JSONDecodeError, KeyError, TypeError, AttributeError, ValueError):
             unknown += not isinstance(out, dict)
     return {"items": [{"id": i, "verdict": "FAIL", "reason": "grader_error: invalid judge output"} for i in ids],
-            "cost_usd": cost, "cost_unknown_attempts": unknown, "grader_error": True, "attempts": 2}
+            "cost_usd": cost, "cost_unknown_attempts": unknown, "grader_error": True, "attempts": 2, "tokens_by_model": tokens}
 
 
 def _call(cmd, cwd, env, timeout_s):
