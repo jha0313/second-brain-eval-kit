@@ -112,21 +112,37 @@ def one_vote(prompt: str, model: str, ids: list[str], timeout_s: int = 300) -> d
     settings = trial_settings(None, [])
     cmd = claude_cmd(prompt, model=model, settings=settings, tools="", max_turns=3, max_usd=1.0, output="json")
     cmd += ["--json-schema", json.dumps(SCHEMA)]
+    cost, unknown = 0.0, 0                       # every attempt is paid for, not only the one that worked
     for attempt in range(2):                     # grader_error: re-run the grader, never the agent
         with tempfile.TemporaryDirectory(prefix="skill-eval-judge-") as d, TrialEnv() as env:
-            p = subprocess.run(cmd, cwd=d, env=env, stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True, timeout=timeout_s)
+            p = _call(cmd, d, env, timeout_s)
+        out = None
         try:
             out = json.loads(p.stdout)
+            cost += float(out.get("total_cost_usd") or 0)
             data = out.get("structured_output") or json.loads(out.get("result", ""))
             items = [i for i in data["items"] if i.get("id") in ids and i.get("verdict") in ("PASS", "FAIL")]
-            if {i["id"] for i in items} == set(ids):
-                return {"items": items, "cost_usd": float(out.get("total_cost_usd") or 0), "attempts": attempt + 1,
+            if len(items) == len(ids) and {i["id"] for i in items} == set(ids):
+                return {"items": items, "cost_usd": cost, "cost_unknown_attempts": unknown, "attempts": attempt + 1,
                         "models": sorted(out.get("modelUsage") or {}), "tokens_by_model": model_tokens(out.get("modelUsage"))}
-        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
-            pass
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError, ValueError):
+            unknown += not isinstance(out, dict)
     return {"items": [{"id": i, "verdict": "FAIL", "reason": "grader_error: invalid judge output"} for i in ids],
-            "cost_usd": 0.0, "grader_error": True, "attempts": 2}
+            "cost_usd": cost, "cost_unknown_attempts": unknown, "grader_error": True, "attempts": 2}
+
+
+def _call(cmd, cwd, env, timeout_s):
+    try:
+        return subprocess.run(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, -9, "", "timeout")
+
+
+def usable_votes(votes: list[dict], needed: int) -> list[dict] | None:
+    """Votes without grader_error, or None if fewer than `needed` are left. A broken judge is the harness's
+    failure: those votes must not count as FAIL items, and too few good votes exclude the trial (infra), never score it 0."""
+    good = [v for v in votes if not v.get("grader_error")]
+    return good if len(good) >= needed else None
 
 
 def judge(case, traj: dict, model: str, votes: int = 3, repo: Path | None = None, commit: str = "") -> list[dict]:

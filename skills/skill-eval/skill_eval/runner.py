@@ -256,6 +256,7 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
     lim = case.limits
     cmd = claude_cmd(case.prompt, model=suite.model, settings=settings, tools=suite.tools,
                      max_turns=lim["max_turns"], max_usd=lim["max_usd"], effort=suite.effort)
+    attempts = []                                 # every attempt is paid for: keep each one's cost, time and tokens
     for attempt in range(3):                      # infra errors: retry up to 2 times
         ws = make_workspace(templates[arm], ws_root)
         start, timed_out = time.time(), False
@@ -277,6 +278,8 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
         traj["ws_state"] = state
         infra = not timed_out and (not traj["has_result"] or (traj["is_error"] and (
             traj["terminal_reason"] == "api_error" or any(m in traj["error_text"] for m in INFRA_MARKERS))))
+        attempts.append({"seconds": round(seconds, 1), "usd": traj["cost_usd"], "usd_known": traj["has_result"],
+                         "tokens_total": sum(traj["tokens"].values()), "infra": infra})
         if not infra:
             break
         time.sleep(5 * (attempt + 1))
@@ -288,9 +291,14 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
            "truncated_output": checks.truncated_output(traj)}
     rec["isolation_ok"], rec["isolation_detail"] = isolation_ok(traj, arm_skill)
     tokens = traj["tokens"]
-    rec["metrics"] = {"seconds": round(seconds, 1), "agent_usd": traj["cost_usd"], "judge_usd": 0.0, "tokens": tokens,
+    # seconds and tokens describe the attempt that was graded; $ is every attempt (an infra attempt with no result
+    # line has an unknown cost: counted in cost_unknown_attempts, not assumed 0)
+    rec["metrics"] = {"seconds": round(seconds, 1), "agent_usd": sum(x["usd"] for x in attempts), "judge_usd": 0.0, "tokens": tokens,
                       "tokens_total": sum(tokens.values()), "tool_calls": len(traj["tool_calls"]), "turns": traj["num_turns"],
-                      "permission_denials": traj["permission_denials"], "tokens_by_model": traj["tokens_by_model"]}
+                      "permission_denials": traj["permission_denials"], "tokens_by_model": traj["tokens_by_model"],
+                      "attempts": attempts, "cost_unknown_attempts": sum(not x["usd_known"] for x in attempts),
+                      "seconds_all_attempts": round(sum(x["seconds"] for x in attempts), 1),
+                      "tokens_total_all_attempts": sum(x["tokens_total"] for x in attempts)}
     rec["permission_denied"] = [f"{c['name']} {json.dumps(c['input'], ensure_ascii=False)[:120]}"
                                 for c in traj["tool_calls"] if DENIED_RE.search(c["output"] or "")]
     rec["final_excerpt"] = (traj["final"] or "")[:1500]

@@ -166,7 +166,7 @@ def load_case(path: Path, suite: Suite) -> Case:
         if name not in HARD_CHECKS:
             raise SuiteError(f"{path.name}: unknown hard check '{name}'")
         args = dict(args or {})
-        if name == "set_match":
+        if name in ("set_match", "sources_hit"):   # keys sit next to the case file, like JSON cases' answer_key
             args["key"] = str(_resolve(path.parent, args["key"]))
             if not Path(args["key"]).exists():
                 raise SuiteError(f"{path.name}: answer key not found: {args['key']}")

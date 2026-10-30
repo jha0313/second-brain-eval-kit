@@ -80,8 +80,9 @@ def aggregate(trials: list[dict], arms: list[str], case_ids: list[str], pairs=((
                 "n": n, "passes": c, "attempted": len(ts),
                 "excluded": len([t for t in ts if t["outcome"] not in SCORED]),
                 "mean_score": _mean([t["score"] for t in scored]),
-                "pass_at_k": pass_at_k(n, c, n) if n else None,
-                "pass_hat_k": pass_hat_k(n, c, n) if n else None,
+                # pass@k / pass^k need every planned repeat scored: with 1 of 3 left, pass^3 would read as pass^1
+                "pass_at_k": pass_at_k(n, c, n) if n and n == len(ts) else None,
+                "pass_hat_k": pass_hat_k(n, c, n) if n and n == len(ts) else None,
                 "exact_rate": _mean([float(x) for x in exact]),
                 "recall": _mean([h.get("recall") for h in set_m]),
                 "precision": _mean([h.get("precision") for h in set_m]),
