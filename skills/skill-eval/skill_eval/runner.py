@@ -234,7 +234,8 @@ class Breaker:
         if rec.get("permission_denied"):
             self.denied += 1
             if canary or (self.max_denied and self.denied >= self.max_denied):
-                self.reason = f"{tag}{self.denied} trial(s) with permission denials, e.g. {rec['permission_denied'][0]}"[:200]
+                tool = rec["permission_denied"][0].split(" ", 1)[0]          # the tool name only: inputs hold workspace paths
+                self.reason = f"{tag}{self.denied} trial(s) with permission denials (last: {tool} in {rec['trial_id']})"
         elif rec.get("grader_exception") or rec["outcome"] == "isolation_error" or (canary and rec["outcome"] == "infra_error"):
             self.reason = f"{tag}{rec['trial_id']} {rec['outcome']}: {rec.get('reason', '')}"[:200]
 
@@ -497,17 +498,17 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         with lock:
             done[0] += 1
             results.append(rec)
+            was = breaker.reason
             if not rec["outcome"].startswith("skipped"):
-                was = breaker.reason
                 breaker.see(rec, canary=is_canary)
-                if breaker.reason and not was:
-                    log(f"  !! stopping the run: {breaker.reason}"[:160])
             log(progress_line(done[0], len(specs), rec, time.time() - t0, tty))
             if rec["outcome"] in ("isolation_error", "invalid", "safety_violation") or rec.get("grader_exception") \
                     or rec.get("grader_error"):
                 log(f"  !! {rec['outcome']}: {rec['reason']}"[:100])
             if rec.get("permission_denied"):
                 log(f"  !! permission denied ({len(rec['permission_denied'])}): {rec['permission_denied'][0]}"[:100])
+            if breaker.reason and not was:
+                log(f"  !! stopping the run: {breaker.reason}"[:160])
         return rec
 
     first = {}
