@@ -124,6 +124,17 @@ check('JSON answers carry freshness: fresh right after the build', () => {
     assert.equal(r.freshness.state, 'fresh');
 });
 check('build --if-stale skips a fresh index', () => assert.equal(rebuild().skipped, true));
+check('build --if-stale rebuilds when the build options differ, and always with --vault', () => {
+  const skipped = (...extra) => JSON.parse(sh(brain, ['build', '.', '--db', db, '--if-stale', '--json', ...extra])).skipped;
+  assert.equal(skipped('--no-knowledge'), false);
+  assert.equal(skipped('--no-knowledge'), true);
+  assert.equal(skipped(), false);                          // back to the default options
+  assert.equal(skipped('--include-root', 'src'), false);
+  assert.equal(skipped('--vault', 'docs'), false);
+  assert.equal(skipped('--vault', 'docs'), false);         // vault notes are outside git: no way to tell they did not change
+  assert.equal(skipped(), false);
+  assert.equal(skipped(), true);
+});
 appendFileSync(join(repo, 'src/lib/charge.ts'), '// edited after the build\n');
 check('an uncommitted edit makes JSON and why answers stale', () => {
   const r = q('why', 'why does reserve throw InsufficientCredits instead of returning false?');

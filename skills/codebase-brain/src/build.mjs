@@ -52,6 +52,7 @@ export function build({ repo, dbPath, vault, includeRoots = [], noKnowledge = fa
     setMeta(db, 'built_at', new Date().toISOString());
     setMeta(db, 'tracked_files', tracked.length);
     setMeta(db, 'vault', vault ?? null);
+    setMeta(db, 'options', { includeRoots, noKnowledge });
     if (commit) setMeta(db, 'worktree', contentHashes(repo, dirtyFiles(repo)));
     setMeta(db, 'stats', stats);
     setMeta(db, 'coverage', { unresolvedLocal, programs: stats.ts?.programs ?? 0, orphans: stats.ts?.orphans ?? 0 });

@@ -119,16 +119,18 @@ const cmds = {
   build({ pos, opt }) {
     const repo = resolve(pos[0] || opt.repo || '.');
     const dbPath = opt.db ? resolve(opt.db) : process.env.BRAIN_DB ? resolve(process.env.BRAIN_DB) : defaultDbPath(repo);
-    // --if-stale: keep an index of this repo (same --vault) that still matches the checkout. Vault edits are not tracked
-    if (opt['if-stale'] && existsSync(dbPath)) {
+    const options = { includeRoots: opt['include-root'], noKnowledge: !!opt['no-knowledge'] };
+    // --if-stale: keep an index of this repo, built with the same options, that still matches the checkout.
+    // A vault always rebuilds: its notes are outside git, so nothing tells us they did not change
+    if (opt['if-stale'] && existsSync(dbPath) && !opt.vault) {
       const db = openDb(dbPath), f = freshness(db, repo);
       db.close();
-      if (f.state === 'fresh' && f.meta.repo === repo && f.meta.vault === (opt.vault ?? null)) {
+      if (f.state === 'fresh' && f.meta.repo === repo && !f.meta.vault && JSON.stringify(f.meta.options) === JSON.stringify(options)) {
         console.error(`brain build: index @${f.commit.slice(0, 8)} is fresh — skipped (drop --if-stale to rebuild)`);
         return opt.json && out(JSON.stringify({ db: dbPath, skipped: true, freshness: freshnessOf(f) }));
       }
     }
-    const r = build({ repo, dbPath, vault: opt.vault, includeRoots: opt['include-root'], noKnowledge: opt['no-knowledge'], tilde });
+    const r = build({ repo, dbPath, vault: opt.vault, ...options, tilde });
     if (opt.json) out(JSON.stringify({ db: dbPath, skipped: false, ...r }));
   },
 

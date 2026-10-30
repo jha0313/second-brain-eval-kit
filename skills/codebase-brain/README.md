@@ -24,7 +24,7 @@ cd /path/to/repo && brain build . --if-stale                             # 대�
 
 | 명령 | 하는 일 |
 |---|---|
-| `brain build <repo> [--if-stale]` | 인덱스 만들기. `--if-stale`: 같은 repo의 인덱스가 아직 맞으면 건너뜀 |
+| `brain build <repo> [--if-stale]` | 인덱스 만들기. `--if-stale`: 같은 repo·같은 빌드 옵션의 인덱스가 아직 맞으면 건너뜀. `--vault`를 주면 늘 다시 빌드(vault는 git 밖이라 바뀌었는지 모름) |
 | `brain status` | 인덱스 커밋·나이, HEAD 이후 바뀐 파일, 미해결 import, 이름 연결에서 뺀 이름 수 |
 | `brain find <이름>` | 심볼·파일 → ID(`path#Name`) |
 | `brain refs <ID>` | 사용 위치 전부 (`--kind call,renders,type…`, `--filter page,route,test,server-action`, `--files`) |
