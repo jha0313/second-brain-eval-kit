@@ -269,6 +269,17 @@ def test_grade_updates_counts_cost_and_judge_metadata(monkeypatch, tmp_path, rep
     assert data["meta"]["cost_unknown_attempts"] == 3
 
 
+def test_grade_replaces_judge_tokens_with_the_new_votes(monkeypatch, tmp_path, repo):
+    # review r3 (small): a re-grade's votes replace the old ones, and so must their token counts
+    repo.write({"a.ts": "x\n"})
+    run = stored_run(tmp_path, repo, "pass", score=1.0, passed=True, votes=[GOOD] * 3)
+    data = json.loads((run / "results.json").read_text())
+    data["trials"][0]["metrics"]["judge_tokens_by_model"] = {"old-m": {"output": 99}}
+    (run / "results.json").write_text(json.dumps(data))
+    data, _ = _grade(monkeypatch, run, [{**GOOD, "tokens_by_model": {"judge-m": {"output": 2}}}] * 3)
+    assert data["trials"][0]["metrics"]["judge_tokens_by_model"] == {"judge-m": {"output": 6}}
+
+
 def test_tokens_count_every_attempt(monkeypatch, tmp_path):
     # review r2 #6: judge tokens add up over attempts; the report keeps the graded attempt and all attempts apart
     use = lambda n: {"judge-m": {"inputTokens": n, "outputTokens": 1}}  # noqa: E731

@@ -210,6 +210,7 @@ def cmd_grade(a):
             judge_usd += sum(v.get("cost_usd", 0) for v in votes)
             unknown += sum(v.get("cost_unknown_attempts", 0) for v in votes)
             rec["judge_models"] = sorted({m for v in votes for m in v.get("models", [])})
+            rec["metrics"]["judge_tokens_by_model"] = runner._sum_tokens(v.get("tokens_by_model") or {} for v in votes)
         else:
             votes = rec.get("votes")
         used = judge.usable_votes(votes, len(votes) // 2 + 1) if votes and not failed else None
