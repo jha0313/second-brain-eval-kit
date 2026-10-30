@@ -173,7 +173,7 @@ export function freshness(db, checkout) {
   const out = { commit: meta.commit, builtAt: meta.built_at, repo, head: null, changed: [], state: 'unknown' };
   try {
     out.head = git(repo, ['rev-parse', 'HEAD']).trim();
-    const committed = out.head !== meta.commit ? git(repo, ['diff', '--name-only', `${meta.commit}..HEAD`]).split('\n') : [];
+    const committed = out.head !== meta.commit ? git(repo, ['diff', '--name-only', '-z', `${meta.commit}..HEAD`]).split('\0') : [];   // -z: no quoting
     // an uncommitted edit counts only if its content differs from what the build read (meta.worktree)
     const indexed = meta.worktree ?? {};
     const check = [...new Set([...dirtyFiles(repo), ...Object.keys(indexed)])];

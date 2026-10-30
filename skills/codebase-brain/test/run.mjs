@@ -158,6 +158,12 @@ check('a file with a Korean name: an edit after each build is "changed", under i
   appendFileSync(join(repo, 'notes/메모.txt'), '또 한 줄\n');
   assert.equal(q('status').state, 'stale');
 });
+check('after a commit, the changed files are listed under their real names (Korean too)', () => {
+  sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-am', 'notes: one more line']);
+  const r = q('status');
+  assert.equal(r.state, 'stale');
+  assert.deepEqual([...r.changed].sort(), ['notes/메모.txt', 'src/lib/charge.ts']);
+});
 check('a cited doc that is gone from disk is marked, in JSON and text', () => {
   rmSync(join(repo, 'docs/credits.md'));                   // still tracked, but there is nothing to open
   const ask = 'why does reserve throw InsufficientCredits instead of returning false?';
