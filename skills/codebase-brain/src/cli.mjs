@@ -98,6 +98,18 @@ function footer(db, cov, extra = '') {
 const routeUrl = (p) => '/' + p.replace(/^(.*\/)?app\//, '').split('/').slice(0, -1)
   .filter((s) => !/^\(.*\)$/.test(s) && !s.startsWith('@')).join('/').replace(/\/?\[.*$/, '');
 
+// a path is never cut (the agent cites it or passes it on): one wider than its room goes whole on its own line under the row
+function tableWhole(head, rows, col, opts = {}) {
+  const max = opts.max || [];
+  const widthOf = (i) => Math.max(...[head, ...rows].map((r) => Math.min(width(String(r[i] ?? '')), max[i] || Infinity)));
+  const room = COLS - 2 - head.reduce((s, _, i) => (i === col ? s : s + widthOf(i) + 2), 0);
+  const long = (v) => width(String(v)) > room;
+  const lines = table(head, rows.map((r) => r.map((v, i) => (i === col && long(v) ? '↓' : v))),
+    { ...opts, max: head.map((_, i) => (i === col ? 0 : max[i])) }).split('\n');
+  rows.forEach((r, i) => { if (long(r[col])) lines[2 + i] += '\n    ' + r[col]; });
+  return lines.join('\n');
+}
+
 function describe(n) {
   return `${c.bold(n.key)} ${c.dim(`(${n.kind}${n.exported ? ', exported' : ''}${n.flags ? ', ' + n.flags : ''})`)}`;
 }
@@ -162,8 +174,12 @@ const cmds = {
     const r = refs(db, node, { kinds, filter: list(opt.filter), exclude: list(opt.exclude), includeImports: opt.imports,
       limit: opt.files ? 1e9 : +(opt.limit || 50), cursor: +(opt.cursor || 0) });
     const cov = coverageFor(db, { truncated: r.next !== null });
+    const site = (x) => ({ kind: x.kind, site: `${x.path}:${x.line}:${x.col}`, in: x.in_kind === 'file' ? null : x.in_name, flags: x.flags || '' });
+    // --files: one row per file (its first site, the site count, every kind), not one per site
+    const perFile = () => [...Map.groupBy(r.rows, (x) => x.path).values()]
+      .map((xs) => ({ ...site(xs[0]), kind: [...new Set(xs.map((x) => x.kind))].join(' '), sites: xs.length }));
     if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total: r.total, files: r.files, next: r.next, coverage: cov, freshness: fresh(db),
-      sites: r.rows.map((x) => ({ kind: x.kind, site: `${x.path}:${x.line}:${x.col}`, in: x.in_kind === 'file' ? null : x.in_name, flags: x.flags || '' })) }));
+      sites: opt.files ? perFile() : r.rows.map(site) }));
     const where = node.path && node.kind !== 'file' ? c.dim(`defined ${node.path}:${node.line}`) : '';
     const head = `${mode} ${describe(node)}`;
     out(where && width(head) + width(where) + 2 > COLS ? `${head}\n  ${where}` : `${head}${where ? '  ' + where : ''}`);
@@ -176,10 +192,10 @@ const cmds = {
       }
       const rows = [...by.values()].map((g) => [g.path + c.dim(`:${g.lines.slice(0, 3).join(',')}`), ...(mode === 'callers' ? [g.in] : []), g.n,
         [...g.kinds].map(([k, n]) => (n > 1 ? `${k}×${n}` : k)).join(' '), g.flags || '']);
-      out(table(['FILE', ...(mode === 'callers' ? ['CALLER'] : []), 'SITES', 'KINDS', 'ROLE'], rows,
-        { align: mode === 'callers' ? ['l', 'l', 'r'] : ['l', 'r'], max: [78, 34] }));
+      out(tableWhole(['FILE', ...(mode === 'callers' ? ['CALLER'] : []), 'SITES', 'KINDS', 'ROLE'], rows, 0,
+        { align: mode === 'callers' ? ['l', 'l', 'r'] : ['l', 'r'], max: [0, 34] }));
     } else {
-      out(table(['KIND', 'SITE', 'IN', 'ROLE'], r.rows.map((x) => [x.kind, `${x.path}:${x.line}`, x.in_kind === 'file' ? c.dim('(top level)') : x.in_name, x.flags || '']), { max: [0, 80, 32] }));
+      out(tableWhole(['KIND', 'SITE', 'IN', 'ROLE'], r.rows.map((x) => [x.kind, `${x.path}:${x.line}`, x.in_kind === 'file' ? c.dim('(top level)') : x.in_name, x.flags || '']), 1, { max: [0, 0, 32] }));
     }
     out(c.dim(`  ${plural(r.total, 'site')} in ${plural(r.files, 'file')}`) + (r.next !== null ? c.yellow(` · showing ${+(opt.cursor || 0) + 1}–${r.next} · next: --cursor ${r.next}`) : ''));
     footer(db, cov);
@@ -220,8 +236,9 @@ const cmds = {
     const node = target(db, pos[0], opt);
     const r = deps(db, node, { hops: +(opt.hops || 99), noTypes: opt['no-types'] });
     const rows = [...r.hopOf].filter(([, h]) => h > 0).sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]));
-    if (opt.json) return out(JSON.stringify({ target: node.key, total: rows.length, coverage: coverageFor(db, { truncated: false }), freshness: fresh(db), files: rows.map(([p, h]) => ({ path: p, hop: h })) }));
+    if (opt.json) return out(JSON.stringify({ target: node.key, from: node.path, total: rows.length, coverage: coverageFor(db, { truncated: false }), freshness: fresh(db), files: rows.map(([p, h]) => ({ path: p, hop: h })) }));
     out(`deps ${describe(node)}: ${plural(rows.length, 'file')} pulled in`);
+    if (!['file', 'dir'].includes(node.kind)) out(c.dim(`  file level: what ${node.path} (where ${node.name} is defined) pulls in`));
     if (opt.list) for (const [p, h] of rows) out(`  ${h}\t${p}`);
     else out(table(['HOP', 'FILES'], Object.entries(rows.reduce((a, [, h]) => ({ ...a, [h]: (a[h] || 0) + 1 }), {})), { align: ['l', 'r'] }));
     footer(db, coverageFor(db, { truncated: false }));

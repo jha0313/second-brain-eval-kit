@@ -1,6 +1,6 @@
-// Fixture test: the cases a real repo throws at the TS adapter, in 17 files.
+// Fixture test: the cases a real repo throws at the TS adapter, in 18 files.
 // two tsconfigs with different `paths` · alias imports · a barrel with a renamed re-export · `const X` + `type X`
-// · dynamic import() destructuring · a file in no tsconfig · a generated file · vi.mock · node_modules committed to git
+// · dynamic import() destructuring · a file in no tsconfig · a generated file · vi.mock · node_modules committed to git · a path over 100 chars
 import { cpSync, mkdtempSync, existsSync, appendFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir, homedir } from 'node:os';
@@ -60,6 +60,24 @@ check('a route file nothing imports: impact 0 says it is reached by URL and what
   assert.match(r.hint, /grep "\/api\/run"/);
   assert.match(sh(brain, ['impact', 'app/api/run/route.ts'], { BRAIN_DB: db, NO_COLOR: '1' }), /reached by URL.*grep "\/api\/run"/);
   assert.equal(q('impact', 'scripts/gen.mjs').hint, undefined);        // 0 importers, but not a route
+});
+
+const LONG = 'src/ui/billing/usage-meters/organization-settings/credit-balance-panels/CreditBalanceMeterWithLabel.tsx';
+const narrow = (...args) => sh(brain, args, { BRAIN_DB: db, NO_COLOR: '1', COLUMNS: '100' });
+check('refs never cuts a path: a long one goes whole on its own line (file table and site table)', () => {
+  assert.ok(narrow('refs', 'src/ui/Meter.tsx', '--files').includes(LONG));
+  assert.ok(narrow('refs', 'src/ui/Meter.tsx#Meter').includes(`${LONG}:5`));
+});
+check('refs --files --json gives one row per file, with the site count', () => {
+  const r = q('refs', 'src/ui/Meter.tsx#Meter', '--files');
+  assert.deepEqual(r.sites.map((s) => s.site.split(':')[0]), ['app/dash/page.tsx', LONG]);
+  assert.equal(r.sites.find((s) => s.site.startsWith(LONG)).sites, 2);
+});
+check('deps of a symbol is the closure of its file, not a silent 0', () => {
+  const r = q('deps', 'src/lib/charge.ts#charge');
+  assert.ok(r.total > 0);
+  assert.deepEqual(r.files, q('deps', 'src/lib/charge.ts').files);
+  assert.equal(r.from, 'src/lib/charge.ts');
 });
 
 const w = q('why', 'why does reserve throw InsufficientCredits instead of returning false?');

@@ -137,8 +137,10 @@ export function deps(db, node, { hops = 99, noTypes = false } = {}) {
   const out = db.prepare(`SELECT DISTINCT e.dst AS id, n.path, e.kind FROM edges e JOIN nodes n ON n.id = e.dst
     WHERE e.src = ? AND e.kind IN (${MODULE_EDGES.filter((k) => k !== 'mocks').map(() => '?').join(',')})`);
   const kinds = MODULE_EDGES.filter((k) => k !== 'mocks' && !(noTypes && k === 'imports-type'));
+  // deps is file level: a symbol starts from the file that defines it (module edges leave files, not symbols)
   const starts = node.kind === 'dir'
-    ? db.prepare(`SELECT id, path FROM nodes WHERE kind = 'file' AND path LIKE ?`).all(`${node.path}/%`) : [{ id: node.id, path: node.path }];
+    ? db.prepare(`SELECT id, path FROM nodes WHERE kind = 'file' AND path LIKE ?`).all(`${node.path}/%`)
+    : [{ id: node.kind === 'file' ? node.id : db.prepare('SELECT id FROM nodes WHERE key = ?').get(node.path)?.id, path: node.path }];
   const hopOf = new Map(starts.map((s) => [s.path, 0]));
   let frontier = starts;
   for (let hop = 1; hop <= hops && frontier.length; hop++) {
