@@ -46,6 +46,55 @@ def _ci(c) -> str:
     return f"[{c['ci95'][0]:+.2f}, {c['ci95'][1]:+.2f}]" if c["ci95"] else "[CI 없음]"
 
 
+def failure_causes(trials: list[dict], arms: list[str]) -> list[tuple[str, dict[str, int]]]:
+    """Why trials did not pass, one cause per trial (the first failed gate, its cites_exist labels, the rubric items,
+    or the exclusion), counted per arm and sorted by total. Two extra rows, not causes: trials with a permission
+    denial, and trials whose judge votes disagreed on some item (e.g. 2:1)."""
+    rows: dict[str, dict[str, int]] = {}
+
+    def add(cause, arm):
+        rows.setdefault(cause, {a: 0 for a in arms})
+        rows[cause][arm] = rows[cause].get(arm, 0) + 1
+
+    for t in trials:
+        o = t["outcome"]
+        if o == "pass":
+            continue
+        h = next((h for h in t.get("hard") or [] if h.get("gate") and h.get("ok") is False), None)
+        if o not in SCORED:
+            cause = f"제외 · {o}"
+        elif o == "limit":
+            cause = "limit · 턴·시간·$ 한도"
+        elif h:
+            cause = h["check"] + (f" · {', '.join(sorted(h['missing_kinds']))}" if h.get("missing_kinds") else "")
+        elif t.get("rubric"):
+            cause = "judge · " + ", ".join(i for i, v in t["rubric"].items() if v != "PASS")
+        else:
+            cause = o
+        add(cause, t["arm"])
+    out = sorted(rows.items(), key=lambda kv: (-sum(kv[1].values()), kv[0]))
+    denied = {a: sum(bool(t.get("permission_denied")) for t in trials if t["arm"] == a) for a in arms}
+    split = {a: sum(_split(t) for t in trials if t["arm"] == a) for a in arms}
+    return out + [(r, v) for r, v in (("(권한 거부가 있던 trial)", denied), ("(judge 표가 갈린 trial)", split)) if any(v.values())]
+
+
+def _split(t) -> bool:
+    votes = [v for v in t.get("votes") or [] if not v.get("grader_error")]
+    seen: dict[str, set] = {}
+    for v in votes:
+        for i in v.get("items", []):
+            seen.setdefault(i["id"], set()).add(i["verdict"])
+    return any(len(x) > 1 for x in seen.values())
+
+
+def _mde_text(c) -> str:
+    if not c.get("mde_80"):
+        return ""
+    need = c.get("families_for_delta_0_05")
+    return (f"이 크기로 80% 확률로 검출하는 차이 ≈ ±{c['mde_80']:.2f}(어림값)"
+            + (f" · Δ 0.05를 잡으려면 가족 약 {need}개" if need and need > c["families"] else ""))
+
+
 def _comp_line(c) -> str:
     return (f"Δ {c['control']:>4}→{c['treatment']:<3} {c['subset']:<8} {c['delta']:+.2f}  탐색적 95% CI {_ci(c):<16} "
             f"({c['cases']} cases / {c['families']} families)  {c['verdict']}")
@@ -111,6 +160,10 @@ def terminal(data: dict, color: bool = False, per_case: bool = False) -> str:
         ci = f"[{c['ci95'][0]:+.2f},{c['ci95'][1]:+.2f}]" if c["ci95"] else "[no CI]"
         lines.append(paint(f"Δ{tag}{c['control']:>4}→{c['treatment']:<4} {c['subset']:<8} {c['delta']:+.2f} {ci:<15} "
                            f"{c['families']:>2} fam  {_short_verdict(c)}", code))
+    mdes = [c for c in agg["comparisons"] if c["subset"] == "all" and c.get("mde_80")]
+    if mdes:
+        lines.append("  검출력(어림값, 80%): " + " · ".join(f"{c['control']}→{c['treatment']} ±{c['mde_80']:.2f}" for c in mdes)
+                     + " — 이보다 작은 차이는 이 케이스 수로 보기 어렵다")
     sens = agg.get("sensitivity")
     if sens and sens["comparisons"]:
         lines.append(f"  민감도({'·'.join(sens['exclude'])} 제외): " + " · ".join(
@@ -131,6 +184,14 @@ def terminal(data: dict, color: bool = False, per_case: bool = False) -> str:
                  + f"cut-off {m.get('truncated_output', 0)} · denied {len(m.get('permission_denied_trials') or [])} · "
                  + f"isolation {'OK' if m['isolation']['all_ok'] else 'BROKEN'}")
     lines.append("* = pre-registered primary metric · CI = exploratory paired bootstrap over case families")
+    if per_case:
+        causes = failure_causes(data["trials"], arms)
+        if causes:
+            w = max(len(c) for c, _ in causes) + 2
+            lines += ["", f"failure causes (trials) {'':<{max(0, w - 24)}}" + "".join(f"{a:>7}" for a in arms)]
+            lines += [f"  {c:<{w - 2}}" + "".join(f"{v.get(a, 0):>7}" for a in arms) for c, v in causes]
+    if m.get("stopped"):
+        lines.append(paint(f"! run stopped early: {m['stopped']}", "31"))
     for key, label in (("models_seen", "agent models"), ("claude_code_versions_seen", "Claude Code versions")):
         if len(m.get(key) or []) > 1:
             lines.append(paint(f"! {label} differ across trials: {', '.join(m[key])}", "33"))
@@ -234,7 +295,8 @@ def _comp_card(title, comps, agg):
                    f'{c["families"]}가족 · {_e(c["verdict"])}</div>' for c in comps[1:])
     return (f'<div class="card"><div class="q">{_e(title)}</div><div class="big">Δ {main["delta"]:+.2f}</div>{_ci_svg(main)}'
             f'<div class="sub"><b>{_e(main["subset"])}</b> · {main["control_mean"]:.2f} → {main["treatment_mean"]:.2f} · 탐색적 95% CI '
-            f'{_ci(main)} · {main["cases"]}케이스/{main["families"]}가족<br><b>{_e(main["verdict"])}</b></div>'
+            f'{_ci(main)} · {main["cases"]}케이스/{main["families"]}가족<br><b>{_e(main["verdict"])}</b>'
+            + (f'<br>{_e(_mde_text(main))}' if _mde_text(main) else "") + '</div>'
             f'{rows}<div class="sub" style="margin-top:6px">{_e(efficiency(agg, main["control"], main["treatment"]))}</div></div>')
 
 
@@ -313,6 +375,17 @@ def scorecard(data: dict) -> str:
             out.append(f'<details><summary><span class="mono">{_e(t["case"])}</span> {_arm(t["arm"])} #{t["rep"]} · '
                        f'놓침 {h.get("n_missed", 0)} · 더함 {h.get("n_extra", 0)} · {_e(h["detail"])}</summary>'
                        f'<div class="grid"><div>{miss or "<span class=na>없음</span>"}</div><div>{extra or "<span class=na>없음</span>"}</div></div></details>')
+
+    causes = failure_causes(trials, arms)
+    if causes:
+        out.append('<h2>실패 원인 (arm별 trial 수)</h2><div class="scroll"><table><tr><th>원인</th>'
+                   + "".join(f"<th>{_arm(a)}</th>" for a in arms) + "</tr>"
+                   + "".join(f'<tr><td class="mono">{_e(c)}</td>' + "".join(f'<td class="num">{v.get(a, 0)}</td>' for a in arms) + "</tr>"
+                             for c, v in causes)
+                   + '</table></div><div class="legend">trial마다 원인 하나: 처음 실패한 체크(cites_exist는 실패 사유 라벨), '
+                   'judge가 FAIL한 항목, 또는 제외 사유. 괄호 줄은 원인이 아니라 함께 센 수입니다.</div>')
+    if m.get("stopped"):
+        out.append(f'<div class="fail"><b>실행이 중간에 멈췄습니다</b> · {_e(m["stopped"])}</div>')
 
     fails = [t for t in trials if t["outcome"] != "pass"]
     out.append(f'<h2>실패·제외된 trial ({len(fails)})</h2>')
