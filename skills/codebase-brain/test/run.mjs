@@ -54,6 +54,14 @@ check('vi.mock is an edge; --no-mocks keeps the test only through its real impor
   assert.equal(q('impact', 'src/lib/credits.ts', '--no-mocks').hops[0].paths.includes('__tests__/charge.test.ts'), false);
 });
 
+check('a route file nothing imports: impact 0 says it is reached by URL and what to grep', () => {
+  const r = q('impact', 'app/api/run/route.ts');
+  assert.equal(r.total, 0);
+  assert.match(r.hint, /grep "\/api\/run"/);
+  assert.match(sh(brain, ['impact', 'app/api/run/route.ts'], { BRAIN_DB: db, NO_COLOR: '1' }), /reached by URL.*grep "\/api\/run"/);
+  assert.equal(q('impact', 'scripts/gen.mjs').hint, undefined);        // 0 importers, but not a route
+});
+
 const w = q('why', 'why does reserve throw InsufficientCredits instead of returning false?');
 check('why cites the doc and the change note, with the PR number', () => {
   const cites = w.citations.map((c) => c.cite).join(' ');

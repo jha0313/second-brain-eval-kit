@@ -94,6 +94,10 @@ function footer(db, cov, extra = '') {
   staleNote(f);
 }
 
+// app/api/thumb/[id]/route.ts -> "/api/thumb": route groups (x) and slots @x are not in the URL; grep stops at the first [param]
+const routeUrl = (p) => '/' + p.replace(/^(.*\/)?app\//, '').split('/').slice(0, -1)
+  .filter((s) => !/^\(.*\)$/.test(s) && !s.startsWith('@')).join('/').replace(/\/?\[.*$/, '');
+
 function describe(n) {
   return `${c.bold(n.key)} ${c.dim(`(${n.kind}${n.exported ? ', exported' : ''}${n.flags ? ', ' + n.flags : ''})`)}`;
 }
@@ -192,7 +196,10 @@ const cmds = {
     const hops = r.hops.map((h) => ({ ...h, paths: h.paths.filter(keep) })).map((h) => ({ ...h, files: h.paths.length, tests: h.paths.filter((p) => r.flagsOf.get(p).includes('test')).length })).filter((h) => h.files);
     const total = hops.reduce((a, h) => a + h.files, 0), tests = hops.reduce((a, h) => a + h.tests, 0);
     const cov = coverageFor(db, { truncated: false });
-    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total, tests, coverage: cov, freshness: fresh(db),
+    // a route handler is reached by its URL, not by an import: with no importers, say what to grep instead
+    const hint = total === 0 && node.kind === 'file' && node.flags.split(' ').includes('route')
+      ? `reached by URL, not imports — grep "${routeUrl(node.path)}" (fetch calls, links, config)` : undefined;
+    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total, tests, coverage: cov, freshness: fresh(db), hint,
       hops: hops.map((h) => ({ hop: h.hop, files: h.files, tests: h.tests, paths: h.paths })) }));
     const level = node.kind === 'file' || node.kind === 'dir' ? 'file level · import edges' : 'symbol level · use edges';
     out(`impact ${describe(node)}  ${c.dim(level)}${filter ? c.dim(` · only ${filter.join(',')}`) : ''}${exclude ? c.dim(` · without ${exclude.join(',')}`) : ''}`);
@@ -203,6 +210,7 @@ const cmds = {
     }), { align: ['l', 'r', 'r', 'r'], max: [0, 0, 0, 0, 60] }));
     // the deepest hop, not the row count: --filter drops hops with no match (hop 8 empty, hop 9 kept = 9 hops)
     out(c.bold(`  total: ${plural(total, 'file')} may be affected (${tests} tests)`) + c.dim(` · ${hops.at(-1)?.hop ?? 0} hops`));
+    if (hint) out(c.yellow(`  ${hint}`));
     if (opt.list) for (const h of hops) for (const p of h.paths) out(`  ${h.hop}\t${p}`);
     footer(db, cov);
   },
