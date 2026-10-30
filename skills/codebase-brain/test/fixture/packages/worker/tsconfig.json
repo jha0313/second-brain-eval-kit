@@ -1,0 +1,3 @@
+{ "compilerOptions": { "strict": true, "module": "esnext", "moduleResolution": "bundler", "noEmit": true,
+    "paths": { "@w/*": ["./lib/*"] } },
+  "include": ["**/*.ts"] }

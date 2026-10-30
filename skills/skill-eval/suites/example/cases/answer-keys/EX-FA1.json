@@ -1,0 +1,9 @@
+{
+ "id": "EX-FA1",
+ "unit": "file",
+ "method": "<정답을 만든 방법. 평가할 스킬과 다른 도구로: 예) dependency-cruiser 역방향 + git grep 교차 확인>",
+ "items": [
+  "<path/to/importer-a.ts>",
+  "<path/to/importer-b.test.ts>"
+ ]
+}

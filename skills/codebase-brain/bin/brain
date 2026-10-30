@@ -1,0 +1,4 @@
+#!/bin/sh
+# brain — codebase map + memory for coding agents. See ../SKILL.md
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec node --disable-warning=ExperimentalWarning --max-old-space-size=8192 "$DIR/src/cli.mjs" "$@"

@@ -1,0 +1,9 @@
+[
+ {
+  "id": "EX-FA1",
+  "type": "find-all",
+  "unit": "file",
+  "prompt": "If the exports of <path/to/module.ts> change, which files could break? List every file that imports it directly or through other files (any depth), including tests. Answer with a JSON array of repo-relative paths in one ```json fenced block, nothing else inside it. Include every item; do not stop at examples.",
+  "answer_key": "answer-keys/EX-FA1.json"
+ }
+]

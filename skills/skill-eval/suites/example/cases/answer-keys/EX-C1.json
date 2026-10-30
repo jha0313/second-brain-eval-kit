@@ -1,0 +1,6 @@
+{
+ "id": "EX-C1",
+ "file": "<path/to/file.ts>",
+ "expected": "<기대하는 값>",
+ "cite": "<path/to/file.ts:줄>"
+}

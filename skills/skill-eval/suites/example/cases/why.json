@@ -1,0 +1,8 @@
+[
+ {
+  "id": "EX-W1",
+  "type": "why",
+  "prompt": "Why does <module or behavior> work this way? What went wrong before? Point me to the commits or files (path:line) you're basing this on.",
+  "answer_key": "answer-keys/EX-W1.json"
+ }
+]

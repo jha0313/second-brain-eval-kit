@@ -1,0 +1,17 @@
+# dependencies and build output (npm install / uv sync bring them back)
+node_modules/
+!skills/codebase-brain/test/fixture/node_modules/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.cache/
+
+# codebase-brain indexes
+*.db
+*.db-*
+*.sqlite*
+.codebase-brain/
+
+.DS_Store

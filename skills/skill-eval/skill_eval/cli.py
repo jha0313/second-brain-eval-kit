@@ -1,0 +1,240 @@
+"""skill-eval command line.
+
+  skill-eval probe [--out DIR]                       prove trial isolation (a few small haiku calls)
+  skill-eval selftest SUITE                          grade made-up answers: the key must pass, broken answers fail ($0)
+  skill-eval freeze SUITE [--reason TEXT]            write FROZEN.json (hashes of cases, keys, code, rules)
+  skill-eval run SUITE --dry-run                     print the plan and the estimated cost; no model calls
+  skill-eval run SUITE [-k 3] [-j 4] [--max-usd 20]  run, grade, write results.json + scorecard.html
+  skill-eval report RUN_DIR                          rebuild the terminal table and scorecard.html
+  skill-eval grade RUN_DIR                           re-grade stored trajectories (hard checks + judge; no agent runs)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from . import checks, extract, judge, report, runner, stats
+from .freeze import freeze, verify
+from .isolation import scan_saved
+from .probe import format_probe, run_probe
+from .selftest import run_selftest
+from .suite import SuiteError, load_suite
+from .trajectory import parse_stream
+
+
+def _csv(s):
+    return [x.strip() for x in s.split(",") if x.strip()] if s else None
+
+
+def cmd_probe(a):
+    r = run_probe(Path(a.out), model=a.model, control=not a.no_control)
+    print(format_probe(r))
+    print(f"\nwrote {runner.short(Path(a.out).resolve() / 'probe.json')}")
+    return 0 if r["all_ok"] else 2
+
+
+def cmd_selftest(a):
+    suite = load_suite(a.suite, a.repo)
+    rows = run_selftest(suite)
+    bad = [r for r in rows if not r["ok"]]
+    for r in rows if a.verbose else bad:
+        mark = "ok " if r["ok"] else "BAD"
+        print(f"  {mark} {r['case']:<6} {r['answer']:<30} want {r['want']:<4} got {r['got']:<4} {'' if r['ok'] else r['detail'][:120]}")
+    print(f"selftest: {len(rows)} made-up answers over {len(suite.cases)} cases, {len(bad)} graded wrong")
+    return 0 if not bad else 2
+
+
+def cmd_freeze(a):
+    suite = load_suite(a.suite, a.repo)
+    bad = [r for r in run_selftest(suite) if not r["ok"]]
+    if bad:
+        raise SuiteError(f"selftest fails on {len(bad)} answers; fix grading before freezing")
+    try:
+        path = freeze(suite, a.reason)
+    except ValueError as e:
+        raise SuiteError(str(e)) from e
+    m = json.loads(path.read_text())
+    idx = m.get("index_check") or {}
+    print(f"frozen {len(suite.cases)} cases, {len(m['keys'])} keys -> {path.name} ({m['frozen_at']})")
+    if idx:
+        print(f"  index check: prepare has --vault: {idx['prepare_has_vault']} · built DB meta: {json.dumps(idx.get('meta'))}")
+    return 0
+
+
+def cmd_run(a):
+    suite = load_suite(a.suite, a.repo)
+    if a.model:
+        suite.model = a.model
+    if a.judge_model:
+        suite.judge_model = a.judge_model
+    arms = _csv(a.arms) or list(suite.arms)
+    unknown = [x for x in arms if x not in suite.arms]
+    if unknown:
+        raise SuiteError(f"unknown arm(s) {unknown}; suite has {list(suite.arms)}")
+    k = a.k or suite.k
+    specs = runner.plan(suite, arms, _csv(a.cases), k, a.seed)
+    if not specs:
+        raise SuiteError("no trials planned (check --cases)")
+    cal = runner.load_calibration(a.calibrate) if a.calibrate else None
+    est = runner.estimate(suite, specs, a.jobs, cal, use_judge=not a.no_judge)
+    frozen, diffs = verify(suite)
+    print(plan_table(suite, specs, arms, k, est, a, frozen, diffs))
+    if a.dry_run:
+        return 0
+    if diffs and not a.unfrozen:
+        raise SuiteError(f"changed since FROZEN.json ({frozen['frozen_at']}): {diffs}. Re-freeze with --reason, or --unfrozen for a dev run")
+    if a.max_usd is not None and est["total_usd"] > a.max_usd:
+        print(f"\nnote: estimate ${est['total_usd']:.2f} is above --max-usd {a.max_usd:.2f}; trials past the cap are skipped.")
+    out = Path(a.out or Path(suite.dir) / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S")).resolve()
+    data = runner.run(suite, specs, out, a.jobs, a.max_usd, est, use_judge=not a.no_judge, keep_ws=a.keep_workspaces,
+                      seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None)
+    html_path, text = report.write_reports(data, out)
+    scan = scan_saved(out)                        # grep every saved file for the token (redacts any hit)
+    data["meta"]["token_scan"] = scan
+    (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
+    print("\n" + text)
+    print(f"saved records: token {scan['token']} · {runner.short(out)}/scorecard.html")
+    return 0 if data["meta"]["isolation"]["all_ok"] else 2
+
+
+def plan_table(suite, specs, arms, k, est, a, frozen=None, diffs=()) -> str:
+    cases = list(dict.fromkeys(s["case"].id for s in specs))
+    kinds = {}
+    for c in suite.cases:
+        if c.id in cases:
+            kinds[c.kind] = kinds.get(c.kind, 0) + 1
+    lines = [f"plan · suite {suite.name} · skill {suite.skill} · repo {suite.label} @{suite.commit[:8]}",
+             f"  arms   {', '.join(f'{x}={suite.arms[x].name if suite.arms[x] else chr(8212)}' + (f' + {suite.patches[x].name}' if x in suite.patches else '') for x in arms)}",
+             f"  cases  {len(cases)} ({', '.join(f'{v} {k_}' for k_, v in kinds.items())})",
+             f"  trials {len(cases)} cases × {len(arms)} arms × k={k} = {len(specs)}",
+             f"  order  arms shuffled per case and repeat (seed {a.seed})",
+             f"  agent  {suite.model} · tools {suite.tools} · limits {suite.limits['max_turns']} turns, {suite.limits['timeout_s']}s, ${suite.limits['max_usd']:.0f}/trial",
+             f"  judge  {suite.judge_model} × {suite.votes} votes, only for rubric cases whose hard checks pass (≤ {est['judge_calls_max']} calls)",
+             f"  frozen {'yes, ' + frozen['frozen_at'] + (' — CHANGED: ' + ', '.join(diffs) if diffs else ' (hashes match)') if frozen else 'no FROZEN.json'}",
+             f"  estimate{' (calibrated: ' + ', '.join(Path(x).parent.name for x in a.calibrate.split(',')) + ')' if a.calibrate else ' (default rates; --calibrate RESULTS.json for measured ones)'}:",
+             f"    agent ${est['agent_usd']:.2f} + judge ≤ ${est['judge_usd']:.2f} + retries ${est['retry_usd']:.2f}"
+             f" + probe ${est['probe_usd']:.2f} = ${est['total_usd']:.2f} · ~{est['wall_minutes']:.0f} min with -j {a.jobs}"]
+    for arm, r in sorted(est["by_arm"].items(), key=lambda x: list(suite.arms).index(x[0])):
+        lines.append(f"    {arm:<5} {r['trials']:>3} trials  ${r['agent_usd'] + r['judge_usd']:.2f}")
+    copies = [x for x in arms if x != "v1" and "v1" in arms and suite.arms[x] == suite.arms["v1"] and x not in suite.patches]
+    if copies:
+        lines.append(f"  A/A    {', '.join(copies)} = same bytes as v1 (its Δ should be ~0)")
+    else:
+        ref = est["by_arm"].get("v1") or next(iter(est["by_arm"].values()))
+        lines.append(f"  A/A    optional: a copy of v1 as one more arm adds ≈ ${ref['agent_usd'] + ref['judge_usd']:.2f} (its Δ should be ~0)")
+    if a.max_usd is not None:
+        lines.append(f"  cap    --max-usd {a.max_usd:.2f} (waits while spent + reserved would pass it, skips once spent would)")
+    return "\n".join(lines)
+
+
+def cmd_report(a):
+    out = Path(a.run_dir).resolve()
+    data = json.loads((out / "results.json").read_text())
+    html_path, text = report.write_reports(data, out)
+    print(text)
+    print(f"\nscorecard {html_path}")
+    return 0
+
+
+def cmd_grade(a):
+    out = Path(a.run_dir).resolve()
+    data = json.loads((out / "results.json").read_text())
+    suite = load_suite(os.path.expanduser(data["meta"]["suite_file"]), a.repo)
+    cases = {c.id: c for c in suite.cases}
+    deny = runner.deny_list(suite, out)
+    for rec in data["trials"]:
+        if rec["outcome"] not in ("pass", "fail", "safety_violation", "invalid") or rec["case"] not in cases:
+            continue                                   # limits, infra and isolation errors keep their outcome
+        case = cases[rec["case"]]
+        traj = parse_stream(out / "trials" / rec["trial_id"] / "trajectory.jsonl")
+        traj["ws_state"] = rec.get("ws_state")
+        hard = checks.run_hard_checks(case, traj, rec["arm"], suite.repo, suite.commit, deny)
+        failed = any(h["gate"] and h["ok"] is False for h in hard)
+        votes = (judge.judge(case, traj, suite.judge_model, suite.votes, suite.repo, suite.commit)
+                 if (case.rubric and not failed and not a.no_judge) else rec.get("votes"))
+        s = checks.score_trial(hard, votes if not failed else None, case.pass_threshold)
+        rec.update(hard=hard, votes=votes, outcome=s["outcome"], score=s["score"],
+                   passed=s["passed"], reason=s["reason"], rubric=s.get("rubric"))
+        rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes or [])
+    arms = list(data["meta"]["arms"])
+    data["aggregate"] = stats.aggregate(data["trials"], arms, list(data["meta"]["cases"]), suite.compare, suite.sensitivity)
+    data["meta"]["regraded"] = datetime.now().isoformat(timespec="seconds")
+    (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
+    html_path, text = report.write_reports(data, out)
+    print(text)
+    return 0
+
+
+def cmd_extract(a):
+    out = Path(a.run_dir).resolve()
+    rows = extract.extract(out, a.case)
+    text = extract.markdown(rows, a.case)
+    (out / f"extract-{a.case}.json").write_text(json.dumps({"case": a.case, "trials": rows, "medians": extract.medians(rows)},
+                                                           indent=1, ensure_ascii=False))
+    (out / f"extract-{a.case}.md").write_text(text + "\n")
+    print(text)
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="skill-eval", description="Eval harness for Claude Code skills (prototype).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    pr = sub.add_parser("probe", help="prove trial isolation")
+    pr.add_argument("--out", default="runs/probe")
+    pr.add_argument("--model", default="haiku")
+    pr.add_argument("--no-control", action="store_true", help="skip the control call with your normal setup")
+    pr.set_defaults(fn=cmd_probe)
+    st = sub.add_parser("selftest", help="grade made-up answers ($0): the answer key must pass, broken answers must fail")
+    st.add_argument("suite")
+    st.add_argument("-v", "--verbose", action="store_true")
+    st.add_argument("--repo", help="repo clone (default: repo.path in the suite, e.g. ${MY_REPO})")
+    st.set_defaults(fn=cmd_selftest)
+    fz = sub.add_parser("freeze", help="write FROZEN.json before any v1 result")
+    fz.add_argument("suite")
+    fz.add_argument("--reason", help="required when FROZEN.json exists")
+    fz.add_argument("--repo", help="repo clone (default: repo.path in the suite)")
+    fz.set_defaults(fn=cmd_freeze)
+    r = sub.add_parser("run", help="plan, run and grade a suite")
+    r.add_argument("suite")
+    r.add_argument("--arms", help="comma list, e.g. none,v1 (default: all arms in the suite)")
+    r.add_argument("--cases", help="comma list of case ids (default: all)")
+    r.add_argument("-k", type=int, help="trials per case and arm (default: suite k)")
+    r.add_argument("-j", "--jobs", type=int, default=4)
+    r.add_argument("--max-usd", type=float, help="hard cap on total $ (agent + judge)")
+    r.add_argument("--dry-run", action="store_true", help="print the plan and the estimate; no model calls")
+    r.add_argument("--calibrate", help="results.json of earlier runs (comma list): use measured $ and time per trial")
+    r.add_argument("--model")
+    r.add_argument("--judge-model")
+    r.add_argument("--no-judge", action="store_true")
+    r.add_argument("--out")
+    r.add_argument("--keep-workspaces", action="store_true")
+    r.add_argument("--seed", type=int, default=0, help="arm order shuffle seed")
+    r.add_argument("--repo", help="repo clone (default: repo.path in the suite)")
+    r.add_argument("--unfrozen", action="store_true", help="dev only: run although FROZEN.json does not match")
+    r.set_defaults(fn=cmd_run)
+    rp = sub.add_parser("report", help="rebuild reports from results.json")
+    rp.add_argument("run_dir")
+    rp.set_defaults(fn=cmd_report)
+    g = sub.add_parser("grade", help="re-grade stored trajectories")
+    g.add_argument("run_dir")
+    g.add_argument("--no-judge", action="store_true", help="keep stored judge votes")
+    g.add_argument("--repo", help="repo clone (default: repo.path in the suite)")
+    g.set_defaults(fn=cmd_grade)
+    ex = sub.add_parser("extract", help="report-only per-trial extract for one case (pre-registered; not grading)")
+    ex.add_argument("run_dir")
+    ex.add_argument("--case", required=True)
+    ex.set_defaults(fn=cmd_extract)
+    a = p.parse_args(argv)
+    try:
+        return a.fn(a)
+    except SuiteError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

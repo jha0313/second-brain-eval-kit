@@ -1,0 +1,11 @@
+{
+ "id": "EX-W1",
+ "sources": [
+  {"commit": "<커밋 SHA 앞 8자 이상>"},
+  {"path": "<changes/YYYYMMDD-note.md>"},
+  {"path": "<path/to/file.ts>", "lines": [10, 20]}
+ ],
+ "found_by": "<출처를 찾은 명령: 예) git log --grep='...'; git grep -l '...' changes/>",
+ "facts": ["<출처에 적힌 사실. judge만 보고 agent는 보지 못한다>"],
+ "forbidden": ["<그럴듯하지만 틀린 추론. judge만 본다>"]
+}

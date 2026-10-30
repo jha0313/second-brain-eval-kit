@@ -1,0 +1,19 @@
+{
+  "name": "codebase-brain",
+  "version": "0.1.0",
+  "description": "Prototype skill: a map (code graph) and a memory (docs + git history) for coding agents",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "brain": "bin/brain"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "test": "node test/run.mjs"
+  }
+}

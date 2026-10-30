@@ -1,0 +1,64 @@
+// Fixture test: the cases a real repo throws at the TS adapter, in 17 files.
+// two tsconfigs with different `paths` · alias imports · a barrel with a renamed re-export · `const X` + `type X`
+// · dynamic import() destructuring · a file in no tsconfig · a generated file · vi.mock · node_modules committed to git
+import { cpSync, mkdtempSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir, homedir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const brain = join(here, '..', 'bin', 'brain');
+const repo = mkdtempSync(join(tmpdir(), 'brain-fixture-'));
+cpSync(join(here, 'fixture'), repo, { recursive: true });
+const sh = (cmd, args, env = {}) => execFileSync(cmd, args, { cwd: repo, encoding: 'utf8', env: { ...process.env, ...env } });
+sh('git', ['init', '-q']);
+sh('git', ['add', '-A', '-f']);
+sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'fixture: reserve credits first (#12)']);
+const db = join(repo, '..', `${repo.split('/').pop()}.db`);
+sh(brain, ['build', '.', '--db', db]);
+const q = (...args) => JSON.parse(sh(brain, [...args, '--json', '--limit', '1000'], { BRAIN_DB: db }));
+const files = (r) => [...new Set(r.sites.map((s) => s.site.split(':')[0]))].sort();
+const impacted = (r) => r.hops.flatMap((h) => h.paths).sort();
+
+let n = 0;
+const check = (name, fn) => { fn(); n++; console.log(`  ok  ${name}`); };
+
+const st = q('status');
+check('two programs: the worker tsconfig has its own paths', () => assert.equal(st.stats.ts.programs, 2));
+check('scripts/gen.mjs is in no tsconfig and still indexed', () => assert.equal(st.stats.ts.orphans, 1));
+check('no unresolved local imports (aliases @/ and @w/ resolve)', () => assert.equal(st.stats.ts.unresolvedLocal, 0));
+check('node_modules is not indexed even when committed', () => assert.equal(q('find', 'fake').rows.filter((r) => r.id.includes('node_modules')).length, 0));
+
+check('refs reserve: direct, barrel, dynamic import() destructuring', () =>
+  assert.deepEqual(files(q('refs', 'src/lib/credits.ts#reserve')), ['app/api/run/route.ts', 'app/dash/page.tsx', 'src/lib/charge.ts']));
+check('the renamed re-export resolves to the original function', () =>
+  assert.ok(files(q('refs', 'src/lib/charge.ts#charge')).includes('src/lib/routes.generated.ts')));
+check('callers --filter server-action finds the use-server route', () =>
+  assert.deepEqual(files(q('callers', 'src/lib/credits.ts#reserve', '--filter', 'server-action')), ['app/api/run/route.ts']));
+check('instanceof through a destructured dynamic import counts as a use', () =>
+  assert.ok(files(q('refs', 'src/lib/credits.ts#InsufficientCredits')).includes('app/api/run/route.ts')));
+check('JSX render edge, filtered to pages', () =>
+  assert.deepEqual(files(q('refs', 'src/ui/Meter.tsx#Meter', '--kind', 'renders', '--filter', 'page')), ['app/dash/page.tsx']));
+check('`const Plan` and `type Plan` are two nodes', () =>
+  assert.equal(q('find', 'Plan').rows.filter((r) => r.id.startsWith('src/lib/credits.ts#Plan')).length, 2));
+
+const imp = q('impact', 'src/lib/credits.ts');
+check('impact crosses programs: worker main.ts via a relative import, then @w/ alias', () => assert.ok(impacted(imp).includes('packages/worker/main.ts')));
+check('impact reaches the generated file and the orphan script', () =>
+  assert.ok(['src/lib/routes.generated.ts', 'scripts/gen.mjs'].every((p) => impacted(imp).includes(p))));
+check('vi.mock is an edge; --no-mocks keeps the test only through its real import chain', () => {
+  assert.ok(impacted(imp).includes('__tests__/charge.test.ts'));
+  assert.equal(q('impact', 'src/lib/credits.ts', '--no-mocks').hops[0].paths.includes('__tests__/charge.test.ts'), false);
+});
+
+const w = q('why', 'why does reserve throw InsufficientCredits instead of returning false?');
+check('why cites the doc and the change note, with the PR number', () => {
+  const cites = w.citations.map((c) => c.cite).join(' ');
+  assert.match(cites, /docs\/credits\.md:\d+-\d+/);
+  assert.match(cites, /changes\/20261001-reserve-first\.md/);
+  assert.ok(w.citations.some((c) => c.prs.includes('#12')));
+});
+check('viz writes one HTML file', () => assert.ok(existsSync(sh(brain, ['viz', 'src/lib/credits.ts', '--out', join(repo, '..', 'v.html')], { BRAIN_DB: db }).trim().replace(/^~(?=\/)/, homedir()))));
+console.log(`${n} checks passed (fixture at ${repo})`);

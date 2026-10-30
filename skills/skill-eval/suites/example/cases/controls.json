@@ -1,0 +1,10 @@
+[
+ {
+  "id": "EX-C1",
+  "type": "control-single-file",
+  "prompt": "In <path/to/file.ts>, what does <function> return when <condition>? Answer in one sentence and cite the line.",
+  "file": "<path/to/file.ts>",
+  "expect_brain_call": false,
+  "answer_key": "answer-keys/EX-C1.json"
+ }
+]
