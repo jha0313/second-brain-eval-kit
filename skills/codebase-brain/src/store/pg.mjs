@@ -5,8 +5,9 @@
 // - Visible at run R: valid_from <= R AND (valid_to IS NULL OR valid_to > R); chunks and refs follow their revision.
 // - Rows keep the Phase 1 SQLite shapes (code.db chunks, github.db items / refs rows, as the mirror writes them) and
 //   the mirror's ids ('c' + chunk_id, 'g' + item_id), so read.mjs shapes both stores alike and ties break as on a mirror
-//   of the same run. The lists follow src/store/sqlite.mjs one by one; FTS is chunk.tsv (english) ranked by ts_rank
-//   instead of FTS5 bm25, and the trigram lists are ILIKE (pg_trgm index) for every length.
+//   of the same run. The lists follow src/store/sqlite.mjs one by one; FTS is chunk.tsv (brain.brain_english: stop
+//   words kept and the original Porter stemmer, as FTS5's porter, sql/003) ranked by ts_rank instead of FTS5 bm25,
+//   and the trigram lists are ILIKE (pg_trgm index) for every length.
 // - Repo memory pointers: <source>:<path>:<a>-<b>@r<n> (rev n of item <source>:<path>). A Phase 1 @<build> pointer
 //   reads the view run when its build is that run's build, else it is stale. Vault notes are never on the server.
 import { BrainError, NotFoundError, StalePtrError } from '../errors.mjs';
@@ -114,7 +115,7 @@ async function candidates(client, q, opts = {}) {
     ctes.push(`${c} AS (SELECT x.*, row_number() OVER (ORDER BY ${order}) AS o FROM (${select}) x ORDER BY o LIMIT ${CAP + 1})`);
     lists.push(`(SELECT jsonb_build_object('name', '${name}', 'rows', coalesce(jsonb_agg(jsonb_build_array(key, grp, d, ptr, flags) ORDER BY o), '[]'::jsonb)) FROM ${c})`);
   };
-  const tsq = t.ascii.length ? `websearch_to_tsquery('english', ${p(t.ascii.map((w) => `"${w}"`).join(' OR '))})` : null;
+  const tsq = t.ascii.length ? `websearch_to_tsquery('brain.brain_english', ${p(t.ascii.map((w) => `"${w}"`).join(' OR '))})` : null;
   const P = f.path ? p(f.path) : null;
   const under = (x) => `(${x} = ${P} OR starts_with(${x}, ${P} || '/'))`;
   const seeded = t.names.length > 0;

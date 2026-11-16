@@ -78,14 +78,18 @@ function parse(argv) {
 }
 
 const list = (v) => (v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : undefined);
-const out = (s = '') => process.stdout.write(cutReader(s) + '\n');   // the reader URL and password: never on stdout
+const write = (s) => process.stdout.write(s + '\n');
+const out = (s = '') => write(cutReader(s));            // the reader URL and password: never on stdout
+const outJson = (o) => write(JSON.stringify(o, (k, v) => (typeof v === 'string' ? cutReader(v) : v)));   // values only: keys and literals stay
 
 // Runtime values (errors, the query echo, log lines) leave through scrub(): the active token and the env tokens
 // are cut out by value first, then the masker and the one-line rule run
-// (the reader URL and its password, registered before any command runs, are cut from 4 characters on, as pullMirror
-// cuts them, out of scrub() and of everything out() writes)
+// (the reader URL and its passwords, registered before any command runs, are cut out of scrub() and of everything
+// out() / outJson() write; in server mode a password shorter than MIN_SECRET is refused: it cannot be cut without
+// cutting words)
 let activeToken = null, readerSecrets = [];
 const secrets = () => [activeToken, process.env.GH_TOKEN, process.env.GITHUB_TOKEN].filter(Boolean);
+const MIN_SECRET = 8;
 const cutReader = (s) => readerSecrets.reduce((t, x) => t.split(x).join('[REDACTED:reader-url]'), s);
 const scrub = (s) => safe(sanitizeLine(redactValues(cutReader(String(s ?? '')), secrets())));
 const say = (s) => console.error(scrub(s));
@@ -134,8 +138,10 @@ async function open(opt) {
     const dir = mirrorDir(s.binding.id, s.at !== null);
     for (let tries = 1; ; tries++) {
       const m = await ensureMirror({ url, dir, view: at.view, repo: checkout ?? null, log: say });
-      const ctx = openContext({ codeDbPath: m.codeDb, checkout });   // open: the file is ours even if replaced now
-      if (sameRun(ctx.meta, at.view)) {
+      let ctx = null;
+      try { ctx = openContext({ codeDbPath: m.codeDb, checkout }); }   // open: the file is ours even if replaced now
+      catch (e) { if (existsSync(m.codeDb)) throw e; }              // removed by a session pulling another run in full
+      if (ctx && sameRun(ctx.meta, at.view)) {
         ctx.sync = at.view.sync;
         ctx.at = { asOf: s.at !== null, latest: at.latest };
         guard(ctx);
@@ -143,8 +149,8 @@ async function open(opt) {
       }
       // another session replaced the mirror between its pull and our open: a newer run (taken as the newest), or
       // another --as-of run (pulled again)
-      const moved = Number(ctx.meta.brain_run);
-      ctx.close();
+      const moved = ctx ? Number(ctx.meta.brain_run) : null;
+      ctx?.close();
       if (tries === 3) throw new BrainError('mirror-busy', 'other sessions keep replacing the mirror with other runs; try again');
       if (s.at === null && moved > at.run) at = await s.store.resolveAsOf(`run:${moved}`);
     }
@@ -193,7 +199,7 @@ function target(ctx, q, opt, write = out) {
     if (r.others && !opt.json) write(c.dim(`  ${ext(scrub(q))} → ${ident(r.node.key)} (the only exported one; ${r.others === 1 ? '1 local symbol shares' : `${r.others} local symbols share`} the name — brain find ${ident(scrub(q))})`));
     return r.node;
   }
-  if (opt.json) out(JSON.stringify({ error: 'ambiguous-or-missing', query: scrub(q), candidates: (r.candidates || []).map((n) => n.key) }));
+  if (opt.json) outJson({ error: 'ambiguous-or-missing', query: scrub(q), candidates: (r.candidates || []).map((n) => n.key) });
   else {
     if (r.candidates?.length) {
       write(`${c.yellow('ambiguous')} ${ext(scrub(q))} — pick one ID and ask again:`);
@@ -288,7 +294,7 @@ const cmds = {
       const ctx = openContext({ codeDbPath: dbPath, checkout: repo });
       const fr = freshFor(ctx), cov = coverage(ctx, { unresolvedLocal: ctx.meta.coverage?.unresolvedLocal });
       ctx.close();
-      if (opt.json) out(JSON.stringify({ db: dbPath, ...fields, coverage: cov, freshness: jsonFresh(fr) }));
+      if (opt.json) outJson({ db: dbPath, ...fields, coverage: cov, freshness: jsonFresh(fr) });
       else finish(fr, cov, say);                         // build's text goes to stderr, so its footer does too
     };
     // --if-stale: keep an index, built with the same options and the current sanitizer, that still matches THIS
@@ -326,7 +332,7 @@ const cmds = {
     const edges = db.prepare('SELECT count(*) n FROM edges').get().n;
     const chunks = Object.fromEntries(db.prepare('SELECT source, count(*) n FROM chunks GROUP BY source').all().map((r) => [r.source, r.n]));
     const ageMin = Math.round((Date.now() - Date.parse(m.built_at)) / 60000);
-    if (opt.json) return out(JSON.stringify({ ...f, repo: f.repo == null ? f.repo : scrub(f.repo), counts, edges, chunks, ageMin, meta: undefined, stats: s, timings: m.timings, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) return outJson({ ...f, repo: f.repo == null ? f.repo : scrub(f.repo), counts, edges, chunks, ageMin, meta: undefined, stats: s, timings: m.timings, coverage: cov, freshness: jsonFresh(fr) });
     out(`${c.bold('brain status')}  ${cutLeft(scrub(tilde(f.repo)), COLS - 16)}`);
     out(table(['', ''], [
       ['index', `@${m.commit?.slice(0, 8)} (${m.commit_date}) · built ${ageMin} min ago in ${m.timings.total}s`],
@@ -345,7 +351,7 @@ const cmds = {
     const ctx = await open(opt), db = ctx.code;
     const r = find(db, pos[0], { limit: +(opt.limit || 20), kind: opt.kind });
     const fr = freshFor(ctx), cov = coverage(ctx, { truncated: r.truncated });
-    if (opt.json) return out(JSON.stringify({ ...r, freshness: jsonFresh(fr), coverage: cov, rows: r.rows.map((n) => ({ id: n.key, kind: n.kind, line: n.line, exported: !!n.exported, uses: n.uses })) }));
+    if (opt.json) return outJson({ ...r, freshness: jsonFresh(fr), coverage: cov, rows: r.rows.map((n) => ({ id: n.key, kind: n.kind, line: n.line, exported: !!n.exported, uses: n.uses })) });
     // an ID is never cut (it is the next command's argument): one wider than the room goes on its own line under the row
     const head = ['ID', 'KIND', 'USES', 'LINE'];
     const rows = r.rows.map((n) => [ident(n.key), n.kind + (n.exported || ['file', 'dir'].includes(n.kind) ? '' : ' (local)'), n.uses, n.line ?? '']);
@@ -370,8 +376,8 @@ const cmds = {
     // --files: one row per file (its first site, the site count, every kind), not one per site
     const perFile = () => [...Map.groupBy(r.rows, (x) => x.path).values()]
       .map((xs) => ({ ...site(xs[0]), kind: [...new Set(xs.map((x) => x.kind))].join(' '), sites: xs.length }));
-    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total: r.total, files: r.files, next: r.next, coverage: cov, freshness: jsonFresh(fr),
-      sites: opt.files ? perFile() : r.rows.map(site) }));
+    if (opt.json) return outJson({ target: node.key, kind: node.kind, total: r.total, files: r.files, next: r.next, coverage: cov, freshness: jsonFresh(fr),
+      sites: opt.files ? perFile() : r.rows.map(site) });
     const where = node.path && node.kind !== 'file' ? c.dim(`defined ${ident(node.path)}:${node.line}`) : '';
     const head = `${mode} ${describe(node)}`;
     out(where && width(head) + width(where) + 2 > COLS ? `${head}\n  ${where}` : `${head}${where ? '  ' + where : ''}`);
@@ -407,8 +413,8 @@ const cmds = {
     // a route handler is reached by its URL, not by an import: with no importers, say what to grep instead
     const hint = total === 0 && node.kind === 'file' && node.flags.split(' ').includes('route')
       ? `reached by URL, not imports — grep "${routeUrl(node.path)}" (fetch calls, links, config)` : undefined;
-    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total, tests, coverage: cov, freshness: jsonFresh(fr), hint,
-      hops: hops.map((h) => ({ hop: h.hop, files: h.files, tests: h.tests, paths: h.paths })) }));
+    if (opt.json) return outJson({ target: node.key, kind: node.kind, total, tests, coverage: cov, freshness: jsonFresh(fr), hint,
+      hops: hops.map((h) => ({ hop: h.hop, files: h.files, tests: h.tests, paths: h.paths })) });
     const level = node.kind === 'file' || node.kind === 'dir' ? 'file level · import edges' : 'symbol level · use edges';
     out(`impact ${describe(node)}  ${c.dim(level)}${filter ? c.dim(` · only ${safe(filter.join(','))}`) : ''}${exclude ? c.dim(` · without ${safe(exclude.join(','))}`) : ''}`);
     let cum = 0;
@@ -429,7 +435,7 @@ const cmds = {
     const r = deps(db, node, { hops: +(opt.hops || 99), noTypes: opt['no-types'] });
     const rows = [...r.hopOf].filter(([, h]) => h > 0).sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]));
     const cov = coverageFor(db, { truncated: false }), fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ target: node.key, from: node.path, total: rows.length, coverage: cov, freshness: jsonFresh(fr), files: rows.map(([p, h]) => ({ path: p, hop: h })) }));
+    if (opt.json) return outJson({ target: node.key, from: node.path, total: rows.length, coverage: cov, freshness: jsonFresh(fr), files: rows.map(([p, h]) => ({ path: p, hop: h })) });
     out(`deps ${describe(node)}: ${plural(rows.length, 'file')} pulled in`);
     if (!['file', 'dir'].includes(node.kind)) out(c.dim(`  file level: what ${ident(node.path)} (where ${safe(node.name)} is defined) pulls in`));
     if (opt.list) for (const [p, h] of rows) out(`  ${h}\t${safe(p)}`);
@@ -443,7 +449,7 @@ const cmds = {
     const r = shared(db, a, b, { noTypes: opt['no-types'] });
     const byTop = r.both.reduce((m, p) => m.set(p.split('/').slice(0, 2).join('/'), (m.get(p.split('/').slice(0, 2).join('/')) || 0) + 1), new Map());
     const cov = coverageFor(db, { truncated: false }), fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ a: a.key, b: b.key, total: r.both.length, coverage: cov, freshness: jsonFresh(fr), files: r.both }));
+    if (opt.json) return outJson({ a: a.key, b: b.key, total: r.both.length, coverage: cov, freshness: jsonFresh(fr), files: r.both });
     out(`shared ${describe(a)} ∩ ${describe(b)}`);
     out(c.dim(`  ${ident(a.path)} pulls in ${r.a} files · ${ident(b.path)} pulls in ${r.b} · both: `) + c.bold(r.both.length));
     out(table(['AREA', 'FILES'], [...byTop].sort((x, y) => y[1] - x[1]).slice(0, opt.list ? 1e9 : 12).map(([k, n]) => [ident(k), n]), { align: ['l', 'r'] }));
@@ -459,7 +465,7 @@ const cmds = {
     const f = freshness(db, checkout);
     markMentions(f.repo, r);
     const fr = freshFor(ctx, f), cov = coverage(ctx, {});
-    if (opt.json) return out(JSON.stringify({ ...r, ms, freshness: jsonFresh(fr), coverage: cov }));
+    if (opt.json) return outJson({ ...r, ms, freshness: jsonFresh(fr), coverage: cov });
     out(`why ${c.bold(ext(scrub(r.question), COLS - 36))}  ${c.dim(`FAST · no LLM · ${ms} ms`)}`);
     if (r.seeds.length) out(c.dim(`  names → code: ${r.seeds.map(ident).join(', ')}`));
     if (r.gap) {
@@ -525,7 +531,7 @@ const cmds = {
     const ctx = afterSync(codeDbPath);
     const fr = freshFor(ctx), cov = coverage(ctx, { githubPresent: !!ctx.gh });
     ctx.close();
-    if (opt.json) out(JSON.stringify({ ...r, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) outJson({ ...r, coverage: cov, freshness: jsonFresh(fr) });
     else { out(renderSync(r)); finish(fr, cov); }
     if (r.status !== 'ok') process.exit(r.status === 'busy' ? 3 : 1);
   },
@@ -538,7 +544,7 @@ const cmds = {
     const { ctx, res } = await memoryRead(opt, (c) => read.search(c, q, opts), (store, asOf) => read.searchIn(store, q, { ...opts, asOf }));
     const shown = { ...res, query: scrub(res.query) };   // the query echo is a runtime value
     const cov = coverage(ctx, { ...res.facts, truncated: res.next != null }), fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ ...shown, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) return outJson({ ...shown, coverage: cov, freshness: jsonFresh(fr) });
     out(renderSearch(shown, { coverage: cov, freshness: fr }, { cursor: opts.cursor ?? 0 }).join('\n'));
   },
 
@@ -546,7 +552,7 @@ const cmds = {
     const ptrs = pointers(pos, 5);
     const { ctx, res } = await memoryRead(opt, (c) => read.get(c, ptrs), (store, asOf) => read.getIn(store, ptrs, { asOf }));
     const cov = coverage(ctx, res.facts), fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ ...res, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) return outJson({ ...res, coverage: cov, freshness: jsonFresh(fr) });
     out(renderGet(res, { coverage: cov, freshness: fr }).join('\n'));
   },
 
@@ -558,7 +564,7 @@ const cmds = {
     // a GitHub quote is as complete as the last sync: a failed or missing one makes it partial
     const cov = coverage(ctx, { lines: { from: src.from, to: src.to, total: src.total }, ...(src.origin === 'github' ? { githubPresent: !!(ctx.gh || ctx.sync) } : {}) });
     const fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ ...src, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) return outJson({ ...src, coverage: cov, freshness: jsonFresh(fr) });
     out(renderSource(src, { coverage: cov, freshness: fr }, read.envelope).join('\n'));
   },
 };
@@ -569,15 +575,18 @@ const cmd = pos.shift();
 if (!cmd || opt.help || !cmds[cmd]) { out(HELP); process.exit(cmd && !opt.help ? 1 : 0); }
 if (cmd !== 'build') checkout = here(opt);
 try {
-  // before anything can echo input; also as they appear inside a JSON string
-  readerSecrets = [...new Set(secretsOf(readerUrl() ?? '').flatMap((x) => [x, JSON.stringify(x).slice(1, -1)]))].sort((a, b) => b.length - a.length);
+  const reader = secretsOf(readerUrl() ?? '');            // before anything can echo input; also as a JSON string holds them
+  if (!opt.local && reader.some((x) => x.length < MIN_SECRET)) {
+    throw new BrainError('not-reader', `the password in BRAIN_READER_URL is shorter than ${MIN_SECRET} characters, too short to keep out of output: use the reader password migrate set`);
+  }
+  readerSecrets = [...new Set(reader.filter((x) => x.length >= MIN_SECRET).flatMap((x) => [x, JSON.stringify(x).slice(1, -1)]))].sort((a, b) => b.length - a.length);
   await cmds[cmd]({ pos, opt });
 }
 catch (e) {
   // an error is not an answer: its code and a masked one-line message, no stack, no token; fail open
   const code = typeof e?.code === 'string' && e.code ? e.code : 'error';
   const msg = scrub(e?.message ?? e);
-  if (opt.json) out(JSON.stringify({ error: msg, code }));
+  if (opt.json) outJson({ error: msg, code });
   else out(`${c.red('brain error')} (${safe(code)}): ${msg}\n  fail open: continue with grep / your normal tools`);
   process.exit(code === 'lock-busy' ? 3 : ['not-reader', 'wrong-repo'].includes(code) ? 2 : 1);   // 2: a server brain refused (§6.2)
 }

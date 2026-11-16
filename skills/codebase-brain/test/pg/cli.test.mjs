@@ -111,11 +111,11 @@ test('the reader URL: BRAIN_READER_URL from the environment, else from .env.loca
   assert.equal(readerUrl({}, join(work, 'missing')), null);
 });
 
-test('the reader password is cut from every output, also a short one, before any input is checked', async () => {
-  const pw = 'pw' + '1234';                                                         // 6 characters: below the token rule
+test('the reader password is cut from every output before any input is checked; a short one is refused', async () => {
+  const pw = 'pw' + '123456';
   const url = `postgresql://brain_reader:${pw}@host.invalid/neondb?sslmode=require`;
-  const q = `postgresql://brain_reader@host.invalid/neondb?password=${'q' + pw}`;
-  assert.deepEqual(secretsOf(q), [q, 'q' + pw]);
+  const q = `postgresql://brain_reader@host.invalid/neondb?password=${'q' + pw}&password=${'r' + pw}`;   // pg takes the last
+  assert.deepEqual(secretsOf(q), [q, 'q' + pw, 'r' + pw]);
   const s = { codeDb: join(mkdtempSync(join(work, 'code-')), 'code.db') }, html = join(work, 'viz.html');
   copyFileSync(buildStores().codeDb, s.codeDb);                                     // the map alone (golden GitHub data is v0)
   const env = { BRAIN_READER_URL: url, BRAIN_DB: s.codeDb };
@@ -128,6 +128,31 @@ test('the reader password is cut from every output, also a short one, before any
   for (const r of runs) assert.ok(!(r.stdout + r.stderr).includes(pw), r.stdout + r.stderr);
   assert.match(runs[0].stdout, /REDACTED:reader-url/);
   assert.ok(!readFileSync(html, 'utf8').includes(pw), 'the viz page holds the password');
+  const last = await brain(['get', 'r' + pw, '--json'], { env: { ...env, BRAIN_READER_URL: q }, homeDir: work });
+  assert.ok(!last.stdout.includes('r' + pw), last.stdout);
+  // a password that is also a JSON key: values are cut, keys and literals stay
+  const word = 'cover' + 'age';
+  const j = await brain(['search', word, '--json', '--local'], { env: { ...env, BRAIN_READER_URL: `postgresql://brain_reader:${word}@host.invalid/neondb` },
+    cwd: dirname(s.codeDb), homeDir: work });
+  const parsed = JSON.parse(j.stdout);
+  assert.equal(parsed.query, '[REDACTED:reader-url]');
+  assert.ok(parsed.coverage && parsed.freshness, j.stdout);
+  // a password a JSON string escapes (an error message quotes the input)
+  const quoted = 'abcd"' + 'efgh';
+  for (const args of [['get', quoted], ['get', quoted, '--json']]) {
+    const r = await brain(args, { env: { ...env, BRAIN_READER_URL: `postgresql://brain_reader:${encodeURIComponent(quoted)}@host.invalid/neondb` }, homeDir: work });
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.ok(!r.stdout.includes(quoted) && !r.stdout.includes(JSON.stringify(quoted).slice(1, -1)), r.stdout);
+  }
+  for (const short of ['pw', 'pw' + '12345']) {                                     // under 8: not cut, it would cut words too
+    const local = await brain(['search', 'reserve', '--local'], { env: { ...env, BRAIN_READER_URL: `postgresql://brain_reader:${short}@host.invalid/neondb` },
+      cwd: dirname(s.codeDb), homeDir: work });
+    assert.equal(local.status, 0, local.stdout + local.stderr);                       // --local does not use the reader account
+    const r = await brain(['get', short], { env: { ...env, BRAIN_READER_URL: `postgresql://brain_reader:${short}@host.invalid/neondb` }, homeDir: work });
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    assert.match(r.stdout, /\(not-reader\): the password in BRAIN_READER_URL is shorter than 8 characters/);
+    assert.doesNotMatch(r.stdout.replace('BRAIN_READER_URL', ''), new RegExp(`\\b${short}\\b`));
+  }
 });
 
 test('--as-of on a local index is a server read', async () => {
@@ -256,6 +281,7 @@ test('V2: only the reader account is used — owner and writer URLs, and an owne
   } finally { await b.query('owner', 'REVOKE brain_reader FROM neondb_owner'); }
   // brain_reader with a write privilege, or a role it can SET ROLE to
   for (const [grant, revoke, why] of [['GRANT INSERT ON brain.item TO brain_reader', 'REVOKE INSERT ON brain.item FROM brain_reader', /can write brain tables/],
+    ['GRANT UPDATE (status) ON brain.attempt TO brain_reader', 'REVOKE UPDATE (status) ON brain.attempt FROM brain_reader', /can write brain tables/],
     ['GRANT brain_writer TO brain_reader WITH INHERIT FALSE', 'REVOKE brain_writer FROM brain_reader', /SET ROLE/]]) {
     await b.query('owner', grant);
     try {

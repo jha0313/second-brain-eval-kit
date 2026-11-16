@@ -36,11 +36,11 @@ export function readerUrl(env = process.env, file = ENV_FILE) {
   return null;
 }
 
-/** the URL and its passwords (user:password@ and ?password=), longest first, for scrubbing */
+/** the URL and every password it carries (user:password@, each ?password=; pg takes the last), longest first */
 export function secretsOf(url) {
   const pw = [];
-  try { const u = new URL(url); pw.push(decodeURIComponent(u.password), u.searchParams.get('password')); } catch { /* not a URL: the whole string is the secret */ }
-  return [url, ...pw].filter((s) => s && s.length >= 4).sort((a, b) => b.length - a.length);
+  try { const u = new URL(url); pw.push(decodeURIComponent(u.password), ...u.searchParams.getAll('password')); } catch { /* not a URL: the whole string is the secret */ }
+  return [...new Set([url, ...pw])].filter(Boolean).sort((a, b) => b.length - a.length);
 }
 
 /**
@@ -53,10 +53,11 @@ export async function connectReader(url, { origin }) {
   client.on('error', () => {});
   try {
     await client.connect();
-    // session_user: the login (options=-c role=… changes current_user only); writes: any brain table; roles: SET ROLE
+    // session_user: the login (options=-c role=… changes current_user only); writes: any brain table, column grants
+    // too (002 grants the writer UPDATE on columns); roles: SET ROLE
     const me = (await client.query(`SELECT session_user AS who, current_user AS cur, to_regclass('brain.run') IS NOT NULL AS migrated,
       EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'brain' AND c.relkind IN ('r', 'p')
-        AND has_table_privilege(c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')) AS can_write,
+        AND (has_table_privilege(c.oid, 'DELETE, TRUNCATE') OR has_any_column_privilege(c.oid, 'INSERT, UPDATE'))) AS can_write,
       EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = session_user) AS has_roles`)).rows[0];
     if (me.who !== 'brain_reader' || me.cur !== 'brain_reader') {
       throw new BrainError('not-reader', `BRAIN_READER_URL logs in as ${JSON.stringify(String(me.who))}, not brain_reader (the read-only account): refusing to use it`);
