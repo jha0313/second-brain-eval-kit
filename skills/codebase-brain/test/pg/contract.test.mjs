@@ -9,10 +9,6 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as C from '../../src/pg/contract.mjs';
-import * as snapshotLane from '../../src/pg/snapshot.mjs';
-import * as publishLane from '../../src/pg/publish.mjs';
-import { pullMirror } from '../../src/pg/mirror.mjs';
-import { migrate } from '../../src/pg/migrate.mjs';
 import { openGithubDb } from '../../src/gh-schema.mjs';
 import { runBrain } from '../phase1/helpers.mjs';
 import { buildGolden, EXPECTED, SEED } from './golden/build-golden.mjs';
@@ -205,14 +201,8 @@ test('golden: the fixture snapshots to the committed expected.json and seed.sql'
   assert.equal(golden.state.run, null);
 });
 
-test('the DDL checks the same publish lock key; lane stubs throw NotImplementedError', async () => {
+test('the DDL checks the same publish lock key; no password in 002; store methods', () => {
   assert.ok(DDL.includes(`pg_advisory_xact_lock(${C.PUBLISH_LOCK_KEY})`), 'guard_run takes PUBLISH_LOCK_KEY');
   assert.ok(!/PASSWORD/i.test(readFileSync(join(here, '..', '..', 'sql', '002_roles.sql'), 'utf8').replace(/^--.*$/gm, '')), 'no password in 002');
-  for (const f of [snapshotLane.snapshot, snapshotLane.diff, snapshotLane.applyDelta, snapshotLane.checkOutbound]) {
-    assert.throws(() => f({}), { code: 'not-implemented' });
-  }
-  for (const f of [publishLane.beginAttempt, publishLane.publish, publishLane.failAttempt, publishLane.resolveAttempt, pullMirror, migrate]) {
-    await assert.rejects(f({}), { code: 'not-implemented' });
-  }
   assert.deepEqual([...C.STORE_METHODS], ['candidates', 'get', 'thread', 'refs', 'source', 'resolveAsOf', 'close']);
 });
