@@ -121,7 +121,7 @@ test('003 applied onto those rows: the search finds the chunk as FTS5 does; no r
   try {
     const server = await searchIn(store, Q, { limit: 50 });
     assert.equal(server.view.run, 2);
-    assert.ok(server.rows.some((r) => r.ptr === 'doc:docs/credits.md:1-7@r2'), JSON.stringify(server.rows.map((r) => r.ptr)));
+    assert.ok(server.rows.some((r) => r.ptr === 'doc:docs/credits.md:1-6@r2'), JSON.stringify(server.rows.map((r) => r.ptr)));
     assert.deepEqual(await found(store), [['chunks_fts', 1]]);                       // by full-text search alone
     assert.deepEqual(await found(sqliteStore(ctx)), [['chunks_fts', 1]]);
     assert.deepEqual(norm(server), norm(search(ctx, Q, { limit: 50 })));
@@ -133,7 +133,7 @@ test('003 applied onto those rows: the search finds the chunk as FTS5 does; no r
   try {
     const r = await searchIn(store3, 'once again', { limit: 50 });
     assert.equal(r.view.run, 3);
-    assert.ok(r.rows.some((x) => x.ptr === 'doc:docs/credits.md:1-7@r3'), JSON.stringify(r.rows.map((x) => x.ptr)));
+    assert.ok(r.rows.some((x) => x.ptr === 'doc:docs/credits.md:1-6@r3'), JSON.stringify(r.rows.map((x) => x.ptr)));
   } finally { await store3.close(); }
 });
 

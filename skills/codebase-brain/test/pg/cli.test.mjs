@@ -28,7 +28,7 @@ const BRAIN = join(KIT, 'bin', 'brain');
 const work = mkdtempSync(join(tmpdir(), 'brain-cli-'));
 after(() => rmSync(work, { recursive: true, force: true }));             // the V2 kit copy's .env.local holds an owner URL
 const SHA = (c) => `aaaaaaa${c}${'0'.repeat(32)}`;
-const DOC = 'doc:docs/credits.md:1-7';
+const DOC = 'doc:docs/credits.md:1-6';
 const meta = (build, commit) => `UPDATE meta SET value = '"${build}"' WHERE key = 'build_id'; UPDATE meta SET value = '"${commit}"' WHERE key = 'commit';`;
 const relink = (from, to) => `UPDATE refs SET resolved_build = '${to}' WHERE resolved_build = '${from}';`;
 // r2: the GitHub state written by the current sanitizer (the guard refuses version 0), a doc edit; r3: an issue title
