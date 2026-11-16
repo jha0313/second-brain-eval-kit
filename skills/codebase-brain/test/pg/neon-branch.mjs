@@ -10,6 +10,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import pg from 'pg';
+import { migrationFiles } from '../../src/pg/migrate.mjs';
 
 const SQL = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'sql');
 
@@ -62,8 +63,8 @@ export async function createBranch(prefix) {
     writer.username = 'brain_writer';
     writer.password = password;
     const reset = async () => {
-      await sql(ownerUrl, `DROP SCHEMA IF EXISTS brain CASCADE; BEGIN; ${readFileSync(join(SQL, '001_init.sql'), 'utf8')}; COMMIT;
-        BEGIN; ${readFileSync(join(SQL, '002_roles.sql'), 'utf8')}; COMMIT;`);
+      await sql(ownerUrl, `DROP SCHEMA IF EXISTS brain CASCADE;
+        ${migrationFiles().map((f) => `BEGIN; ${readFileSync(join(SQL, f), 'utf8')}; COMMIT;`).join('\n')}`);
       await sql(ownerUrl, `ALTER ROLE brain_writer PASSWORD '${password}'`);   // hex only; this branch only
     };
     return { name, ownerUrl, writerUrl: writer.toString(), reset, drop };

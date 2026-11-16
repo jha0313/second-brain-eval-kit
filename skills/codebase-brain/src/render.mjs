@@ -98,8 +98,17 @@ function headLine(it) {
   return '  ' + parts.join(' · ');
 }
 
+// server revisions (Phase 2 §6.8): r1 2026-09-10 run 3 · r2 2026-09-12 run 7 closed-unmerged, and how to read an old one
+function revLines(it, cols) {
+  const parts = it.revs.map((r) => `r${r.rev} ${day(r.publishedAt)} run ${r.run}${r.state ? ` ${label(r.state)}` : ''}`);
+  const lines = wrapped('revs', parts, cols);
+  if (it.revs.length > 1) lines.push(cont(`an old text: brain source ${ident(it.ptr.replace(/@r\d+$/, ''))}@r${it.revs[0].rev}`));
+  return lines;
+}
+
 function getBlock(it, cols) {
   const u = it.untrusted, lines = [headLine(it)];
+  if (it.revs?.length) lines.push(...revLines(it, cols));
   const thread = ['pr', 'issue'].includes(it.type) && it.origin === 'github';
   if (u.url || u.base || u.head) {
     const branches = u.base || u.head ? `base ${ext(u.base ?? '?', 40)} ← head ${ext(u.head ?? '?', 40)}` : '';

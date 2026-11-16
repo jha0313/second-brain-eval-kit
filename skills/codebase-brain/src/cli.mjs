@@ -12,7 +12,7 @@ import { viz } from './viz.mjs';
 import { table, c, cut, cutLeft, plural, width, COLS, safe, ext, ident } from './fmt.mjs';
 import { withWriteLock, openGithubDb, githubDbPath, readSyncState } from './gh-schema.mjs';
 import { relink } from './link.mjs';
-import { openContext } from './context.mjs';
+import { openContext, viewContext } from './context.mjs';
 import { coverage, freshness as answerFreshness, footer, guard } from './answer.mjs';
 import * as read from './read.mjs';
 import { renderSearch, renderGet, renderSource, renderSync } from './render.mjs';
@@ -20,7 +20,10 @@ import { sync as ghSync, parseRemote } from './gh-sync.mjs';
 import { createClient, readToken, fetchTransport, realClock } from './gh-client.mjs';
 import { replaySeams } from './seams.mjs';
 import { SANITIZE_VERSION, sanitizeLine, redactValues } from './sanitize.mjs';
-import { parsePtr } from './ptr.mjs';
+import { parseRevPtr } from './ptr.mjs';
+import { pgStore } from './store/pg.mjs';
+import { sqliteStore } from './store/sqlite.mjs';
+import { readerUrl, secretsOf, connectReader, ensureMirror, mirrorDir, sameRun } from './store/server.mjs';
 import { BrainError } from './errors.mjs';
 import { git, gitEnv } from './files.mjs';
 
@@ -46,6 +49,11 @@ const HELP = `brain — codebase map + memory (prototype)
   brain get <ptr>… (at most 5)         meta, thread, link status of each pointer (no bodies)
   brain source <ptr> [--from N] [--lines N]   the stored text in a quote envelope (default 200 lines)
 
+  Server mode (the team brain, read-only): BRAIN_READER_URL in the environment or in brain's own .env.local
+          search · get · source read the server; the map commands read a local mirror of the same run
+          --as-of run:N | commit:SHA | YYYY-MM-DD[+hh:mm]   an earlier run · get lists revisions, source <ptr>@r<n> reads one
+          --local: the local index instead · build and sync write only in local mode (CI writes the team brain)
+
   common: --db F (or BRAIN_DB) · --repo DIR · --json · --limit N · --cursor N
           --filter test,page,route,server-action,client,script,generated · --exclude test
           --kind call,renders,type,…  · --no-types · --no-mocks · --files (one row per file) · --list (every path)`;
@@ -54,7 +62,7 @@ const HELP = `brain — codebase map + memory (prototype)
 const HOME = homedir();
 const tilde = (p) => (p && HOME && (p === HOME || p.startsWith(HOME + '/')) ? '~' + p.slice(HOME.length) : p);
 
-const BOOL = new Set(['json', 'files', 'no-types', 'no-mocks', 'no-knowledge', 'if-stale', 'list', 'open', 'imports', 'help', 'full']);
+const BOOL = new Set(['json', 'files', 'no-types', 'no-mocks', 'no-knowledge', 'if-stale', 'list', 'open', 'imports', 'help', 'full', 'local']);
 
 function parse(argv) {
   const pos = [], opt = { 'include-root': [] };
@@ -70,13 +78,20 @@ function parse(argv) {
 }
 
 const list = (v) => (v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : undefined);
-const out = (s = '') => process.stdout.write(s + '\n');
+const write = (s) => process.stdout.write(s + '\n');
+const out = (s = '') => write(cutReader(s));            // the reader URL and password: never on stdout
+const outJson = (o) => write(JSON.stringify(o, (k, v) => (typeof v === 'string' ? cutReader(v) : v)));   // values only: keys and literals stay
 
 // Runtime values (errors, the query echo, log lines) leave through scrub(): the active token and the env tokens
 // are cut out by value first, then the masker and the one-line rule run
-let activeToken = null;
+// (the reader URL and its passwords, registered before any command runs, are cut out of scrub() and of everything
+// out() / outJson() write; in server mode a password shorter than MIN_SECRET is refused: it cannot be cut without
+// cutting words)
+let activeToken = null, readerSecrets = [];
 const secrets = () => [activeToken, process.env.GH_TOKEN, process.env.GITHUB_TOKEN].filter(Boolean);
-const scrub = (s) => safe(sanitizeLine(redactValues(String(s ?? ''), secrets())));
+const MIN_SECRET = 8;
+const cutReader = (s) => readerSecrets.reduce((t, x) => t.split(x).join('[REDACTED:reader-url]'), s);
+const scrub = (s) => safe(sanitizeLine(redactValues(cutReader(String(s ?? '')), secrets())));
 const say = (s) => console.error(scrub(s));
 
 // the checkout we are in: --repo, else the git repo around cwd
@@ -92,16 +107,75 @@ function dbPathFor(opt) {
   return defaultDbPath(checkout ?? process.cwd());
 }
 
-// every read command but status: both stores, refused when written before the current sanitizer
-function open(opt) {
-  const ctx = openContext({ codeDbPath: dbPathFor(opt), checkout });
-  guard(ctx);
-  return ctx;
+// ---------- Phase 2: server mode (design §6.2, §6.4) ----------
+// BRAIN_READER_URL (environment, else brain's own .env.local) and no --local. DATABASE_URL is never read.
+const serverUrl = (opt) => (opt.local ? null : readerUrl());
+const originOf = (dir) => { try { return origin(dir); } catch { return null; } };
+// one checked reader connection per command; at: the run --as-of names (null: the newest, picked by the first read)
+async function serverSession(url, opt) {
+  const { client, binding } = await connectReader(url, { origin: originOf(checkout ?? process.cwd()) });
+  const store = pgStore(client);
+  try { return { store, binding, at: opt['as-of'] !== undefined ? await store.resolveAsOf(text(opt['as-of'], 'as-of')) : null }; }
+  catch (e) { await store.close(); throw e; }
+}
+function localOnly(opt, what) {
+  if (serverUrl(opt)) throw new BrainError('server-mode', `brain ${what} writes a local index; in server mode (BRAIN_READER_URL is set) only CI writes the team brain — add --local to ${what} a local index`);
+}
+
+// every read command but status: both stores, refused when written before the current sanitizer. Server mode: the
+// mirror of the run (the newest, or --as-of) with that run's GitHub state, from the server
+async function open(opt) {
+  const url = serverUrl(opt);
+  if (!url) {
+    const ctx = openContext({ codeDbPath: dbPathFor(opt), checkout });
+    if (opt['as-of'] !== undefined) await sqliteStore(ctx).resolveAsOf(String(opt['as-of']));   // code needs-server
+    guard(ctx);
+    return ctx;
+  }
+  const s = await serverSession(url, opt);
+  try {
+    let at = s.at ?? await s.store.resolveAsOf(null);
+    const dir = mirrorDir(s.binding.id, s.at !== null);
+    for (let tries = 1; ; tries++) {
+      const m = await ensureMirror({ url, dir, view: at.view, repo: checkout ?? null, log: say });
+      let ctx = null;
+      try { ctx = openContext({ codeDbPath: m.codeDb, checkout }); }   // open: the file is ours even if replaced now
+      catch (e) { if (existsSync(m.codeDb)) throw e; }              // removed by a session pulling another run in full
+      if (ctx && sameRun(ctx.meta, at.view)) {
+        ctx.sync = at.view.sync;
+        ctx.at = { asOf: s.at !== null, latest: at.latest };
+        guard(ctx);
+        return ctx;
+      }
+      // another session replaced the mirror between its pull and our open: a newer run (taken as the newest), or
+      // another --as-of run (pulled again)
+      const moved = ctx ? Number(ctx.meta.brain_run) : null;
+      ctx?.close();
+      if (tries === 3) throw new BrainError('mirror-busy', 'other sessions keep replacing the mirror with other runs; try again');
+      if (s.at === null && moved > at.run) at = await s.store.resolveAsOf(`run:${moved}`);
+    }
+  } finally { await s.store.close(); }
+}
+
+// search / get / source: Phase 1 on the local stores, or the server store at one run. The context returned is what the
+// footer and the guard read: in server mode the run's view, never a local file
+async function memoryRead(opt, local, server) {
+  const url = serverUrl(opt);
+  if (!url) { const ctx = await open(opt); return { ctx, res: local(ctx) }; }
+  const s = await serverSession(url, opt);
+  try {
+    const { view, ...res } = await server(s.store, s.at?.run ?? null);
+    const ctx = viewContext(view, checkout);
+    ctx.at = { asOf: s.at !== null, latest: s.at?.latest ?? view.run };
+    guard(ctx);                                         // before anything read is shown
+    return { ctx, res };
+  } finally { await s.store.close(); }
 }
 
 // one freshness per answer: the footer prints it; --json carries the Phase 0 fields plus `github`
 const freshFor = (ctx, phase0) => answerFreshness(ctx, { phase0 });
-const jsonFresh = (fr) => ({ state: fr.code.state, commit: fr.code.commit, head: fr.code.head, changed: fr.code.changed, files: fr.code.files, github: fr.github });
+const jsonFresh = (fr) => ({ state: fr.code.state, commit: fr.code.commit, head: fr.code.head, changed: fr.code.changed, files: fr.code.files, github: fr.github,
+  ...(fr.brain && { brain: fr.brain }) });
 // a Phase 0 coverage object (query.mjs coverageFor) as footer coverage
 const covOf = (ctx, cov) => coverage(ctx, { truncated: cov.state === 'truncated', unresolvedLocal: cov.unresolvedLocal });
 
@@ -125,7 +199,7 @@ function target(ctx, q, opt, write = out) {
     if (r.others && !opt.json) write(c.dim(`  ${ext(scrub(q))} → ${ident(r.node.key)} (the only exported one; ${r.others === 1 ? '1 local symbol shares' : `${r.others} local symbols share`} the name — brain find ${ident(scrub(q))})`));
     return r.node;
   }
-  if (opt.json) out(JSON.stringify({ error: 'ambiguous-or-missing', query: scrub(q), candidates: (r.candidates || []).map((n) => n.key) }));
+  if (opt.json) outJson({ error: 'ambiguous-or-missing', query: scrub(q), candidates: (r.candidates || []).map((n) => n.key) });
   else {
     if (r.candidates?.length) {
       write(`${c.yellow('ambiguous')} ${ext(scrub(q))} — pick one ID and ask again:`);
@@ -188,9 +262,9 @@ function since(v) {
   return String(v);
 }
 function pointers(pos, max) {
-  if (!pos.length) throw usage('give a pointer from brain search (pr:12, review:9, doc:path:1-24@build, commit:sha …)');
+  if (!pos.length) throw usage('give a pointer from brain search (pr:12, review:9, doc:path:1-24@build, doc:path:1-24@r3, commit:sha …)');
   if (pos.length > max) throw usage(`at most ${max} pointer${max === 1 ? '' : 's'} at a time (got ${pos.length})`);
-  for (const p of pos) parsePtr(p);
+  for (const p of pos) parseRevPtr(p);
   return pos;
 }
 
@@ -212,6 +286,7 @@ function afterSync(codeDbPath) {
 
 const cmds = {
   async build({ pos, opt }) {
+    localOnly(opt, 'build');
     const repo = resolve(pos[0] || opt.repo || '.');
     const dbPath = opt.db ? resolve(opt.db) : process.env.BRAIN_DB ? resolve(process.env.BRAIN_DB) : defaultDbPath(repo);
     const options = { includeRoots: opt['include-root'], noKnowledge: !!opt['no-knowledge'] };
@@ -219,7 +294,7 @@ const cmds = {
       const ctx = openContext({ codeDbPath: dbPath, checkout: repo });
       const fr = freshFor(ctx), cov = coverage(ctx, { unresolvedLocal: ctx.meta.coverage?.unresolvedLocal });
       ctx.close();
-      if (opt.json) out(JSON.stringify({ db: dbPath, ...fields, coverage: cov, freshness: jsonFresh(fr) }));
+      if (opt.json) outJson({ db: dbPath, ...fields, coverage: cov, freshness: jsonFresh(fr) });
       else finish(fr, cov, say);                         // build's text goes to stderr, so its footer does too
     };
     // --if-stale: keep an index, built with the same options and the current sanitizer, that still matches THIS
@@ -261,7 +336,7 @@ const cmds = {
     const edges = db.prepare('SELECT count(*) n FROM edges').get().n;
     const chunks = Object.fromEntries(db.prepare('SELECT source, count(*) n FROM chunks GROUP BY source').all().map((r) => [r.source, r.n]));
     const ageMin = Math.round((Date.now() - Date.parse(m.built_at)) / 60000);
-    if (opt.json) return out(JSON.stringify({ ...f, repo: f.repo == null ? f.repo : scrub(f.repo), counts, edges, chunks, ageMin, meta: undefined, stats: s, timings: m.timings, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) return outJson({ ...f, repo: f.repo == null ? f.repo : scrub(f.repo), counts, edges, chunks, ageMin, meta: undefined, stats: s, timings: m.timings, coverage: cov, freshness: jsonFresh(fr) });
     out(`${c.bold('brain status')}  ${cutLeft(scrub(tilde(f.repo)), COLS - 16)}`);
     out(table(['', ''], [
       ['index', `@${m.commit?.slice(0, 8)} (${m.commit_date}) · built ${ageMin} min ago in ${m.timings.total}s`],
@@ -276,11 +351,11 @@ const cmds = {
     for (const l of footer({ coverage: cov, freshness: fr })) out(c.dim(l));
   },
 
-  find({ pos, opt }) {
-    const ctx = open(opt), db = ctx.code;
+  async find({ pos, opt }) {
+    const ctx = await open(opt), db = ctx.code;
     const r = find(db, pos[0], { limit: +(opt.limit || 20), kind: opt.kind });
     const fr = freshFor(ctx), cov = coverage(ctx, { truncated: r.truncated });
-    if (opt.json) return out(JSON.stringify({ ...r, freshness: jsonFresh(fr), coverage: cov, rows: r.rows.map((n) => ({ id: n.key, kind: n.kind, line: n.line, exported: !!n.exported, uses: n.uses })) }));
+    if (opt.json) return outJson({ ...r, freshness: jsonFresh(fr), coverage: cov, rows: r.rows.map((n) => ({ id: n.key, kind: n.kind, line: n.line, exported: !!n.exported, uses: n.uses })) });
     // an ID is never cut (it is the next command's argument): one wider than the room goes on its own line under the row
     const head = ['ID', 'KIND', 'USES', 'LINE'];
     const rows = r.rows.map((n) => [ident(n.key), n.kind + (n.exported || ['file', 'dir'].includes(n.kind) ? '' : ' (local)'), n.uses, n.line ?? '']);
@@ -293,8 +368,8 @@ const cmds = {
     finish(fr, cov);
   },
 
-  refs({ pos, opt }, mode = 'refs') {
-    const ctx = open(opt), db = ctx.code;
+  async refs({ pos, opt }, mode = 'refs') {
+    const ctx = await open(opt), db = ctx.code;
     const node = target(ctx, pos[0], opt);
     const kinds = mode === 'callers' ? ['call', 'new', 'renders'] : list(opt.kind);
     const r = refs(db, node, { kinds, filter: list(opt.filter), exclude: list(opt.exclude), includeImports: opt.imports,
@@ -305,8 +380,8 @@ const cmds = {
     // --files: one row per file (its first site, the site count, every kind), not one per site
     const perFile = () => [...Map.groupBy(r.rows, (x) => x.path).values()]
       .map((xs) => ({ ...site(xs[0]), kind: [...new Set(xs.map((x) => x.kind))].join(' '), sites: xs.length }));
-    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total: r.total, files: r.files, next: r.next, coverage: cov, freshness: jsonFresh(fr),
-      sites: opt.files ? perFile() : r.rows.map(site) }));
+    if (opt.json) return outJson({ target: node.key, kind: node.kind, total: r.total, files: r.files, next: r.next, coverage: cov, freshness: jsonFresh(fr),
+      sites: opt.files ? perFile() : r.rows.map(site) });
     const where = node.path && node.kind !== 'file' ? c.dim(`defined ${ident(node.path)}:${node.line}`) : '';
     const head = `${mode} ${describe(node)}`;
     out(where && width(head) + width(where) + 2 > COLS ? `${head}\n  ${where}` : `${head}${where ? '  ' + where : ''}`);
@@ -330,8 +405,8 @@ const cmds = {
 
   callers(args) { return cmds.refs(args, 'callers'); },
 
-  impact({ pos, opt }) {
-    const ctx = open(opt), db = ctx.code;
+  async impact({ pos, opt }) {
+    const ctx = await open(opt), db = ctx.code;
     const node = target(ctx, pos[0], opt);
     const r = impact(db, node, { hops: +(opt.hops || 99), noTypes: opt['no-types'], noMocks: opt['no-mocks'] });
     const filter = list(opt.filter), exclude = list(opt.exclude);
@@ -342,8 +417,8 @@ const cmds = {
     // a route handler is reached by its URL, not by an import: with no importers, say what to grep instead
     const hint = total === 0 && node.kind === 'file' && node.flags.split(' ').includes('route')
       ? `reached by URL, not imports — grep "${routeUrl(node.path)}" (fetch calls, links, config)` : undefined;
-    if (opt.json) return out(JSON.stringify({ target: node.key, kind: node.kind, total, tests, coverage: cov, freshness: jsonFresh(fr), hint,
-      hops: hops.map((h) => ({ hop: h.hop, files: h.files, tests: h.tests, paths: h.paths })) }));
+    if (opt.json) return outJson({ target: node.key, kind: node.kind, total, tests, coverage: cov, freshness: jsonFresh(fr), hint,
+      hops: hops.map((h) => ({ hop: h.hop, files: h.files, tests: h.tests, paths: h.paths })) });
     const level = node.kind === 'file' || node.kind === 'dir' ? 'file level · import edges' : 'symbol level · use edges';
     out(`impact ${describe(node)}  ${c.dim(level)}${filter ? c.dim(` · only ${safe(filter.join(','))}`) : ''}${exclude ? c.dim(` · without ${safe(exclude.join(','))}`) : ''}`);
     let cum = 0;
@@ -358,13 +433,13 @@ const cmds = {
     finish(fr, covOf(ctx, cov));
   },
 
-  deps({ pos, opt }) {
-    const ctx = open(opt), db = ctx.code;
+  async deps({ pos, opt }) {
+    const ctx = await open(opt), db = ctx.code;
     const node = target(ctx, pos[0], opt);
     const r = deps(db, node, { hops: +(opt.hops || 99), noTypes: opt['no-types'] });
     const rows = [...r.hopOf].filter(([, h]) => h > 0).sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]));
     const cov = coverageFor(db, { truncated: false }), fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ target: node.key, from: node.path, total: rows.length, coverage: cov, freshness: jsonFresh(fr), files: rows.map(([p, h]) => ({ path: p, hop: h })) }));
+    if (opt.json) return outJson({ target: node.key, from: node.path, total: rows.length, coverage: cov, freshness: jsonFresh(fr), files: rows.map(([p, h]) => ({ path: p, hop: h })) });
     out(`deps ${describe(node)}: ${plural(rows.length, 'file')} pulled in`);
     if (!['file', 'dir'].includes(node.kind)) out(c.dim(`  file level: what ${ident(node.path)} (where ${safe(node.name)} is defined) pulls in`));
     if (opt.list) for (const [p, h] of rows) out(`  ${h}\t${safe(p)}`);
@@ -372,13 +447,13 @@ const cmds = {
     finish(fr, covOf(ctx, cov));
   },
 
-  shared({ pos, opt }) {
-    const ctx = open(opt), db = ctx.code;
+  async shared({ pos, opt }) {
+    const ctx = await open(opt), db = ctx.code;
     const a = target(ctx, pos[0], opt), b = target(ctx, pos[1], opt);
     const r = shared(db, a, b, { noTypes: opt['no-types'] });
     const byTop = r.both.reduce((m, p) => m.set(p.split('/').slice(0, 2).join('/'), (m.get(p.split('/').slice(0, 2).join('/')) || 0) + 1), new Map());
     const cov = coverageFor(db, { truncated: false }), fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ a: a.key, b: b.key, total: r.both.length, coverage: cov, freshness: jsonFresh(fr), files: r.both }));
+    if (opt.json) return outJson({ a: a.key, b: b.key, total: r.both.length, coverage: cov, freshness: jsonFresh(fr), files: r.both });
     out(`shared ${describe(a)} ∩ ${describe(b)}`);
     out(c.dim(`  ${ident(a.path)} pulls in ${r.a} files · ${ident(b.path)} pulls in ${r.b} · both: `) + c.bold(r.both.length));
     out(table(['AREA', 'FILES'], [...byTop].sort((x, y) => y[1] - x[1]).slice(0, opt.list ? 1e9 : 12).map(([k, n]) => [ident(k), n]), { align: ['l', 'r'] }));
@@ -386,15 +461,15 @@ const cmds = {
     finish(fr, covOf(ctx, cov));
   },
 
-  why({ pos, opt }) {
-    const ctx = open(opt), db = ctx.code;
+  async why({ pos, opt }) {
+    const ctx = await open(opt), db = ctx.code;
     const t0 = performance.now();
     const r = why(db, pos.join(' '), { limit: +(opt.limit || 8) });
     const ms = Math.round(performance.now() - t0);
     const f = freshness(db, checkout);
     markMentions(f.repo, r);
     const fr = freshFor(ctx, f), cov = coverage(ctx, {});
-    if (opt.json) return out(JSON.stringify({ ...r, ms, freshness: jsonFresh(fr), coverage: cov }));
+    if (opt.json) return outJson({ ...r, ms, freshness: jsonFresh(fr), coverage: cov });
     out(`why ${c.bold(ext(scrub(r.question), COLS - 36))}  ${c.dim(`FAST · no LLM · ${ms} ms`)}`);
     if (r.seeds.length) out(c.dim(`  names → code: ${r.seeds.map(ident).join(', ')}`));
     if (r.gap) {
@@ -427,10 +502,10 @@ const cmds = {
     finish(fr, cov);
   },
 
-  viz({ pos, opt }) {
-    const ctx = open(opt), db = ctx.code;
+  async viz({ pos, opt }) {
+    const ctx = await open(opt), db = ctx.code;
     const node = target(ctx, pos[0], opt, say);
-    const file = viz(db, node, { out: opt.out, hops: +(opt.hops || 2), question: opt.why, max: +(opt.max || 260) });
+    const file = viz(db, node, { out: opt.out, hops: +(opt.hops || 2), question: opt.why == null ? opt.why : scrub(opt.why), max: +(opt.max || 260) });
     out(safe(tilde(file)));                              // stdout is the file path only; the footer goes to stderr
     if (opt.open) execFileSync('open', [file]);
     finish(freshFor(ctx), covOf(ctx, coverageFor(db, { truncated: false })), say);
@@ -439,6 +514,7 @@ const cmds = {
   // ---------- Phase 1: GitHub memory ----------
 
   async sync({ opt }) {
+    localOnly(opt, 'sync');
     const codeDbPath = dbPathFor(opt), repoDir = checkout ?? process.cwd();
     const { owner, repo } = origin(repoDir);              // before the token: no credential is read for a repo we cannot sync
     const timeout = whole(opt['request-timeout'], 'request-timeout', 1), rateWait = whole(opt['max-rate-wait'], 'max-rate-wait', 0);
@@ -459,41 +535,40 @@ const cmds = {
     const ctx = afterSync(codeDbPath);
     const fr = freshFor(ctx), cov = coverage(ctx, { githubPresent: !!ctx.gh });
     ctx.close();
-    if (opt.json) out(JSON.stringify({ ...r, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) outJson({ ...r, coverage: cov, freshness: jsonFresh(fr) });
     else { out(renderSync(r)); finish(fr, cov); }
     if (r.status !== 'ok') process.exit(r.status === 'busy' ? 3 : 1);
   },
 
-  search({ pos, opt }) {
+  async search({ pos, opt }) {
     const q = pos.join(' ');
     const opts = { kind: oneOf(opt.kind, 'kind', KINDS), state: oneOf(opt.state, 'state', STATES), path: text(opt.path, 'path'),
       author: text(opt.author, 'author'), since: since(opt.since), limit: whole(opt.limit, 'limit', 1), cursor: whole(opt.cursor, 'cursor', 0) };
     if (!q.trim() && !opts.path) throw usage('brain search "<question>" [--path P] — give a question, a --path, or both');
-    const ctx = open(opt);
-    const res = read.search(ctx, q, opts), shown = { ...res, query: scrub(res.query) };   // the query echo is a runtime value
+    const { ctx, res } = await memoryRead(opt, (c) => read.search(c, q, opts), (store, asOf) => read.searchIn(store, q, { ...opts, asOf }));
+    const shown = { ...res, query: scrub(res.query) };   // the query echo is a runtime value
     const cov = coverage(ctx, { ...res.facts, truncated: res.next != null }), fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ ...shown, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) return outJson({ ...shown, coverage: cov, freshness: jsonFresh(fr) });
     out(renderSearch(shown, { coverage: cov, freshness: fr }, { cursor: opts.cursor ?? 0 }).join('\n'));
   },
 
-  get({ pos, opt }) {
+  async get({ pos, opt }) {
     const ptrs = pointers(pos, 5);
-    const ctx = open(opt);
-    const res = read.get(ctx, ptrs);
+    const { ctx, res } = await memoryRead(opt, (c) => read.get(c, ptrs), (store, asOf) => read.getIn(store, ptrs, { asOf }));
     const cov = coverage(ctx, res.facts), fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ ...res, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) return outJson({ ...res, coverage: cov, freshness: jsonFresh(fr) });
     out(renderGet(res, { coverage: cov, freshness: fr }).join('\n'));
   },
 
-  source({ pos, opt }) {
+  async source({ pos, opt }) {
     const [ptr] = pointers(pos, 1);
     const from = whole(opt.from, 'from', 1) ?? 1, maxLines = whole(opt.lines, 'lines', 1) ?? 200;
-    const ctx = open(opt);
-    const src = read.source(ctx, ptr, { from, maxLines });
+    const { ctx, res: src } = await memoryRead(opt, (c) => read.source(c, ptr, { from, maxLines }),
+      (store, asOf) => read.sourceIn(store, ptr, { from, maxLines, asOf }));
     // a GitHub quote is as complete as the last sync: a failed or missing one makes it partial
-    const cov = coverage(ctx, { lines: { from: src.from, to: src.to, total: src.total }, ...(src.origin === 'github' ? { githubPresent: !!ctx.gh } : {}) });
+    const cov = coverage(ctx, { lines: { from: src.from, to: src.to, total: src.total }, ...(src.origin === 'github' ? { githubPresent: !!(ctx.gh || ctx.sync) } : {}) });
     const fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ ...src, coverage: cov, freshness: jsonFresh(fr) }));
+    if (opt.json) return outJson({ ...src, coverage: cov, freshness: jsonFresh(fr) });
     out(renderSource(src, { coverage: cov, freshness: fr }, read.envelope).join('\n'));
   },
 };
@@ -503,12 +578,19 @@ const { pos, opt } = parse(process.argv.slice(2));
 const cmd = pos.shift();
 if (!cmd || opt.help || !cmds[cmd]) { out(HELP); process.exit(cmd && !opt.help ? 1 : 0); }
 if (cmd !== 'build') checkout = here(opt);
-try { await cmds[cmd]({ pos, opt }); }
+try {
+  const reader = secretsOf(readerUrl() ?? '');            // before anything can echo input; also as a JSON string holds them
+  if (!opt.local && reader.some((x) => x.length < MIN_SECRET)) {
+    throw new BrainError('not-reader', `the password in BRAIN_READER_URL is shorter than ${MIN_SECRET} characters, too short to keep out of output: use the reader password migrate set`);
+  }
+  readerSecrets = [...new Set(reader.filter((x) => x.length >= MIN_SECRET).flatMap((x) => [x, JSON.stringify(x).slice(1, -1)]))].sort((a, b) => b.length - a.length);
+  await cmds[cmd]({ pos, opt });
+}
 catch (e) {
   // an error is not an answer: its code and a masked one-line message, no stack, no token; fail open
   const code = typeof e?.code === 'string' && e.code ? e.code : 'error';
   const msg = scrub(e?.message ?? e);
-  if (opt.json) out(JSON.stringify({ error: msg, code }));
+  if (opt.json) outJson({ error: msg, code });
   else out(`${c.red('brain error')} (${safe(code)}): ${msg}\n  fail open: continue with grep / your normal tools`);
-  process.exit(code === 'lock-busy' ? 3 : 1);
+  process.exit(code === 'lock-busy' ? 3 : ['not-reader', 'wrong-repo'].includes(code) ? 2 : 1);   // 2: a server brain refused (§6.2)
 }
