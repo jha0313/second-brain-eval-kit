@@ -604,11 +604,13 @@ export const refreshStatePath = (home, sourceRepoId) => `${home}/.cache/brain/re
 
 // ---- ci-publish stages, limits, signals (§6.2, A2, A5) -------------------------------------------------------------
 export const CI_STAGES = Object.freeze(['prepare', 'record', 'mirror', 'build', 'sync', 'outbound', 'publish', 'verify']);
-/** Per-stage limits in ms (null = none). Child stages get SIGTERM at the limit and SIGKILL 10 s later. */
+/** Per-stage limits in ms (null = none). Child stages get SIGTERM at the limit and SIGKILL 10 s later.
+ *  mirrorCold: the mirror stage with no cached mirror (a full pull). The cache is saved only on success, so a cold pull
+ *  that always hit the 60 s warm limit would never produce a cache. */
 export const CI_LIMITS = Object.freeze({
-  normal: Object.freeze({ record: 60_000, mirror: 60_000, build: 180_000, sync: 120_000, publish: 60_000, verify: 30_000,
+  normal: Object.freeze({ record: 60_000, mirror: 60_000, mirrorCold: 300_000, build: 180_000, sync: 120_000, publish: 60_000, verify: 30_000,
     requestMs: 30_000, rateWaitMs: 60_000, txTimeout: '60s', statementTimeout: '30s', lockTimeout: '15s' }),
-  bootstrap: Object.freeze({ record: 60_000, mirror: 60_000, build: 180_000, sync: null, publish: 600_000, verify: 30_000,
+  bootstrap: Object.freeze({ record: 60_000, mirror: 60_000, mirrorCold: 300_000, build: 180_000, sync: null, publish: 600_000, verify: 30_000,
     requestMs: 30_000, rateWaitMs: null, txTimeout: '10min', statementTimeout: '5min', lockTimeout: '15s' }),
 });
 export const CI_KILL_GRACE_MS = 10_000;
