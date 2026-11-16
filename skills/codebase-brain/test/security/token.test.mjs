@@ -58,8 +58,15 @@ for (const name of FAILPOINTS) {
     const dir = writeReplay(replayRoutes(gh));
     const full = name === 'sync:full:before-swap';
     const env = { BRAIN_FAIL_AT: name };
+    // a resumed run skips the PR file lists the failed run already stored, so it would not reach sync:files:N again:
+    // check the first run's output and stores, then start the second from an empty github.db
     const runs = full ? [sync(fx, dir), sync(fx, dir, ['--full'], env), sync(fx, dir, ['--full', '--json'], env)]
-      : [sync(fx, dir, [], env), sync(fx, dir, ['--json'], env)];
+      : [sync(fx, dir, [], env)];
+    if (!full) {
+      assert.deepEqual([...outputLeaks(reg, runs), ...storeLeaks(reg, fx.codeDb)], [], 'the first run');
+      resetGithub(fx);
+      runs.push(sync(fx, dir, ['--json'], env));
+    }
     verdict(runs, name === 'sync:relink' ? 'ok' : 'failed');
   });
 }

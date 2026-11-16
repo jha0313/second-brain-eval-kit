@@ -11,7 +11,7 @@ import { sync, upsertPage, ingestRaw } from '../../src/gh-sync.mjs';
 import { githubDbPath, openGithubDb, readSyncState, writeSyncState } from '../../src/gh-schema.mjs';
 import { GuardError } from '../../src/errors.mjs';
 import { SANITIZE_VERSION } from '../../src/sanitize.mjs';
-import { fakeClock, ghItem } from './helpers.mjs';
+import { fakeClock, ghItem, holdLockInChild, killChild, lockState } from './helpers.mjs';
 import { SECRET, TOKEN, fakeClient, fakeDeps, loadSnapshot, refsOf } from './gh-fixture/fakes.mjs';
 
 const CHILD = join(dirname(fileURLToPath(import.meta.url)), 'gh-fixture', 'sync-child.mjs');
@@ -45,6 +45,8 @@ const row = (path, ptr) => withDb(path, (db) => ({ ...db.prepare('SELECT * FROM 
 const stateOf = (path) => withDb(path, readSyncState);
 const refsAt = (path, ptr, origin) => withDb(path, (db) => rows(db, 'SELECT kind, target FROM refs WHERE ptr = ? AND origin = ? ORDER BY kind, target', ptr, origin));
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
+// the write lock is free and its last holder released it normally (no diagnostic pid file left)
+const released = (s) => { assert.equal(lockState(s.codeDbPath), 'clean'); assert.equal(existsSync(`${s.lock}.pid`), false); };
 const noTemp = (s) => { for (const f of [`${s.ghPath}.full-tmp`, `${s.ghPath}.full-tmp-journal`]) assert.equal(existsSync(f), false, f); };
 
 function dump(path) {
@@ -101,14 +103,14 @@ const LINE_COLS = ['title', 'author', 'author_assoc', 'url', 'base', 'head', 'pa
 test('first sync: every kind stored, R10 states, only sanitized values bound, cursor = Date of getRepo', async () => {
   const s = store();
   let lockHeld = null;
-  const deps = fakeDeps({ relink: async (o) => { lockHeld = existsSync(`${o.codeDbPath}.lock`); deps.calls.relink.push(o); return { linked: 0 }; } });
+  const deps = fakeDeps({ relink: async (o) => { lockHeld = lockState(o.codeDbPath) === 'held'; deps.calls.relink.push(o); return { linked: 0 }; } });
   const { r, client } = await run(s, 'v1', { deps });
   assert.deepEqual(pick(r, ['status', 'cursor', 'error', 'staleLock']), { status: 'ok', cursor: T1, error: null, staleLock: false });
   assert.deepEqual(r.counts, { prs: 6, issues: 2, reviews: 2, reviewComments: 3, issueComments: 3, files: 6, requests: client.requests.length });
   assert.deepEqual(r.relink, { linked: 0 });
   assert.equal(lockHeld, true);                                            // relink ran inside the lock
   assert.deepEqual(deps.calls.relink.map((o) => [o.codeDbPath, o.repoDir]), [[s.codeDbPath, s.dir]]);
-  assert.equal(existsSync(s.lock), false);
+  released(s);
   assert.equal(statSync(s.ghPath).mode & 0o777, 0o600);
   assert.deepEqual(pick(stateOf(s.ghPath), ['cursor', 'run_status', 'last_ok_at', 'last_full_at', 'last_error', 'sanitize_version', 'repo_id', 'repo', 'limits']),
     { cursor: T1, run_status: 'ok', last_ok_at: NOW, last_full_at: null, last_error: null, sanitize_version: SANITIZE_VERSION, repo_id: 4242, repo: 'L|o/r', limits: { filesTruncated: 1 } });
@@ -247,12 +249,12 @@ for (const [at, full = false] of [...FAILPOINTS, ['sync:relink']]) {
     const s = await base();
     const before = readFileSync(s.ghPath);
     crash(s, at, full);
-    assert.equal(existsSync(s.lock), true);                               // SIGKILL: no finally, the lock stays
+    assert.equal(lockState(s.codeDbPath), 'dirty');                       // SIGKILL: no finally; the OS freed the lock, the holder row says it died
     if (full) assert.ok(readFileSync(s.ghPath).equals(before), 'old store untouched');
     assertInvariants(s, at === 'sync:relink' ? T2 : T1);                  // relink runs after the final commit
     const { r } = await run(s, 'v2', { full });
     assert.deepEqual(pick(r, ['status', 'staleLock']), { status: 'ok', staleLock: true });
-    assert.equal(existsSync(s.lock), false);
+    released(s);
     noTemp(s);
     assert.deepEqual(dump(s.ghPath), (await reference())[full ? 'full' : 'inc']);
   });
@@ -379,7 +381,7 @@ test('S8 incremental sync on a store masked by an older sanitizer: GuardError, n
   await assert.rejects(run(s, 'v2', { client }), (e) => e instanceof GuardError && e.store === 'github' && e.code === 'rebuild-needed');
   assert.deepEqual(client.requests, []);
   assert.ok(readFileSync(s.ghPath).equals(before), 'nothing written');
-  assert.equal(existsSync(s.lock), false);
+  released(s);
   const { r } = await run(s, 'v2', { full: true });
   assert.equal(r.status, 'ok');
   assert.equal(stateOf(s.ghPath).sanitize_version, SANITIZE_VERSION);
@@ -427,8 +429,8 @@ test('S10 relink failure (an error, or BRAIN_FAIL_AT=sync:relink) is reported an
 
 test('another write holding the lock: status busy, no store created', async () => {
   const s = store();
-  writeFileSync(s.lock, String(process.ppid));                            // a live process that is not us
-  const { r, client } = await run(s, 'v1');
+  const holder = await holdLockInChild(s.codeDbPath);                     // a live process that is not us
+  const { r, client } = await run(s, 'v1').finally(() => killChild(holder));
   assert.deepEqual(pick(r, ['status', 'cursor', 'staleLock', 'relink']), { status: 'busy', cursor: null, staleLock: false, relink: null });
   assert.match(r.error, /another brain write is running/);
   assert.deepEqual(client.requests, []);

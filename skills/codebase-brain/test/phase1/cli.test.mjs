@@ -9,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
-import { fixtureRepo, makeGithubDb, runBrain } from './helpers.mjs';
+import { fixtureRepo, makeGithubDb, runBrain, holdLockInChild, killChild } from './helpers.mjs';
 import { SANITIZE_VERSION } from '../../src/sanitize.mjs';
 
 const ch = (n) => String.fromCodePoint(n);
@@ -216,11 +216,11 @@ test('build --if-stale rebuilds an index made by an older sanitizer, then keeps 
   assert.equal(build().skipped, true);
 });
 
-test('a write while another process holds the lock exits 3 (busy)', () => {
+test('a write while another process holds the lock exits 3 (busy)', async () => {
   const db = copyIndex();
-  writeFileSync(`${db}.lock`, String(process.pid));          // this test process: alive, and not the brain process
-  const r = F.brain(['build', '.', '--json'], { BRAIN_DB: db });
-  rmSync(`${db}.lock`);
+  const holder = await holdLockInChild(db);                  // a live process that is not the brain process
+  let r;
+  try { r = F.brain(['build', '.', '--json'], { BRAIN_DB: db }); } finally { await killChild(holder); }
   assert.equal(r.status, 3, r.stdout + r.stderr);
   assert.equal(JSON.parse(r.stdout).code, 'lock-busy');
 });

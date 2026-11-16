@@ -254,8 +254,8 @@ const cmds = {
     const edges = db.prepare('SELECT count(*) n FROM edges').get().n;
     const chunks = Object.fromEntries(db.prepare('SELECT source, count(*) n FROM chunks GROUP BY source').all().map((r) => [r.source, r.n]));
     const ageMin = Math.round((Date.now() - Date.parse(m.built_at)) / 60000);
-    if (opt.json) return out(JSON.stringify({ ...f, counts, edges, chunks, ageMin, meta: undefined, stats: s, timings: m.timings, coverage: cov, freshness: jsonFresh(fr) }));
-    out(`${c.bold('brain status')}  ${cutLeft(safe(tilde(f.repo)), COLS - 16)}`);
+    if (opt.json) return out(JSON.stringify({ ...f, repo: f.repo == null ? f.repo : scrub(f.repo), counts, edges, chunks, ageMin, meta: undefined, stats: s, timings: m.timings, coverage: cov, freshness: jsonFresh(fr) }));
+    out(`${c.bold('brain status')}  ${cutLeft(scrub(tilde(f.repo)), COLS - 16)}`);
     out(table(['', ''], [
       ['index', `@${m.commit?.slice(0, 8)} (${m.commit_date}) · built ${ageMin} min ago in ${m.timings.total}s`],
       ['head', f.head ? `@${f.head.slice(0, 8)} · ${plural(f.changed.length, 'file')} changed since the index` : 'unknown (not a git repo?)'],

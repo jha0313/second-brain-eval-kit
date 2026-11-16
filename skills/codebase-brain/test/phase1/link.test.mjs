@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { extractRefs, fileRefs, relink } from '../../src/link.mjs';
 import { withWriteLock } from '../../src/gh-schema.mjs';
-import { fixtureRepo, makeGithubDb } from './helpers.mjs';
+import { fixtureRepo, makeGithubDb, lockState } from './helpers.mjs';
 
 const pairs = (refs) => refs.map((r) => `${r.kind} ${r.target} ${r.origin}`).sort();
 
@@ -242,8 +242,8 @@ test('relink: targets shaped like options or shell never reach git grep as argum
 test('relink runs inside the caller\'s write lock and never takes it itself', async () => {
   freshGh([{ kind: 'file', target: 'src/lib/credits.ts' }]);
   const { value } = await withWriteLock(fx.codeDb, () => run());
-  assert.equal(value.linked, 1);
-  assert.equal(existsSync(`${fx.codeDb}.lock`), false);
+  assert.equal(value.linked, 1);                                             // a nested withWriteLock would have thrown lock-busy
+  assert.equal(lockState(fx.codeDb), 'clean');
 });
 
 test('brain build relinks an existing github.db against the new build', async () => {
