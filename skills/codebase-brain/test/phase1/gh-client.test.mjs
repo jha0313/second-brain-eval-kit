@@ -403,3 +403,29 @@ test('readToken captures gh stderr: nothing reaches the terminal', () => {
   assert.equal(r.stderr, '');
   assert.ok(existsSync(failing.args));                                          // gh did run
 });
+
+test('integration: every attempt carries a timeout signal; a stalled request is a network error, retried, then GhError', async () => {
+  const stall = Object.assign(async (req) => {
+    stall.calls.push(req);
+    return new Promise((_, rej) => req.signal.addEventListener('abort', () => rej(req.signal.reason)));
+  }, { calls: [] });
+  const clock = virtualClock(START);
+  const client = createClient({ owner: 'o', repo: 'r', token: TOKEN, transport: stall, clock, requestTimeoutMs: 30 });
+  await assert.rejects(client.getRepo(), (e) => e instanceof GhError && e.kind === 'network' && !e.message.includes(TOKEN));
+  assert.equal(stall.calls.length, 4);                                     // 1 + 3 retries
+  assert.ok(stall.calls.every((c) => c.signal instanceof AbortSignal));
+  assert.notEqual(stall.calls[0].signal, stall.calls[1].signal);           // a fresh deadline per attempt
+  assert.deepEqual(clock.slept, [1000, 2000, 4000]);
+});
+
+test('integration: a rate-limit wait over maxRateWaitMs fails at once instead of waiting', async () => {
+  const reset = String(Date.parse(START) / 1000 + 300);
+  const limited = { status: 403, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': reset }, body: { message: 'API rate limit exceeded' } };
+  const clock = virtualClock(START);
+  const client = createClient({ owner: 'o', repo: 'r', token: TOKEN, transport: scripted(limited, REPO_OK), clock, maxRateWaitMs: 60_000 });
+  await assert.rejects(client.getRepo(), (e) => e.kind === 'rate-limit' && /300s is over the 60s limit/.test(e.message));
+  assert.deepEqual(clock.slept, []);
+  const ok = createClient({ owner: 'o', repo: 'r', token: TOKEN, transport: scripted({ ...limited, headers: { 'retry-after': '30' } }, REPO_OK),
+    clock: virtualClock(START), maxRateWaitMs: 60_000 });
+  assert.equal((await ok.getRepo()).id, 42);                               // a 30 s wait is within the limit
+});

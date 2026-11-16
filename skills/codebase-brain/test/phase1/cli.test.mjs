@@ -238,3 +238,18 @@ test('freshness footer: N commits behind, then diverged', () => {
   assert.match(R.brain(['find', 'reserve']).stdout, new RegExp(`\\n {2}freshness: code @${at.slice(0, 8)} · HEAD @[0-9a-f]{8} · diverged · github never synced\\n$`));
   assert.equal(JSON.parse(R.brain(['find', 'reserve', '--json']).stdout).freshness.state, 'stale');
 });
+
+
+test('integration: an index without the local-path meta (repo, worktree) still answers every read command', () => {
+  // Phase 2 mirrors drop these two meta keys (R16): reads must not need them
+  const db = copyIndex();
+  const w = new DatabaseSync(db);
+  w.prepare("DELETE FROM meta WHERE key IN ('repo', 'worktree')").run();
+  w.close();
+  for (const args of [['status', '--json'], ['find', 'reserve', '--json'], ['refs', 'reserve', '--json'], ['why', 'why reserve first?', '--json'],
+    ['search', 'reserve', '--json'], ['impact', 'src/lib/credits.ts', '--json']]) {
+    const r = F.brain(args, { BRAIN_DB: db });
+    assert.equal(r.status, 0, `${args[0]}: ${r.stdout}${r.stderr}`);
+    assert.ok(JSON.parse(r.stdout).freshness, args[0]);
+  }
+});

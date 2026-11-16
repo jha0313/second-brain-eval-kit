@@ -436,3 +436,16 @@ test('another write holding the lock: status busy, no store created', async () =
   assert.deepEqual(client.requests, []);
   assert.equal(existsSync(s.ghPath), false);
 });
+
+test('integration: a server Date before the stored cursor fails the sync and never moves the cursor back', async () => {
+  const s = await base();                                                  // cursor T1
+  const before = stateOf(s.ghPath).cursor;
+  for (const full of [false, true]) {
+    const client = fakeClient({ ...loadSnapshot('v2'), serverDate: '2026-11-09T10:00:00Z' });
+    const { r } = await run(s, 'v2', { client, full });
+    assert.equal(r.status, 'failed');
+    assert.match(r.error, /server Date 2026-11-09T10:00:00Z is before the stored cursor/);
+    assert.deepEqual(client.requests, ['repo']);
+  }
+  assert.equal(stateOf(s.ghPath).cursor, before);
+});

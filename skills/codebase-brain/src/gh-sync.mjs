@@ -105,6 +105,8 @@ async function runLocked(run) {
       const repo = await client.getRepo();
       const T = time(repo.serverDate);
       if (!T) throw new GhError('protocol', 'the repo response has no usable Date header');   // R1
+      // the cursor never moves back: a server Date before the stored T is a clock we cannot trust (Phase 3 §5)
+      if (state.cursor && T < state.cursor) throw new GhError('protocol', `the server Date ${T} is before the stored cursor ${state.cursor}`);
       if (state.repo_id != null && Number(state.repo_id) !== Number(repo.id)) {
         result.error = `github.db is bound to GitHub repo id ${Number(state.repo_id)}, origin is repo id ${Number(repo.id)}: nothing written`;
         return result;

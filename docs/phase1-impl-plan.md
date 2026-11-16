@@ -342,6 +342,13 @@ flowchart LR
 | A22 | `--state closed` = 열려 있지 않음(닫힌 이슈, 머지·미머지로 닫힌 PR). `--kind review` = 리뷰 + 인라인 댓글, `--kind comment` = 인라인 댓글 + 대화 댓글 | E2: 값 목록만 있고 뜻이 없었다. GitHub의 뜻을 따랐다 |
 | A23 | sync는 busy를 `{ status: 'busy' }`로 돌려준다(throw 안 함). `SyncResult.relink` = `RelinkResult` · `{ error }` · `null`. sync opts에 `token`(값으로 지우기 전용). CLI가 넘긴다 | E1 · G: 모양이 정해지지 않았다. CLI가 token을 넘기지 않아 `last_error`의 `redactValues`가 아무것도 안 했다 |
 
+| A24 | `createClient`의 `requestTimeoutMs`(기본 60초, 시도마다 `AbortSignal.timeout`, 넘으면 네트워크 오류로 재시도)와 `maxRateWaitMs`(기본 1시간, 넘는 대기는 기다리지 않고 `GhError('rate-limit')`). CLI `brain sync --request-timeout S --max-rate-wait S` | Phase 3 S4(요청 하나 30초, rate limit 대기 60초)와 F8: Phase 1 fetch에는 시간 상한이 없었다 |
+| A25 | 서버 `Date`가 저장된 cursor보다 이르면 sync 실패(cursor는 뒤로 가지 않는다). `--full`도 같다 | Phase 3 §5 "T는 앞으로만 간다" |
+| A26 | `detectSecrets(s)` → 비밀 종류 목록(아무것도 고쳐 쓰지 않음, `mask()`와 같은 규칙) | Phase 2 R16 업로드 전 검사가 어떤 문자열에도 부를 탐지기가 필요했다. `SANITIZE_VERSION`은 규칙이 바뀔 때 손으로 올리는 정수라 같은 글·같은 버전이면 결과가 같다 |
+| A27 | meta `repo` · `worktree` 없이도 모든 읽기 명령이 돈다(테스트로 고정) | Phase 2 mirror는 로컬 경로 meta를 올리지 않는다(R16) |
+
+Phase 2가 Phase 1에 요청한 것 중 이미 맞는 것: T = 첫 응답(`getRepo`)의 `Date`(G가 이미 그렇다), 링크 결과는 노드 키 문자열(D: file → 경로, symbol → `path#Name`, grep → `path:line`; Phase 2 `canonicalResolved`가 정규 키로 바꾼다), vault는 로컬 전용(Phase 2 snapshot이 vault 청크를 거부한다). async store와 `@r<n>`은 Phase 2 레인 C 몫이다.
+
 **계약 요청 중 받지 않은 것(I 판단).**
 
 | 요청 | 판단 |
