@@ -11,10 +11,13 @@ import { ext, plural } from './fmt.mjs';
  *   code: { state: 'fresh'|'stale'|'unknown', commit: string|null, head: string|null, behind: number|null, diverged: boolean, changed: number, files: string[] },
  *   github: { state: 'never'|'ok'|'stale'|'failed'|'interrupted'|'running', asOf: string|null, syncedAt: string|null, fullAt: string|null,
  *             runAt: string|null, pid: number|null, error: string|null },
- *   brain?: { run: number, commit: string|null, publishedAt: string|null, asOf: boolean, latest: number|null }
+ *   brain?: { run: number, commit: string|null, publishedAt: string|null, asOf: boolean, latest: number|null },
+ *   staleness?: import('./pg/contract.mjs').Staleness & { cells: string[] }
  * }} Freshness
  *   brain: server mode only (Phase 2 §6.4): the run the answer read (meta brain_* of a mirror or of a store's view),
  *   asOf: picked by --as-of, latest: the newest run then (ctx.at)
+ *   staleness: server mode, the newest run only (ctx.staleness, Phase 3 §6.5): the four cells of the newest run against
+ *   origin main, and their footer phrases (pg/status.mjs footerCells)
  * @typedef {{ truncated?: boolean, unresolvedLocal?: number, lines?: { from: number, to: number, total: number } } & Partial<import('./read.mjs').ReadFacts>} CoverageFacts
  *   githubPresent (ReadFacts) marks an answer that reads GitHub memory: only then does the sync state count.
  *   lines: the page `source` printed.
@@ -80,6 +83,7 @@ export function freshness(ctx, { now = Date.now(), phase0 } = {}) {
       runAt: s?.run_started_at ?? null, pid: s?.run_pid ?? null, error: ['failed', 'interrupted'].includes(state) ? s?.last_error ?? null : null },
     ...(m.brain_run != null && { brain: { run: Number(m.brain_run), commit: m.brain_run_commit ?? null, publishedAt: m.brain_published_at ?? null,
       asOf: !!ctx.at?.asOf, latest: ctx.at?.latest ?? null } }),
+    ...(ctx.staleness && { staleness: ctx.staleness }),
   };
 }
 
@@ -101,13 +105,14 @@ function codeLine(c) {
   return `${a} · HEAD @${c.head.slice(0, 8)}${rel}${changed}`;
 }
 
-function githubLine(g, now) {
+// server: the data is the team brain's (CI syncs it), so no local `brain sync` hint
+function githubLine(g, now, server = false) {
   const asOf = g.asOf ? `data as of ${at(g.asOf)}` : 'no complete sync yet';
   const full = `full sync ${g.fullAt ? `${age(g.fullAt, now)} ago` : 'never'}`;
   switch (g.state) {
     case 'never': return 'github never synced';
     case 'ok': return `github data as of ${at(g.asOf)} (synced ${age(g.syncedAt ?? g.asOf, now)} ago, ok · ${full})`;
-    case 'stale': return `github data as of ${at(g.asOf)} (${age(g.asOf, now)} old, stale: run brain sync · ${full})`;
+    case 'stale': return `github data as of ${at(g.asOf)} (${age(g.asOf, now)} old, stale${server ? '' : ': run brain sync'} · ${full})`;
     case 'failed': return `last github sync FAILED ${g.runAt ? `${age(g.runAt, now)} ago ` : ''}${g.error ? `(${ext(g.error, 80)}) ` : ''}· ${asOf}`;
     case 'interrupted': return `last github sync interrupted · ${asOf}`;
     default: return `github sync running${g.pid ? ` (pid ${g.pid})` : ''} · ${asOf}`;
@@ -121,21 +126,30 @@ function brainLine(b, now) {
   return `brain data as of ${run} (${b.publishedAt ? b.publishedAt.slice(0, 10) : '?'}, as-of)${b.latest != null ? ` · latest run ${b.latest}` : ''}`;
 }
 
-/** @param {{ coverage: Coverage, freshness: Freshness, now?: number }} a @returns {[string, string]} plain text, no color */
+/**
+ * Server mode, newest run: the run read, the four staleness cells (they hold the GitHub age), then the checkout's HEAD:
+ * `brain data: run 42 @9f3c2e1a (published 3h ago) · 3 commits behind main · github as of 27h ago (stale) · code @9f3c2e1a · HEAD @…`
+ * @param {{ coverage: Coverage, freshness: Freshness, now?: number }} a @returns {[string, string]} plain text, no color
+ */
 export function footer({ coverage: cov, freshness: fr, now = Date.now() }) {
   const c = cov.state + (cov.reasons.length ? ` · ${cov.reasons.join(' · ')}` : '');
-  return [`  coverage: ${c}`, `  freshness: ${fr.brain ? `${brainLine(fr.brain, now)} · ` : ''}${codeLine(fr.code)} · ${githubLine(fr.github, now)}`];
+  const st = fr.brain && fr.staleness;
+  const fresh = st
+    ? [brainLine(fr.brain, now), ...st.cells, ...(st.run != null && st.run !== fr.brain.run ? [`latest run ${st.run}`] : []), codeLine(fr.code)].join(' · ')
+    : `${fr.brain ? `${brainLine(fr.brain, now)} · ` : ''}${codeLine(fr.code)} · ${githubLine(fr.github, now, !!fr.brain)}`;
+  return [`  coverage: ${c}`, `  freshness: ${fresh}`];
 }
 
 /**
  * Refuse to show stored content written before the current sanitizer.
  * code: meta.sanitize_version. github: sync_state.sanitize_version, once the store holds a sync (a cursor) or says
- * which version wrote it.
+ * which version wrote it. A server run (meta brain_run: a mirror or a store's view) is fixed by a new publish, not here.
  * @param {import('./context.mjs').Ctx} ctx @throws {GuardError}
  */
 export function guard(ctx) {
+  const server = ctx.meta.brain_run != null;
   const have = Number(ctx.meta.sanitize_version ?? -1);
-  if (have < SANITIZE_VERSION) throw new GuardError('code', have, SANITIZE_VERSION);
+  if (have < SANITIZE_VERSION) throw new GuardError('code', have, SANITIZE_VERSION, server);
   const s = ctx.sync;
-  if (s && (s.cursor || s.sanitize_version != null) && Number(s.sanitize_version ?? -1) < SANITIZE_VERSION) throw new GuardError('github', s.sanitize_version ?? -1, SANITIZE_VERSION);
+  if (s && (s.cursor || s.sanitize_version != null) && Number(s.sanitize_version ?? -1) < SANITIZE_VERSION) throw new GuardError('github', s.sanitize_version ?? -1, SANITIZE_VERSION, server);
 }

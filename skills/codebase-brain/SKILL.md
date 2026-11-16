@@ -28,6 +28,11 @@ request is a GET under `api.github.com/repos/<owner>/<repo>/`. `--request-timeou
 (default 3600: a longer rate-limit wait fails the run instead of hanging). A failed run never moves the cursor;
 run it again.
 
+Team brain (server mode): with `BRAIN_READER_URL` set (in the environment, or in `.env.local` in this directory),
+`search`, `get` and `source` read the team's server, and the map commands read a local mirror of the same published
+run. CI is the only writer, so `build` and `sync` refuse (`--local` reads a local index instead). `brain status` shows
+the run, its commit and GitHub state, and how stale it is. `--as-of run:N` reads an earlier run.
+
 ## 1. Route by question
 
 | The question | Call | Not this |
@@ -77,6 +82,11 @@ metadata, the thread and how each mention links to code (no bodies), `source` gi
    do not quote it as if it were the value.
 9. **A link is a claim to check.** `get` shows each mention as `linked`, `ambiguous`, `unlinked` or `pending`
    (with the reason). Open the linked code before you cite it, and say when a mention did not link.
+10. **A stale team brain: refresh, then answer.** If the `freshness: brain data:` line of an answer says `behind main`,
+    `differs from main`, `(stale)` or `never synced`, run `brain refresh` before you work from that answer.
+    Exit 75: run `brain refresh --wait` again. Exit 0: run the original command again and use the new answer.
+    Exit 1 or 2: tell the user that the data is stale and why (the line `refresh` printed), then answer.
+    A refresh stops by itself 15 minutes after its first call. `(freshness unknown)` alone is not a reason to refresh.
 
 ## 3. Output
 
@@ -92,6 +102,18 @@ Tables for people; add `--json` for exact lists. Every answer ends with two line
 `complete` is not "fresh": that is the `freshness:` line (`--json`: `freshness`). GitHub data is `stale` when its
 time (the cursor of the last complete sync) is more than 24 h old; a failed or interrupted last sync makes GitHub
 answers `partial`. Say so, or run `brain sync`.
+
+In server mode the line starts with the run the answer read and how stale the team brain is (`--json`:
+`freshness.staleness`), then compares that run with your checkout:
+
+```text
+  freshness: brain data: run 42 @9f3c2e1a (published 3h ago) · 3 commits behind main · github as of 27h ago (stale) · last attempt FAILED 40m ago (sync) · code @9f3c2e1a · HEAD @4d5e6f70 · 3 commits behind
+```
+
+`= main` · `N commits behind main` · `differs from main` compare the newest run with `origin`'s `main`; `github as of
+<age> ago` turns `(stale)` after 24 h (`github never synced`: no GitHub data yet). `refresh running` and `last attempt
+FAILED` describe the publish job. `(freshness unknown)`: `origin` or the server could not be read in time. The
+`code @… · HEAD @…` part is your branch against the run, which no refresh changes. Rule 10 says what to do.
 
 ## 4. Limits (prototype)
 

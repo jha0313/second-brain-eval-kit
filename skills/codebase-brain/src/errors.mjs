@@ -35,12 +35,15 @@ export class NotFoundError extends BrainError {
   constructor(ptr) { super('not-found', `no such item: ${ptr}`); }
 }
 
-// stores written before the current sanitizer: content must not be shown
+// stores written before the current sanitizer: content must not be shown. server: the team brain's run (server mode),
+// which only a new full publish fixes (Phase 2 R15: the bootstrap workflow), never a local build or sync
 export class GuardError extends BrainError {
-  constructor(store, have, need) {
-    super('rebuild-needed', store === 'code'
-      ? `the index was built before secret masking v${need} (has v${have}) — run: brain build <repo>`
-      : `github data was stored before secret masking v${need} (has v${have}) — run: brain sync --full`, { store, have, need });
+  constructor(store, have, need, server = false) {
+    super('rebuild-needed', server
+      ? `the team brain's ${store === 'code' ? 'index' : 'github data'} was published before secret masking v${need} (has v${have}) — ask an admin to run the bootstrap (brain-bootstrap.yml)`
+      : store === 'code'
+        ? `the index was built before secret masking v${need} (has v${have}) — run: brain build <repo>`
+        : `github data was stored before secret masking v${need} (has v${have}) — run: brain sync --full`, { store, have, need, server });
   }
 }
 
