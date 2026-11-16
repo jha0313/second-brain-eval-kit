@@ -413,3 +413,85 @@ test('search payload: a group date that is not ASCII gets the lists, and rank() 
     for (const o of [{}, { kind: ['doc', 'change'] }]) assert.deepEqual(await searchIn(store, q, o), await searchIn(plain, q, o), `${q} ${JSON.stringify(o)}`);
   }
 }));
+
+test('lists: ties come in one order on both stores, by content, not ids (a short Korean term, linked chunks, bm25 / ts_rank)', { skip }, () => withStore(async (store) => {
+  // docs (linked to what docs/credits.md links to) and issues that match 예약, each pair alike but for one ORDER BY term.
+  // zz / aa and issue:300 / issue:200 tie but for their content key, and the one that sorts first is published a run
+  // later, so its local and server ids are both the higher ones; mm and issue:250 match in their titles but are older;
+  // ab and issue:150 are older than both and sort first by content; nd has no date (last: NULLS LAST); ic:12, a comment
+  // on issue:300 (no title: no title match, as on the server), ties with issue:300 and issue:200 on its group's date and
+  // sorts first by ptr. B, 결제 and the two nt chunks tie with aa / zz on everything but the content key: path bytes
+  // (B before aa, 결제 after zz: SQLite BINARY, the server's COLLATE "C"), then a NULL title before a title (SQLite
+  // ascending, the server's NULLS FIRST); each is published so that its ids are in the other order. The 'Tie' docs and
+  // issues have one text, so they also tie exactly in the ranked lists: fts for 'tie' (bm25 / ts_rank) and the 3+
+  // trigram 메모장 (local bm25; the server ranks those by title match and date first). Issues 300 / 200 / 150 also refer
+  // to src/lib/credits.ts (items_links: date, then ptr), docs zz / aa / B name #77 (chunks_keys), PRs 401 / 400 share a
+  // merge sha prefix (items_keys) and so do commits d / c (chunks_keys, by sha); those lists order by content alone
+  const last = Number((await b.query('reader', 'SELECT max(run_id) AS m FROM brain.run')).rows[0].m);
+  const sq = (x) => (x === null ? 'NULL' : `'${x}'`);
+  const doc = (path, date = '2026-10-01', title = 'Tie', body = '예약 메모장', prs = null) => `INSERT INTO chunks (source, path, start_line, end_line, title, body, date, prs)
+    VALUES ('doc', '${path}', 1, 2, ${sq(title)}, '${body}', ${sq(date)}, ${sq(prs)});
+    INSERT INTO links (chunk, node, kind) SELECT (SELECT max(id) FROM chunks WHERE path = '${path}'), node, kind FROM links WHERE chunk = (SELECT id FROM chunks WHERE path = 'docs/credits.md');
+    INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild'); INSERT INTO chunks_tri(chunks_tri) VALUES ('rebuild');`;
+  const issue = (n, id, at = '2099-11-26T00:00:00Z', title = 'Tie') => `INSERT INTO items (id, ptr, kind, number, title, body, url, created_at, updated_at)
+    VALUES (${id}, 'issue:${n}', 'issue', ${n}, '${title}', '예약 메모장', 'https://github.com/o/r/issues/${n}', '${at}', '${at}');
+    INSERT INTO items_fts(rowid, title, body) VALUES (${id}, '${title}', '예약 메모장'); INSERT INTO items_tri(rowid, title, body) VALUES (${id}, '${title}', '예약 메모장');`;
+  // issue n refers to src/lib/credits.ts, resolved in that build; relink keeps the refs before it current
+  const ref = (n, build) => `INSERT INTO refs (ptr, kind, target, origin, status, resolved, resolved_build)
+    VALUES ('issue:${n}', 'file', 'src/lib/credits.ts', 'text', 'linked', '["src/lib/credits.ts"]', '${build}');`;
+  const pr = (n, id, sha) => `INSERT INTO items (id, ptr, kind, number, title, body, url, state, merge_sha, created_at, updated_at, merged_at)
+    VALUES (${id}, 'pr:${n}', 'pr', ${n}, 'Keys', 'merged', 'https://github.com/o/r/pull/${n}', 'merged', '${sha}', '2099-11-26T00:00:00Z', '2099-11-26T00:00:00Z', '2099-11-26T00:00:00Z');
+    INSERT INTO items_fts(rowid, title, body) VALUES (${id}, 'Keys', 'merged'); INSERT INTO items_tri(rowid, title, body) VALUES (${id}, 'Keys', 'merged');`;
+  const commit = (sha) => `INSERT INTO chunks (source, title, body, sha, date) VALUES ('commit', 'Keys', 'keys', '${sha}', '2026-10-01');
+    INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild'); INSERT INTO chunks_tri(chunks_tri) VALUES ('rebuild');`;
+  const b0 = new DatabaseSync(prev.codeDb, { readOnly: true }), build0 = JSON.parse(b0.prepare("SELECT value FROM meta WHERE key = 'build_id'").get().value);
+  b0.close();
+  const MS = 'abcdef1';
+  await publish({ n: last + 1, base: last, at: '2099-11-26T00:00:00.000Z', code: `${doc('docs/결제-tie.md')} ${doc('docs/zz-tie.md', '2026-10-01', 'Tie', '예약 메모장', '#77')} ${doc('docs/nd-tie.md', null)} ${commit(`${MS}${'d'.repeat(33)}`)} ${meta('golden08', SHA(5))}`,
+    gh: `${relink(build0, 'golden08')} ${issue(300, 300)} ${ref(300, 'golden08')} ${pr(401, 305, `${MS}${'b'.repeat(33)}`)}` });
+  const comment = `INSERT INTO items (id, ptr, kind, parent_number, body, url, created_at, updated_at) VALUES (302, 'ic:12', 'issue_comment', 300, '예약 확인',
+    'https://github.com/o/r/issues/300#issuecomment-12', '2099-11-27T00:00:00Z', '2099-11-27T00:00:00Z');
+    INSERT INTO items_fts(rowid, title, body) VALUES (302, NULL, '예약 확인'); INSERT INTO items_tri(rowid, title, body) VALUES (302, NULL, '예약 확인');`;
+  await publish({ n: last + 2, base: last + 1, at: '2099-11-27T00:00:00.000Z',
+    code: `${doc('docs/aa-tie.md', '2026-10-01', 'Tie', '예약 메모장', '#77')} ${doc('docs/mm-tie.md', '2026-09-01', '예약 안내', 'memo')} ${doc('docs/ab-tie.md', '2026-09-01')}
+      ${doc('docs/B-tie.md', '2026-10-01', 'Tie', '예약 메모장', '#77')} ${doc('docs/nt-tie.md')} ${doc('docs/nt-tie.md', '2026-10-01', null)} ${commit(`${MS}${'c'.repeat(33)}`)} ${meta('golden09', SHA(6))}`,
+    gh: `${relink('golden08', 'golden09')} ${issue(200, 301)} ${ref(200, 'golden09')} ${comment} ${issue(250, 303, '2099-11-20T00:00:00Z', '예약 질문')}
+      ${issue(150, 304, '2099-11-20T00:00:00Z')} ${ref(150, 'golden09')} ${pr(400, 306, `${MS}${'a'.repeat(33)}`)}` });
+  // each list row by content: a chunk as source:path:lines (a commit: its sha; no title: marked), an item as its ptr
+  const name = (c) => (c.source === 'commit' ? `commit:${c.sha}` : `${c.source}:${c.path}:${c.start_line}-${c.end_line}${c.title === null ? ' (no title)' : ''}`);
+  const d = (s) => `doc:docs/${s}-tie.md:1-2`, nt0 = `${d('nt')} (no title)`;
+  const db = new DatabaseSync(prev.codeDb, { readOnly: true }), gdb = new DatabaseSync(prev.ghDb, { readOnly: true });
+  const ctx = openContext({ codeDbPath: prev.codeDb });
+  try {
+    const local = (k) => (k[0] === 'c' ? name(db.prepare('SELECT * FROM chunks WHERE id = ?').get(Number(k.slice(1)))) : gdb.prepare('SELECT ptr FROM items WHERE id = ?').get(Number(k.slice(1))).ptr);
+    const listsOf = async (s, q, names, nameOf) => (await s.candidates(q)).lists.filter((l) => names.includes(l.name)).map((l) => [l.name, l.rows.map((r) => nameOf(r.key))]);
+    for (const [q, names] of [['예약', ['items_tri', 'chunks_tri']], ['src/lib/credits.ts', ['items_links', 'chunks_links']], ['#77', ['chunks_keys']], [MS, ['items_keys', 'chunks_keys']]]) {
+      const keys = (await store.candidates(q)).lists.flatMap((l) => l.rows.map((r) => r.key));
+      const byKey = new Map((await store.rows(keys)).rows.map((r) => [r.key, r.origin === 'github' ? r.ptr : name(r)]));
+      const server = await listsOf(store, q, names, (k) => byKey.get(k)), mine = await listsOf(sqliteStore(ctx), q, names, local);
+      assert.deepEqual(server, mine, q);
+      assert.deepEqual(server.map(([n]) => n), names, q);
+      // the planted rows, in the order each list must hold them (chunks_links has no title term)
+      const WANT = { items_tri: ['issue:250', 'ic:12', 'issue:200', 'issue:300', 'issue:150'],
+        chunks_tri: [d('mm'), d('B'), d('aa'), nt0, d('nt'), d('zz'), d('결제'), d('ab'), d('nd')],
+        chunks_links: [d('B'), d('aa'), nt0, d('nt'), d('zz'), d('결제'), d('ab'), d('mm'), d('nd')], items_links: ['issue:200', 'issue:300', 'issue:150'],
+        chunks_keys: q === MS ? [`commit:${MS}${'c'.repeat(33)}`, `commit:${MS}${'d'.repeat(33)}`] : [d('B'), d('aa'), d('zz')], items_keys: ['pr:400', 'pr:401'] };
+      for (const [n, rows] of server) assert.deepEqual(rows.filter((x) => WANT[n].includes(x)), WANT[n], `${q} ${n}: ${rows.join(' ')}`);
+    }
+    // exact ties in the ranked lists, each store against its own order (the lists differ elsewhere: ts_rank, (c)). nt0 has
+    // no title: no 'tie' match, and locally the shortest 메모장 row (the highest bm25)
+    const RANKED = [['tie', ['items_fts', 'chunks_fts'], { items_fts: ['issue:150', 'issue:200', 'issue:300'],
+      chunks_fts: [d('B'), d('aa'), d('ab'), d('nd'), d('nt'), d('zz'), d('결제')] }, null],
+    ['메모장', ['items_tri', 'chunks_tri'], { items_tri: ['issue:150', 'issue:200', 'issue:300', 'issue:250'],
+      chunks_tri: [nt0, d('B'), d('aa'), d('ab'), d('nd'), d('nt'), d('zz'), d('결제')] },
+    { items_tri: ['issue:200', 'issue:300', 'issue:150', 'issue:250'], chunks_tri: [d('B'), d('aa'), nt0, d('nt'), d('zz'), d('결제'), d('ab'), d('nd')] }]];
+    for (const [q, names, mineWant, serverWant] of RANKED) {
+      const keys = (await store.candidates(q)).lists.flatMap((l) => l.rows.map((r) => r.key));
+      const byKey = new Map((await store.rows(keys)).rows.map((r) => [r.key, r.origin === 'github' ? r.ptr : name(r)]));
+      for (const [lists, want, who] of [[await listsOf(store, q, names, (k) => byKey.get(k)), serverWant ?? mineWant, 'server'], [await listsOf(sqliteStore(ctx), q, names, local), mineWant, 'local']]) {
+        assert.deepEqual(lists.map(([n]) => n), names, `${q} ${who}`);
+        for (const [n, rows] of lists) assert.deepEqual(rows.filter((x) => want[n].includes(x)), want[n], `${q} ${who} ${n}: ${rows.join(' ')}`);
+      }
+    }
+  } finally { ctx.close(); db.close(); gdb.close(); }
+}));

@@ -49,6 +49,9 @@ function pathRefs(gh, p, build) {
 // a review / comment matches as itself but ranks as its parent PR or issue (r); ptr is unique, so this join is indexed
 const ROW = `JOIN items r ON r.ptr IN (i.ptr, 'pr:' || i.parent_number, 'issue:' || i.parent_number) AND r.kind IN ('pr', 'issue')`;
 const ROW_DATE = 'coalesce(r.merged_at, r.closed_at, r.updated_at, r.created_at)';
+// a chunk by content (why.mjs, the map tie-break): the last ORDER BY terms of a list, so ties do not follow ids, which a
+// local build and the server assign apart
+const CHUNK_ORDER = 'c.source, c.path, c.sha, c.start_line, c.end_line, c.title';
 
 function itemLists(gh, t, f, build, add, seeds = []) {
   const w = [`i.kind IN (${marks(f.ghKinds)})`], p = [...f.ghKinds];
@@ -63,23 +66,24 @@ function itemLists(gh, t, f, build, add, seeds = []) {
     w.push(`(i.ptr IN (SELECT value FROM json_each(?)) OR r.ptr IN (SELECT value FROM json_each(?)) OR ${UNDER('i.path')})`);
     p.push(json, json, ...underArgs(f.path));
   }
-  const run = (name, from, match, args, order = '') => add(name, gh.prepare(
+  const run = (name, from, match, args, order = '', orderArgs = []) => add(name, gh.prepare(
     `SELECT 'g' || i.id AS key, 'g' || r.id AS grp, ${ROW_DATE} AS d, i.ptr AS ptr, i.flags AS flags FROM ${from} ${ROW}
-     WHERE ${match} AND ${w.join(' AND ')} ${order} LIMIT ${CAP + 1}`).all(...args, ...p));
-  if (t.ascii.length) run('items_fts', 'items_fts JOIN items i ON i.id = items_fts.rowid', 'items_fts MATCH ?', [t.ascii.map(quote).join(' OR ')], 'ORDER BY bm25(items_fts, 3.0, 1.0)');
+     WHERE ${match} AND ${w.join(' AND ')} ${order} LIMIT ${CAP + 1}`).all(...args, ...p, ...orderArgs));
+  if (t.ascii.length) run('items_fts', 'items_fts JOIN items i ON i.id = items_fts.rowid', 'items_fts MATCH ?', [t.ascii.map(quote).join(' OR ')], 'ORDER BY bm25(items_fts, 3.0, 1.0), i.ptr');
   for (const s of t.tri) {
-    if ([...s].length >= 3) run('items_tri', 'items_tri JOIN items i ON i.id = items_tri.rowid', 'items_tri MATCH ?', [quote(s)], 'ORDER BY bm25(items_tri, 3.0, 1.0)');
-    else run('items_tri', 'items i', '(i.title LIKE ? OR i.body LIKE ?)', [`%${s}%`, `%${s}%`]);
+    if ([...s].length >= 3) run('items_tri', 'items_tri JOIN items i ON i.id = items_tri.rowid', 'items_tri MATCH ?', [quote(s)], 'ORDER BY bm25(items_tri, 3.0, 1.0), i.ptr');
+    // a term under 3 characters has no trigram: as the server orders it, title match, then date, then ptr
+    else run('items_tri', 'items i', '(i.title LIKE ? OR i.body LIKE ?)', [`%${s}%`, `%${s}%`], `ORDER BY coalesce(i.title LIKE ?, 0) DESC, ${ROW_DATE} DESC, i.ptr`, [`%${s}%`]);
   }
   const nums = t.prs.flatMap((n) => [`pr:${n.slice(1)}`, `issue:${n.slice(1)}`]);
-  if (nums.length) run('items_keys', 'items i', `i.ptr IN (${marks(nums)})`, nums);
-  for (const sha of t.shas) run('items_keys', 'items i', 'i.merge_sha LIKE ?', [`${sha}%`]);
+  if (nums.length) run('items_keys', 'items i', `i.ptr IN (${marks(nums)})`, nums, 'ORDER BY i.ptr');
+  for (const sha of t.shas) run('items_keys', 'items i', 'i.merge_sha LIKE ?', [`${sha}%`], 'ORDER BY i.ptr');
   if (seeds.length) {   // refs resolved in this build to a seed: a symbol key, a file path, or path:line inside a seed file
     const keys = seeds.map((n) => n.key), files = seeds.filter((n) => n.kind === 'file').map((n) => n.key);
     const ptrs = gh.prepare(`SELECT DISTINCT r.ptr FROM refs r, json_each(CASE WHEN json_valid(r.resolved) THEN r.resolved ELSE '[]' END) j
       WHERE r.resolved_build = ? AND r.status IN ('linked', 'ambiguous') AND (j.value IN (${marks(keys)})
       ${files.length ? `OR substr(j.value, 1, instr(j.value || ':', ':') - 1) IN (${marks(files)})` : ''})`).all(build, ...keys, ...files).map((x) => x.ptr);
-    if (ptrs.length) run('items_links', 'items i', 'i.ptr IN (SELECT value FROM json_each(?))', [JSON.stringify(ptrs)], `ORDER BY ${ROW_DATE} DESC, i.id`);
+    if (ptrs.length) run('items_links', 'items i', 'i.ptr IN (SELECT value FROM json_each(?))', [JSON.stringify(ptrs)], `ORDER BY ${ROW_DATE} DESC, i.ptr`);
   }
   return pending;
 }
@@ -91,17 +95,17 @@ function chunkLists(code, t, f, add, seeds = []) {
     w.push(`(${UNDER('c.path')} OR EXISTS (SELECT 1 FROM links l JOIN nodes n ON n.id = l.node WHERE l.chunk = c.id AND ${UNDER('n.path')}))`);
     p.push(...underArgs(f.path), ...underArgs(f.path));
   }
-  const run = (name, from, match, args, order = '') => add(name, code.prepare(
+  const run = (name, from, match, args, order = '', orderArgs = []) => add(name, code.prepare(
     `SELECT 'c' || c.id AS key, 'c' || c.id AS grp, c.date AS d FROM ${from} WHERE ${match} AND ${w.join(' AND ')} ${order} LIMIT ${CAP + 1}`)
-    .all(...args, ...p));
-  if (t.ascii.length) run('chunks_fts', 'chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid', 'chunks_fts MATCH ?', [t.ascii.map(quote).join(' OR ')], 'ORDER BY bm25(chunks_fts, 3.0, 1.0)');
+    .all(...args, ...p, ...orderArgs));
+  if (t.ascii.length) run('chunks_fts', 'chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid', 'chunks_fts MATCH ?', [t.ascii.map(quote).join(' OR ')], `ORDER BY bm25(chunks_fts, 3.0, 1.0), ${CHUNK_ORDER}`);
   for (const s of t.tri) {
-    if ([...s].length >= 3) run('chunks_tri', 'chunks_tri JOIN chunks c ON c.id = chunks_tri.rowid', 'chunks_tri MATCH ?', [quote(s)], 'ORDER BY bm25(chunks_tri, 3.0, 1.0)');
-    else run('chunks_tri', 'chunks c', '(c.title LIKE ? OR c.body LIKE ?)', [`%${s}%`, `%${s}%`]);
+    if ([...s].length >= 3) run('chunks_tri', 'chunks_tri JOIN chunks c ON c.id = chunks_tri.rowid', 'chunks_tri MATCH ?', [quote(s)], `ORDER BY bm25(chunks_tri, 3.0, 1.0), ${CHUNK_ORDER}`);
+    else run('chunks_tri', 'chunks c', '(c.title LIKE ? OR c.body LIKE ?)', [`%${s}%`, `%${s}%`], `ORDER BY coalesce(c.title LIKE ?, 0) DESC, c.date DESC, ${CHUNK_ORDER}`, [`%${s}%`]);
   }
-  for (const n of t.prs) run('chunks_keys', 'chunks c', `(' ' || c.prs || ' ') LIKE ?`, [`% ${n} %`]);
-  for (const sha of t.shas) run('chunks_keys', 'chunks c', 'c.sha LIKE ?', [`${sha}%`]);
-  if (seeds.length) run('chunks_links', 'chunks c', `c.id IN (SELECT chunk FROM links WHERE node IN (${marks(seeds)}))`, seeds.map((n) => n.id), 'ORDER BY c.date DESC, c.id');
+  for (const n of t.prs) run('chunks_keys', 'chunks c', `(' ' || c.prs || ' ') LIKE ?`, [`% ${n} %`], `ORDER BY ${CHUNK_ORDER}`);
+  for (const sha of t.shas) run('chunks_keys', 'chunks c', 'c.sha LIKE ?', [`${sha}%`], `ORDER BY ${CHUNK_ORDER}`);
+  if (seeds.length) run('chunks_links', 'chunks c', `c.id IN (SELECT chunk FROM links WHERE node IN (${marks(seeds)}))`, seeds.map((n) => n.id), `ORDER BY c.date DESC, ${CHUNK_ORDER}`);
 }
 
 // name -> code link signal (design §6.7, as in why): identifiers and paths in the query that name code nodes (one node,

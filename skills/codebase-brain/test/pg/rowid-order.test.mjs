@@ -8,6 +8,9 @@ import { copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parity, runQuery } from './parity.mjs';
 import { fixtureRepo } from '../phase1/helpers.mjs';
+import { openContext } from '../../src/context.mjs';
+import { core } from '../../src/store/sqlite.mjs';
+import { search } from '../../src/read.mjs';
 
 delete process.env.BRAIN_READER_URL;                                     // the fixture build runs in local mode
 
@@ -81,4 +84,34 @@ test('a copy of the fixture with every id reversed answers every query as the or
   assert.deepEqual((await json(queries[15])).sites.map((s) => s.kind), ['imports'], 'refs a.ts --limit 1: imports before reexports');
   assert.equal((await json(queries[18])).files.length, 2, 'deps of root.ts: both look-alike files');
   assert.deepEqual((await json(queries[19])).files.map((f) => f.path), ['src/tie/ab.ts', `src/tie/a${SHY}b.ts`], 'deps of the directory: in the order of its files');
+});
+
+// search lists (sqlite.mjs): three docs that link to src/lib/credits.ts and match 예약 (the fixture's docs have no date).
+// tie-a and tie-b match outside their titles: they tie in the 예약 list (title match, date) and in the linked chunks
+// (date), and the content key orders them; tie-z matches in its title, so it comes first in the 예약 list and last in
+// the linked chunks. tie-a and tie-z have the same bm25 in chunks_fts for src/lib/credits.ts (an exact tie: the fixture
+// is small, so every idf is the 1e-6 floor), and the content key orders them there too
+const KO = { 'docs/tie-b.md': '# 메모\n\n예약 순서는 src/lib/credits.ts 에 있다.\n', 'docs/tie-a.md': '# 메모\n\n예약은 실행 전에 한다: src/lib/credits.ts 참고, 그 뒤에 정산.\n',
+  'docs/tie-z.md': '# 예약 안내\n\n실행하기 전에 src/lib/credits.ts 의 reserve 를 부른다.\n' };
+
+test('search: a copy with every id reversed gives the same lists and results (a short Korean term, a name\'s linked chunks)', () => {
+  const { repo, codeDb } = fixtureRepo({ extraFiles: KO });
+  const b = join(repo, '..', `${repo.split('/').pop()}-reversed.db`);
+  copyFileSync(codeDb, b);
+  reverseIds(b).close();
+  const ca = openContext({ codeDbPath: codeDb }), cb = openContext({ codeDbPath: b });
+  try {
+    const paths = (ctx, name, q) => {
+      const l = core.candidates(ctx, q, {}).lists.find((x) => x.name === name);
+      return l.rows.map((r) => ctx.code.prepare('SELECT path FROM chunks WHERE id = ?').get(Number(r.key.slice(1))).path);
+    };
+    const TIE = ['docs/tie-a.md', 'docs/tie-b.md', 'docs/tie-z.md'];
+    for (const [name, q, want] of [['chunks_tri', '예약', ['docs/tie-z.md', 'docs/tie-a.md', 'docs/tie-b.md']], ['chunks_links', 'src/lib/credits.ts', TIE],
+      ['chunks_fts', 'src/lib/credits.ts', ['docs/tie-b.md', 'docs/tie-a.md', 'docs/tie-z.md']]]) {
+      const x = paths(ca, name, q);
+      assert.deepEqual(x.filter((p) => TIE.includes(p)), want, `${name}: ${x.join(' ')}`);
+      assert.deepEqual(paths(cb, name, q), x, name);
+    }
+    for (const q of ['예약', 'src/lib/credits.ts', '예약 순서', 'credits.ts']) assert.deepEqual(search(cb, q, { limit: 50 }), search(ca, q, { limit: 50 }), q);
+  } finally { ca.close(); cb.close(); }
 });
