@@ -73,7 +73,8 @@ export async function staleness({ reader, repoDir, actions = null, now = Date.no
 /**
  * The footer line (§6.5), e.g.
  * `brain data: run 42 @9f3c2e1a · 3 commits behind main · github as of 27h ago (stale) · last attempt FAILED 40m ago (sync)`.
- * `(freshness unknown)` appears once when code or memory is unknown.
+ * `(freshness unknown)` appears once when code or memory is unknown, or when an Actions client was given and the Actions
+ * API could not be read (activity and last are then the DB's view only, P13).
  * @param {import('./contract.mjs').Staleness} s @returns {string}
  */
 export function footerLine(s) {
@@ -89,6 +90,8 @@ export function footerLine(s) {
   add(typeof a === 'function' ? a(s.activity.stage ?? null) : a);
   const l = s.last && P.last[s.last.state];
   if (l) add(l(ageText(s.last.agoMs ?? 0), s.last.stage ?? null));
+  const gh = s.detail?.actions;
+  if (gh && !gh.ok && !['no-token', 'no-binding'].includes(gh.error)) add(FRESHNESS_UNKNOWN);
   return [head, ...parts].join(' · ');
 }
 
@@ -179,11 +182,13 @@ async function codeCell(db, head, repoDir, left, env) {
   if (!db.ok || !head.ok) return { state: 'unknown', runCommit, mainHead };
   if (!runCommit) return { state: 'differs', runCommit, mainHead };
   if (runCommit === mainHead) return { state: 'same', behind: 0, runCommit, mainHead };
-  // ancestry and N only from local objects (no fetch): exit 0 ancestor, 1 not, 128 missing object
+  // ancestry and N only from local objects: exit 0 ancestor, 1 not, 128 missing object. GIT_NO_LAZY_FETCH: a partial
+  // clone must not fetch the missing objects from its promisor remote (git 2.44+)
   const t = () => Math.min(left(), GIT_MAX_MS);
-  const anc = await runGit(['merge-base', '--is-ancestor', runCommit, mainHead], { cwd: repoDir, timeoutMs: t(), env });
+  const local = { ...env, GIT_NO_LAZY_FETCH: '1' };
+  const anc = await runGit(['merge-base', '--is-ancestor', runCommit, mainHead], { cwd: repoDir, timeoutMs: t(), env: local });
   if (anc.code === 0) {
-    const n = await runGit(['rev-list', '--count', `${runCommit}..${mainHead}`], { cwd: repoDir, timeoutMs: t(), env });
+    const n = await runGit(['rev-list', '--count', `${runCommit}..${mainHead}`], { cwd: repoDir, timeoutMs: t(), env: local });
     const behind = n.code === 0 ? Number(n.stdout.trim()) : NaN;
     if (Number.isInteger(behind) && behind > 0) return { state: 'behind', behind, runCommit, mainHead };
   }
@@ -231,9 +236,11 @@ function mergeExecutions(db, gh) {
     if (db.attempts.some((a) => a.ghaRunId === r.id && a.ghaAttempt === r.runAttempt)) continue;
     const st = actionsState(r, r.runAttempt);
     if (st === 'completed_success' || st === 'unknown') continue;
-    if (st === 'cancelled' && gh.runs.some((x) => Date.parse(x.createdAt) > Date.parse(r.createdAt))) continue;
     const startedMs = Date.parse(r.runStartedAt ?? r.createdAt);
     if (Number.isNaN(startedMs)) continue;
+    // replaced while pending: another run was created after this attempt was queued (a re-run is queued at its
+    // run_started_at, not at the run's old created_at)
+    if (st === 'cancelled' && gh.runs.some((x) => x.id !== r.id && Date.parse(x.createdAt) > startedMs)) continue;
     out.push({ ghaRunId: r.id, ghaAttempt: r.runAttempt, shown: attemptDisplay({ db: null, actions: st }), stage: null, sourceSha: null, startedMs });
   }
   return out.sort((x, y) => y.startedMs - x.startedMs || y.ghaRunId - x.ghaRunId);

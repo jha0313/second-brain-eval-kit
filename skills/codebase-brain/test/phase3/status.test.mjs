@@ -4,6 +4,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
@@ -78,6 +79,17 @@ describe('P3 cells from real inputs', () => {
     const s = await look(x);
     assert.equal(s.code.state, 'differs');
     assert.ok(footerLine(s).includes('differs from main'));
+  });
+  test('differs in a partial clone: missing commits are not fetched from the promisor remote (local objects only)', async () => {
+    const x = setup();
+    execFileSync('git', ['-C', x.repos.origin, 'config', 'uploadpack.allowFilter', 'true']);
+    const partial = join(x.repos.root, 'partial');
+    execFileSync('git', ['clone', '-q', '--filter=blob:none', `file://${x.repos.origin}`, partial], { stdio: 'ignore' });
+    const head = x.repos.push(2);
+    const s = await staleness({ reader: x.reader, repoDir: partial, actions: null });
+    assert.equal(s.code.state, 'differs');
+    const has = spawnSync('git', ['-C', partial, 'cat-file', '-e', `${head}^{commit}`], { env: { ...process.env, GIT_NO_LAZY_FETCH: '1' } });
+    assert.notEqual(has.status, 0, 'the new main commit was not fetched');
   });
   test('differs: run commit is not an ancestor of main (force-push shape)', async () => {
     const repos = gitRepos();
@@ -198,9 +210,17 @@ describe('P4 failure display and last', () => {
     s = await look(x);
     assert.deepEqual([s.activity.state, s.last.state], ['idle', 'abandoned']);
   });
+  test('a cancelled re-run of an old run is not hidden by runs created before the re-run started', async () => {
+    const x = setup();
+    x.world.addActionsRun({ phase: 'completed', conclusion: 'success', createdMs: Date.now() - 2 * H });   // newer than run r below
+    x.world.addActionsRun({ conclusion: 'cancelled', runAttempt: 2, createdMs: Date.now() - 3 * H, startedMs: Date.now() - 5 * M });
+    const s = await look(x, { actions: worldActions(x.world) });
+    assert.equal(s.last.state, 'failed before start');
+  });
   test('a pending run cancelled by a newer dispatch is not a failure (P8 shape)', async () => {
     const x = setup();
-    x.world.addActionsRun({ conclusion: 'cancelled', createdMs: Date.now() - 2 * M });
+    // a pending run never started: run_started_at = created_at
+    x.world.addActionsRun({ conclusion: 'cancelled', createdMs: Date.now() - 2 * M, startedMs: Date.now() - 2 * M });
     x.world.addActionsRun({ phase: 'queued', startAt: Infinity, createdMs: Date.now() - M });
     const s = await look(x, { actions: worldActions(x.world) });
     assert.equal(s.last?.state ?? null, 'ok');
@@ -220,13 +240,16 @@ describe('P4 failure display and last', () => {
 });
 
 describe('P13 / P14', () => {
-  test('P13: Actions API down -> code and memory still from git and the DB; ls-remote down too -> (freshness unknown)', async () => {
+  test('P13: Actions API down -> code and memory still from git and the DB, footer says (freshness unknown)', async () => {
     const x = setup({ tAgoMs: 27 * H });
     const s = await look(x, { actions: worldActions(x.world, { fail: 'network' }) });
     assert.deepEqual([s.code.state, s.memory.state, s.detail.actions.ok, s.detail.actions.error], ['same', 'old', false, 'network']);
+    assert.ok(footerLine(s).endsWith(`github as of 27h ago (stale) · ${FRESHNESS_UNKNOWN}`), footerLine(s));
     x.repos.setOrigin(join(x.repos.root, 'missing.git'));
     const s2 = await look(x, { actions: worldActions(x.world, { fail: 'network' }) });
-    assert.ok(footerLine(s2).includes(FRESHNESS_UNKNOWN));
+    assert.equal(footerLine(s2).split(FRESHNESS_UNKNOWN).length - 1, 1, footerLine(s2));
+    // no token is not "GitHub down": the footer stays as the DB and git say
+    assert.ok(!footerLine(await look(x)).includes('github as of 27h ago (stale) · ('));
   });
   test('P14: laptop clock +2h changes nothing (server clocks only)', async () => {
     const x = setup({ tAgoMs: 23 * H + 30 * M });
@@ -266,7 +289,7 @@ describe('F8 bounds: git and the DB', () => {
     const t0 = Date.now();
     const s = await staleness({ reader: x.reader, repoDir: x.repos.clone, actions: null, deadline: Date.now() + 800 });
     assert.ok(Date.now() - t0 < 1500);
-    assert.deepEqual([s.memory.state, s.detail.db.error, x.reader.destroyed, x.reader.ended], ['unknown', 'timeout', 1, 1]);
+    assert.deepEqual([s.memory.state, s.detail.db.error, x.reader.order], ['unknown', 'timeout', ['destroy', 'end']]);
   });
 });
 
@@ -274,7 +297,7 @@ describe('F8 bounds: git and the DB', () => {
 const READER_URL = process.env.BRAIN_P3_READER_URL;
 describe('Neon: STATUS_SQL under brain_reader', { skip: READER_URL ? false : 'set BRAIN_P3_READER_URL (a throwaway branch with 001/002 + golden seed)' }, () => {
   test('golden seed -> run 1, T, binding, the ok attempt; memory age from DB now()', async () => {
-    const client = new pg.Client({ connectionString: READER_URL, connectionTimeoutMillis: 15_000 });
+    const client = new pg.Client({ connectionString: READER_URL, connectionTimeoutMillis: 15_000, query_timeout: 20_000 });
     await client.connect();
     try {
       const who = await client.query("SELECT current_user AS u, has_table_privilege(current_user, 'brain.run', 'INSERT') AS w");

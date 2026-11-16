@@ -2,6 +2,7 @@
 // Actions client, and a GitHub stub HTTP server with faults (drop the reply, hang, 401/403/404/422/500, down).
 // No network beyond 127.0.0.1. Fake tokens are built by concatenation.
 import http from 'node:http';
+import net from 'node:net';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, chmodSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -134,7 +135,8 @@ export function createWorld({ clock, repos, dbSkewMs = 0, ghSkewMs = 0, queueMs 
     if (r.plan === 'fail-before-start') return complete(r, 'failure', t);
     const source = repos.head();
     const l = latest(), lt = latestT();
-    if (r.runAttempt === 1 && l && l.commit === source && lt && Date.parse(lt) >= r.createdMs + ghSkewMs) {
+    // A5 with GitHub's second-resolution times on both sides (Date header, created_at)
+    if (r.runAttempt === 1 && l && l.commit === source && lt && Date.parse(lt) >= Date.parse(iso(r.createdMs + ghSkewMs))) {
       w.db.attempts.push({ attemptId: w.nextAttempt++, ghaRunId: r.id, ghaAttempt: r.runAttempt, sourceSha: source, status: 'skipped', stage: null, startedMs: t + dbSkewMs });
       w.skips += 1;
       return complete(r, 'success', t);
@@ -212,9 +214,9 @@ export function createWorld({ clock, repos, dbSkewMs = 0, ghSkewMs = 0, queueMs 
  */
 export function stubReader(world, { mode = 'ok' } = {}) {
   const reader = {
-    mode, sql: [], destroyed: 0, ended: 0,
-    connection: { stream: { destroy: () => { reader.destroyed += 1; } } },
-    end: async () => { reader.ended += 1; },
+    mode, sql: [], destroyed: 0, ended: 0, order: [],
+    connection: { stream: { destroy: () => { reader.destroyed += 1; reader.order.push('destroy'); } } },
+    end: async () => { reader.ended += 1; reader.order.push('end'); },
     async query(sql, params = []) {
       reader.sql.push(sql);
       if (!/^\s*(SELECT|WITH)\b/i.test(sql) || /\b(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP|GRANT|COPY|LOCK)\b/i.test(sql)) {
@@ -250,7 +252,8 @@ export function worldActions(world, { fail = null } = {}) {
  *   'drop-before' destroy the socket and do nothing
  *   'hang'        never reply
  *   401 | 403 | 404 | 422 | 500
- * log: { method, path, auth: 'dispatch-token' | 'other' | 'none', body } per request (no header values kept).
+ * log: { method, path, auth: 'dispatch-token' | 'other-token' | 'unknown' | 'none', body } per request (no header values
+ * kept). beforeDispatch: called before a dispatch is applied (another dispatcher racing us).
  */
 export async function githubStub(world, { token = FAKE_TOKEN } = {}) {
   const stub = { faults: {}, log: [], hung: [] };
@@ -259,7 +262,8 @@ export async function githubStub(world, { token = FAKE_TOKEN } = {}) {
     req.on('data', (c) => { body += c; });
     req.on('end', () => {
       const url = new URL(req.url, 'http://x');
-      const auth = req.headers.authorization === `Bearer ${token}` ? 'dispatch-token' : req.headers.authorization ? 'other' : 'none';
+      const h = req.headers.authorization;
+      const auth = h === `Bearer ${token}` ? 'dispatch-token' : h === `Bearer ${OTHER_TOKEN}` ? 'other-token' : h ? 'unknown' : 'none';
       stub.log.push({ method: req.method, path: url.pathname, query: url.search, auth, body: body || null });
       const route = routeOf(req.method, url.pathname);
       const fault = stub.faults[route] ?? stub.faults['*'];
@@ -273,6 +277,7 @@ export async function githubStub(world, { token = FAKE_TOKEN } = {}) {
       let out;
       if (req.method === 'POST' && url.pathname === `${wf}/dispatches`) {
         if (body !== JSON.stringify({ ref: 'main', return_run_details: true })) { send(422, { message: 'bad body' }); return; }
+        stub.beforeDispatch?.();
         const id = world.dispatch();
         out = [200, { workflow_run_id: id, run_url: `http://x/runs/${id}`, html_url: `http://x/run/${id}` }];
       } else if (req.method === 'GET' && url.pathname === `${wf}/runs`) {
@@ -310,3 +315,29 @@ export function fakeClock(start = Date.parse('2026-11-16T09:00:00Z')) {
 }
 
 export const tempDir = (p = 'brain-p3-') => { const d = mkdtempSync(join(tmpdir(), p)); mkdirSync(d, { recursive: true }); return d; };
+
+/**
+ * A Postgres server that answers the startup (AuthenticationOk, ReadyForQuery) and then never replies again: a stalled
+ * connection for a real pg.Client, offline. sockets: the server-side sockets, to check they get closed.
+ */
+export async function stallingPgServer() {
+  const sockets = new Set();
+  const server = net.createServer((sock) => {
+    sockets.add(sock);
+    sock.on('close', () => sockets.delete(sock));
+    sock.on('error', () => {});
+    let started = false;
+    sock.on('data', () => {
+      if (started) return;   // swallow every query
+      started = true;
+      const auth = Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0]);   // 'R' AuthenticationOk
+      const ready = Buffer.from([0x5a, 0, 0, 0, 5, 0x49]);        // 'Z' ReadyForQuery idle
+      sock.write(Buffer.concat([auth, ready]));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return {
+    url: `postgres://stall:x@127.0.0.1:${server.address().port}/none`, port: server.address().port, sockets,
+    close: () => new Promise((r) => { for (const s of sockets) s.destroy(); server.close(r); }),
+  };
+}
