@@ -55,10 +55,18 @@ export const plural = (n, word) => `${n.toLocaleString('en-US')} ${word}${n === 
 
 // ---------- Phase 1: external strings (design §6.5 L4) ----------
 // safe: one line, control / bidi / zero-width characters gone (normalize), newlines folded to spaces.
-export const safe = (s) => normalize(String(s ?? '')).replace(/\n/g, ' ');
+// The output boundary strips them again itself, whatever normalize() does: ANSI sequences, C0 (but tab) and C1
+// controls, bidi and zero-width characters; every line break (CR, LF, NEL, U+2028, U+2029) becomes a space.
+const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]/g;
+const BREAK_RE = /\r\n|[\n\r\u0085\u2028\u2029]/g;
+const CTRL_RE = /[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+export const safe = (s) => normalize(String(s ?? '')).replace(ANSI_RE, '').replace(BREAK_RE, ' ').replace(CTRL_RE, '');
 // ext: an external string as a quoted value. Inner quotes and backslashes are escaped, so it can never close its
 // own quote, start a line, or pass for brain's own output. n = max width including the quotes.
 export function ext(s, n = 0) {
   const body = safe(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   return `"${n ? cut(body, Math.max(1, n - 2)) : body}"`;
 }
+// ident: a repo path or graph ID, printed bare because it is the next command's argument. One holding a space or a
+// quote is quoted, so a crafted file name cannot read as a sentence of brain's own at the start of a line.
+export const ident = (s) => { const v = safe(s); return /[\s"\\]/.test(v) ? ext(v) : v; };

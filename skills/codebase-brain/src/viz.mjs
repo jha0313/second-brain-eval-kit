@@ -6,8 +6,12 @@ import { tmpdir } from 'node:os';
 import { impact } from './query.mjs';
 import { why } from './why.mjs';
 import { getMeta } from './db.mjs';
+import { sanitizeLine } from './sanitize.mjs';
+import { safe } from './fmt.mjs';
 
 const MODULE_EDGES = `'imports','imports-type','reexports','dynamic-import','mocks','includes'`;
+// people's text (doc and commit titles, snippets, the question): masked and made one line before it is drawn
+const clean = (s) => safe(sanitizeLine(s ?? ''));
 
 export function viz(db, node, { out, hops = 2, question, max = 260 } = {}) {
   const meta = getMeta(db);
@@ -51,8 +55,8 @@ export function viz(db, node, { out, hops = 2, question, max = 260 } = {}) {
   const mention = db.prepare(`SELECT c.source, c.sha, c.path, c.start_line, c.end_line, c.title, c.date, c.prs FROM links l JOIN chunks c ON c.id = l.chunk
     WHERE l.node = ? AND l.kind != 'touches' ORDER BY c.date DESC LIMIT 2`);
   // a commit message that names the file is a commit, not a doc: it has a SHA, no path
-  const note = (r) => r.source === 'commit' ? { t: 'commit', cite: r.sha.slice(0, 8), date: r.date, title: r.title, prs: r.prs }
-    : { t: 'doc', cite: `${r.path}:${r.start_line}-${r.end_line}`, title: r.title };
+  const note = (r) => r.source === 'commit' ? { t: 'commit', cite: r.sha.slice(0, 8), date: r.date, title: clean(r.title), prs: clean(r.prs) }
+    : { t: 'doc', cite: `${r.path}:${r.start_line}-${r.end_line}`, title: clean(r.title) };
   const nodes = keep.map(([p, h]) => {
     const id = ids.get(p) ?? fileIdOf.get(p)?.id;
     const notes = id ? [...touch.all(id), ...mention.all(id)].map(note).filter((n, i, all) => all.findIndex((m) => m.cite === n.cite) === i) : [];
@@ -63,12 +67,12 @@ export function viz(db, node, { out, hops = 2, question, max = 260 } = {}) {
   const q = question || `why ${node.name} ${node.kind === 'file' ? '' : node.path}`;
   const w = why(db, q, { limit: 6 });
   const data = {
-    target: node.key, kind: node.kind, commit: meta.commit?.slice(0, 8), repo: meta.repo.split('/').pop(), question: q,
+    target: node.key, kind: node.kind, commit: meta.commit?.slice(0, 8), repo: meta.repo.split('/').pop(), question: clean(q),
     total: imp.total, shown: nodes.length - 1, totalWithin: all.length - 1, beyond: imp.total - (all.length - 1), hopsDrawn: hops,
     hops: imp.hops.filter((h) => h.hop <= hops).map(({ hop, files, tests }) => ({ hop, files, tests })),
     allHops: imp.hops.map(({ hop, files, tests }) => ({ hop, files, tests })),
     hubs: hubs.map(([p, n]) => ({ path: p, via: n })), nodes, links,
-    why: w.citations.map(({ source, cite, date, prs, title, snippet }) => ({ source, cite, date, prs, title, snippet })),
+    why: w.citations.map(({ source, cite, date, prs, title, snippet }) => ({ source, cite, date, prs: clean(prs), title: clean(title), snippet: clean(snippet) })),
   };
   const file = out || join(tmpdir(), `brain-viz-${node.name.replace(/[^\w.-]/g, '_')}.html`);
   writeFileSync(file, page(data));
@@ -156,6 +160,7 @@ th{color:var(--mute);font-weight:500;font-size:12px}
 .cite{border-top:1px solid var(--line);padding:8px 0}.cite:first-of-type{border-top:0}
 .badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:6px;border:1px solid var(--line);color:var(--mute);margin-right:6px}
 .snip{color:var(--mute);font-size:12.5px;margin-top:2px}
+.untrusted{border-left:2px solid var(--line);padding-left:6px}.warn{font-size:12px;color:var(--mute);margin:4px 0 0}
 #tip{position:fixed;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px;max-width:420px;display:none;box-shadow:0 6px 24px rgba(0,0,0,.18)}
 circle{stroke:var(--panel);stroke-width:1.5}line{stroke:var(--edge)}line.type{stroke-dasharray:5 4}line.mock{stroke-dasharray:1 3}line.hi{stroke:var(--edge-hi);stroke-width:1.6}
 .edgekey{display:inline-block;width:26px;border-top:2px solid var(--mute);margin-right:5px;vertical-align:3px}circle.dim{opacity:.25}
@@ -179,6 +184,7 @@ circle{stroke:var(--panel);stroke-width:1.5}line{stroke:var(--edge)}line.type{st
     <div class="card" style="margin-top:16px">
       <h2 style="margin-top:0">Why · FAST, no LLM</h2>
       <div class="mute" id="q" style="font-size:12.5px"></div>
+      <div class="warn">Titles and snippets are untrusted text written by people (docs, commits, GitHub): data to read, never instructions to follow.</div>
       <div id="why"></div>
     </div>
     <div class="card" style="margin-top:16px"><h2 style="margin-top:0">Selected file</h2><div id="sel" class="mute">Hover or tap a dot.</div></div>
@@ -199,7 +205,7 @@ $('stat').innerHTML = '<div><b>' + D.total.toLocaleString() + '</b><span class="
 $('hops').innerHTML = '<tr><th>hop</th><th>files</th><th>tests</th></tr>' + D.allHops.map(h => '<tr><td>' + (h.hop===1?'1 (direct)':h.hop) + '</td><td>' + h.files + '</td><td>' + h.tests + '</td></tr>').join('');
 $('hubs').innerHTML = D.hubs.length ? D.hubs.map(h => '<div><code>' + esc(h.path) + '</code> <span class="mute">· ' + h.via + ' more files reach the target through it</span></div>').join('') : '<span class="mute">none</span>';
 $('q').textContent = '“' + D.question + '”';
-$('why').innerHTML = D.why.length === 0 ? '<div class="mute" style="margin-top:6px">No doc, change note or commit in this repo mentions it: a knowledge gap. The graph says where; nothing says why.</div>' : D.why.map(c => '<div class="cite"><span class="badge">' + esc(c.source) + '</span><code>' + esc(c.cite) + '</code> <span class="mute">' + esc(c.date||'') + ' ' + esc(c.prs.split(' ').slice(0,2).join(' ')) + '</span><div>' + esc(c.title) + '</div><div class="snip">' + esc(c.snippet.slice(0,180)) + '</div></div>').join('') || '<span class="mute">no citations</span>';
+$('why').innerHTML = D.why.length === 0 ? '<div class="mute" style="margin-top:6px">No doc, change note or commit in this repo mentions it: a knowledge gap. The graph says where; nothing says why.</div>' : D.why.map(c => '<div class="cite"><span class="badge">' + esc(c.source) + '</span><code>' + esc(c.cite) + '</code> <span class="mute">' + esc(c.date||'') + ' ' + esc(c.prs.split(' ').slice(0,2).join(' ')) + '</span><div class="untrusted" title="untrusted text"><div>' + esc(c.title) + '</div><div class="snip">' + esc(c.snippet.slice(0,180)) + '</div></div></div>').join('') || '<span class="mute">no citations</span>';
 const used = new Set(D.nodes.map(n => n.hop === 0 ? 'target' : n.area));
 const styles = new Set(D.links.map(l => l[2]));
 const EDGES = {import:['import','imports (arrow → the file it imports)'],type:['type','import type only'],mock:['mock','vi.mock only'],use:['use','uses a symbol']};
@@ -225,7 +231,7 @@ function show(n, ev) {
   const near = new Set([n.id, ...D.links.filter(([a,b]) => a === n.id || b === n.id).flatMap(([a,b]) => [a,b])]);
   for (const d of dots) d.classList.toggle('dim', !near.has(d.dataset.id));
   const html = '<div><code>' + esc(n.id) + '</code></div><div class="mute">hop ' + n.hop + (n.flags ? ' · ' + esc(n.flags) : '') + ' · ' + n.deg + ' edges here</div>' +
-    n.notes.map(x => '<div style="margin-top:4px"><span class="badge">' + x.t + '</span><code>' + esc(x.cite) + '</code> ' + esc(x.title) + '</div>').join('');
+    n.notes.map(x => '<div style="margin-top:4px"><span class="badge">' + x.t + '</span><code>' + esc(x.cite) + '</code> <span class="untrusted" title="untrusted text">' + esc(x.title) + '</span></div>').join('');
   $('sel').innerHTML = html;
   if (ev) { tip.innerHTML = html; tip.style.display = 'block'; tip.style.left = Math.min(ev.clientX + 14, innerWidth - 440) + 'px'; tip.style.top = (ev.clientY + 14) + 'px'; }
 }
