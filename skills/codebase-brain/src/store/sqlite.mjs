@@ -167,7 +167,11 @@ function findChunk(ctx, p) {
 
 function findItem(ctx, p) {
   const r = ctx.gh?.prepare('SELECT * FROM items WHERE ptr = ?').get(formatPtr(p));
-  if (!r) throw new NotFoundError(formatPtr(p));
+  if (!r) {
+    const other = { pr: 'issue', issue: 'pr' }[p.type];
+    const also = other && ctx.gh?.prepare('SELECT ptr FROM items WHERE ptr = ?').get(`${other}:${p.id}`)?.ptr;
+    throw new NotFoundError(formatPtr(p), also || null);
+  }
   return r;
 }
 

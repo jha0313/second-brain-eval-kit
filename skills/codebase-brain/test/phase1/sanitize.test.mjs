@@ -175,6 +175,17 @@ test('sections: blank lines are dropped by slicing, the first body line keeps it
   assert.equal(out[0].bodyLine, 3);
 });
 
+test('sections: the last chunk ends on the file\'s last line, not one past it (a final newline is not a line)', () => {
+  for (const text of ['# A\n\nfirst section body text here\n\n# B\n\nsecond section body text here\n',   // 7 lines + final newline
+    '# A\n\nfirst section body text here\n\n# B\n\nsecond section body text here',                     // no final newline
+    '# A\n\nfirst section body text here\n\n# B\n\nsecond section body text here\n\n']) {             // a blank 8th line
+    const n = text.endsWith('\n') ? text.split('\n').length - 1 : text.split('\n').length;
+    const out = sections(text, 'docs/x.md');
+    assert.equal(out.at(-1).end, n, JSON.stringify(text));
+    for (const c of out) assert.ok(c.start >= 1 && c.end <= n);
+  }
+});
+
 test('sweepSecrets: two secrets whose 4-hex suffixes collide still get two graph keys (Codex review)', () => {
   const secret = (n) => 'gh' + 'p_' + String(n).padStart(36, 'Q');
   const seen = new Map();

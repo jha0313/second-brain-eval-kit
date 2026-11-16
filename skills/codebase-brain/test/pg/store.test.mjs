@@ -26,7 +26,7 @@ const skip = neonSkip();
 const b = useBranch('store');
 const work = mkdtempSync(join(tmpdir(), 'brain-store-'));
 
-const DOC = 'doc:docs/credits.md:1-7', CHANGE = 'change:changes/20261001-reserve-first.md:1-9', COMMIT = 'commit:b070cb73';
+const DOC = 'doc:docs/credits.md:1-6', CHANGE = 'change:changes/20261001-reserve-first.md:1-8', COMMIT = 'commit:b070cb73';
 const GH_PTRS = ['pr:1121', 'review:9', 'rc:7', 'issue:45', 'ic:11'];
 const SHA = (c) => `aaaaaaa${c}${'0'.repeat(32)}`;
 const meta = (build, commit) => `UPDATE meta SET value = '"${build}"' WHERE key = 'build_id'; UPDATE meta SET value = '"${commit}"' WHERE key = 'commit';`;
@@ -109,7 +109,7 @@ test('revision pointers: @r<n> on every pointer but vault; Phase 1 pointers unch
   for (const s of ['pr:1121@r2', 'rc:7@r1', `${DOC}@r3`, 'doc:a@r1.md:1-2@r10', `${COMMIT}@r1`, `${DOC}@golden00`, 'vault:n.md:1-2@abcd1234', 'pr:5']) {
     assert.equal(formatRevPtr(parseRevPtr(s)), s, s);
   }
-  assert.deepEqual(parseRevPtr(`${DOC}@r3`), { type: 'doc', path: 'docs/credits.md', a: 1, b: 7, build: null, rev: 3 });
+  assert.deepEqual(parseRevPtr(`${DOC}@r3`), { type: 'doc', path: 'docs/credits.md', a: 1, b: 6, build: null, rev: 3 });
   assert.equal(parseRevPtr(`${DOC}@r1234567`).build, 'r1234567');   // 8 characters: a build, never a revision
   for (const s of ['vault:n.md:1-2@r1', `${DOC}@golden00@r1`, 'doc:x.md:5-2@r1', 'pr:abc@r1', 'pr:1@r0', DOC]) {
     assert.throws(() => parseRevPtr(s), (e) => code(e) === 'bad-pointer', s);

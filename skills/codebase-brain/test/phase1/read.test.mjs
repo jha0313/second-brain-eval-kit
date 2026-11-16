@@ -267,7 +267,10 @@ test('get: at most 5 pointers; bad, unknown and stale pointers throw the documen
   assert.equal(get(main, ['pr:1121', 'pr:1149', 'issue:1100', 'rc:88123', 'ic:99120']).items.length, 5);
   assert.throws(() => get(main, ['pr:1121', 'pr:1149', 'issue:1100', 'rc:88123', 'ic:99120', 'pr:1150']), (e) => e.code === 'too-many-pointers');
   assert.throws(() => get(main, ['pr:abc']), PtrError);
-  assert.throws(() => get(main, ['pr:9999']), NotFoundError);
+  assert.throws(() => get(main, ['pr:9999']), (e) => e instanceof NotFoundError && !e.also);
+  // PRs and issues share numbers: a miss on one kind names the other when it exists
+  assert.throws(() => get(main, ['pr:1100']), (e) => e instanceof NotFoundError && e.also === 'issue:1100' && /issue:1100 exists/.test(e.message));
+  assert.throws(() => source(main, 'issue:1121'), (e) => e instanceof NotFoundError && e.also === 'pr:1121');
   assert.throws(() => get(main, ['commit:deadbee']), NotFoundError);
   assert.throws(() => get(main, [`doc:docs/nope.md:1-2@${BUILD}`]), NotFoundError);
   assert.throws(() => get(main, ['pr:1121', `doc:docs/kiwi.md:1-4@${OLD}`]), StalePtrError);

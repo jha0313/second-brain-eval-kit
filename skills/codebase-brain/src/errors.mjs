@@ -32,7 +32,10 @@ export class StalePtrError extends BrainError {
 
 // a pointer that parses but names nothing in the stores
 export class NotFoundError extends BrainError {
-  constructor(ptr) { super('not-found', `no such item: ${ptr}`); }
+  // also: a pointer that does exist and is likely meant (pr:N missed, issue:N there: PRs and issues share numbers)
+  constructor(ptr, also = null) {
+    super('not-found', `no such item: ${ptr}` + (also ? ` — ${also} exists (PRs and issues share one number space): use ${also}` : ''), also ? { also } : undefined);
+  }
 }
 
 // stores written before the current sanitizer: content must not be shown
