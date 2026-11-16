@@ -38,6 +38,8 @@ before(() => {
   runs.phase0 = [
     read('why', 'credential rotation runbook'), read('why', 'credential rotation runbook', '--json'), read('why', 'slack workspace hook rotation'),
     read('find', 'rotate'), read('find', 'rotate', '--json'), read('find', 'vault-keys'), read('find', 'vault-keys', '--json'), read('status'), read('status', '--json'),
+    read('refs', 'src/lib/credits.ts'), read('refs', 'src/lib/credits.ts#reserve', '--json'), read('callers', 'src/lib/credits.ts#reserve'),
+    read('impact', 'src/lib/credits.ts'), read('impact', 'src/lib/credits.ts', '--json'), read('deps', 'app/api/run/route.ts'), read('shared', 'src/lib', 'app'),
   ];
   const out = mkdtempSync(join(tmpdir(), 'brain-s-viz-'));
   html = [join(out, 'credits.html'), join(out, 'vault-keys.html')];
@@ -73,7 +75,7 @@ test('secrets: search, get and source print no canary (text and --json)', () => 
   assert.ok(quoted.length > gh.ptrs.length, `source quoted every GitHub item and the commit (${quoted.length})`);
 });
 
-test('secrets: why, find and status print no canary', () => {
+test('secrets: why, find, status and the graph commands (refs, callers, impact, deps, shared) print no canary', () => {
   assert.deepEqual(outputLeaks(reg, runs.phase0), []);
   assert.ok(parseJson(runs.phase0[1])?.citations?.length > 0, `why --json cites the corpus: ${brief(reg, runs.phase0[1])}`);
 });

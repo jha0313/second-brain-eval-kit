@@ -103,6 +103,13 @@ export function zwSplit(reg, loc, kind) {
   return split;
 }
 
+/** A short literal password (T7): masked whatever its length. */
+export function shortPassword(reg, loc) {
+  const v = rnd(`${loc}/short-password`, 6);
+  reg.set(`${loc}/assignment#short`, v);
+  return 'pass' + `word: "${v}"`;
+}
+
 // Labels carry no assignment keyword, so each secret is caught (or not) by its own kind's rule.
 export const secretLines = (reg, loc, kinds = SECRET_KINDS) =>
   kinds.map((k, i) => `rotation step ${i + 1}:${k === 'private-key' ? '\n' : ' '}${secret(reg, loc, k)}`).join('\n');
@@ -110,11 +117,12 @@ export const secretLine = (reg, loc, kinds) => kinds.map((k, i) => `(${i + 1}) $
 
 // Token canaries in the environment of every run. In replay mode the active token is "replay-token" (seams.mjs):
 // it is a canary too, since the token may appear only in the Authorization header.
+export const ACTIVE_TOKEN = 'replay-' + 'token';
 export const TOKEN_ENV = { GH_TOKEN: 'brain' + 'TokCanary' + rnd('env:GH_TOKEN', 28, LOW + D), GITHUB_TOKEN: 'gh' + 'p_' + rnd('env:GITHUB_TOKEN', 36) };
 export function addTokenCanaries(reg) {
   reg.set('env/GH_TOKEN', TOKEN_ENV.GH_TOKEN);
   reg.set('env/GITHUB_TOKEN', TOKEN_ENV.GITHUB_TOKEN);
-  reg.set('seam/active-token', 'replay-' + 'token');
+  reg.set('seam/active-token', ACTIVE_TOKEN);
   return reg;
 }
 
@@ -259,14 +267,14 @@ export function githubSecretCorpus(reg) {
     pr({ number: 103, state: 'closed', title: 'Webhook rotation: ' + L('pr-title@103', ['slack', 'url-credential']), body: 'Superseded by #101.',
       head: `chore/${I('branch@103', 'slack')}`, author: 'carol', assoc: 'CONTRIBUTOR', updated: '2026-10-01T10:00:00Z' }),
   ];
-  const page2 = [pr({ number: 104, state: 'merged', title: 'Header auth: ' + L('pr-title@104', ['bearer', 'assignment']), body: 'Earlier rotation, see docs/credits.md.',
+  const page2 = [pr({ number: 104, state: 'merged', title: 'Header auth: ' + L('pr-title@104', ['bearer', 'assignment']), body: `Earlier rotation, see docs/credits.md. Old db ${shortPassword(reg, 'pr-body@104')}`,
     head: `feat/${I('branch@104', 'api-key')}/${I('branch@104', 'jwt')}`, updated: '2026-09-20T10:00:00Z' })];
   const rcPath = `config/${I('review-comment-path@7001', 'github-token')}.yml`;
   return {
     prPages: [prs, page2],
     issues: [
       issue({ number: 201, state: 'open', title: 'Leaked keys in CI logs: ' + L('issue-title@201', ['github-token', 'slack', 'jwt', 'bearer']), body: M('issue-body@201'), updated: '2026-10-06T10:00:00Z' }),
-      issue({ number: 202, state: 'closed', title: 'Rotate staging: ' + L('issue-title@202', ['aws-key', 'api-key', 'url-credential', 'assignment']), body: 'Done in #101.', updated: '2026-10-07T10:00:00Z' }),
+      issue({ number: 202, state: 'closed', title: 'Rotate staging: ' + L('issue-title@202', ['aws-key', 'api-key', 'url-credential', 'assignment']), body: `Done in #101. Staging ${shortPassword(reg, 'issue-body@202')}`, updated: '2026-10-07T10:00:00Z' }),
       prAsIssue(prs[0]),
     ],
     issueComments: [
@@ -311,7 +319,7 @@ export function repoSecretCorpus(reg) {
   const key = secret(reg, 'repo-change-note', 'private-key').split('\n');
   const filler = Array.from({ length: 34 }, (_, i) => `- step ${i + 1} of the credential rotation runbook for the credits service`);
   const doc = ['# Credential rotation', '', ...filler, secretLines(reg, 'repo-doc', ['private-key']),     // key: lines 37–42
-    secretLines(reg, 'repo-doc', ONE_LINE_KINDS), ''].join('\n');
+    secretLines(reg, 'repo-doc', ONE_LINE_KINDS), `old staging ${shortPassword(reg, 'repo-doc')}`, ''].join('\n');
   return {
     extraFiles: {
       [`src/lib/${fileName}.ts`]: "import { reserve } from './credits';\nexport const rotateKeys = () => reserve;\n",
@@ -466,6 +474,24 @@ export const badChars = (text) => [...new Set((String(text).match(FORBIDDEN_RE) 
 const HEAD_RE = /^\s*(SYSTEM\b|ignore (all )?previous|INJ-|── (end )?quote\b|│)/i;
 export const headViolations = (text) => String(text).split('\n').filter((l) => HEAD_RE.test(l));
 
+/**
+ * Matches of `re` (global) outside a "…" span: ext() quotes an external string and escapes \" and \\ inside it,
+ * so a title, snippet or first line can only appear between unescaped quotes.
+ */
+export function unquoted(text, re) {
+  const out = [];
+  for (const line of String(text).split('\n')) {
+    const inside = [];
+    for (let i = 0, q = false; i < line.length; i++) {
+      inside[i] = q;
+      if (line[i] === '\\') { inside[++i] = q; continue; }
+      if (line[i] === '"') q = !q;
+    }
+    for (const m of line.matchAll(re)) if (!inside[m.index]) out.push(m[0]);
+  }
+  return out;
+}
+
 /** The footer is two lines, once, at the very end: a body that imitates it must not add a third. */
 export function footerProblems(text) {
   const lines = String(text).split('\n').filter((l) => l.trim());
@@ -498,21 +524,23 @@ export function envelopeProblems(text, ptr) {
   return p;
 }
 
-// DTO rules (read.mjs): pointers and repo paths from code.db live outside `untrusted`; everything else external inside.
-const OUTSIDE_OK = new Set(['ptr', 'matched', 'path', 'resolved', 'files', 'commitPtr', 'prPtr', 'query']);
-const PTR_RE = /^(pr|issue|review|rc|ic):\d+$|^commit:[0-9a-f]{7,40}$|^(doc|change|changelog|vault):/;
+// DTO rules (read.mjs): pointers, repo paths from code.db and the caller's own query live outside `untrusted`.
+const OUTSIDE_OK = [/(^|\.)ptr$/, /(^|\.)matched\.\d+$/, /(^|\.)merge\.(commitPtr|prPtr)$/, /(^|\.)links\.\w+\.\d+\.resolved\.\d+$/, /(^|\.)code\.files\.\d+$/, /^query$/];
+// GetItem.path is the repo path of a repo-memory item; a GitHub item keeps its paths under untrusted.
+const repoPath = (key, parent) => key === 'path' && parent && typeof parent.origin === 'string' && parent.origin !== 'github';
 
 /** Strings that match `marker` must sit under an `untrusted` key; strings under `untrusted` must be normalized. */
 export function untrustedProblems(value, marker) {
   const p = [];
-  const walk = (v, path) => {
+  const walk = (v, path, parent) => {
     if (typeof v === 'string') {
       const where = path.join('.');
       const inside = path.includes('untrusted');
-      if (marker.test(v) && !inside && !OUTSIDE_OK.has(String(path.at(-1))) && !OUTSIDE_OK.has(String(path.at(-2))) && !PTR_RE.test(v)) p.push(`${where}: external text outside "untrusted"`);
+      const allowed = OUTSIDE_OK.some((re) => re.test(where)) || repoPath(path.at(-1), parent);
+      if (marker.test(v) && !inside && !allowed) p.push(`${where}: external text outside "untrusted"`);
       if (inside && badChars(v).length) p.push(`${where}: ${badChars(v).join(' ')}`);
-    } else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) walk(x, [...path, k]);
+    } else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) walk(x, [...path, k], v);
   };
-  walk(value, []);
+  walk(value, [], null);
   return p;
 }

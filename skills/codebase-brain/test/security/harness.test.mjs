@@ -11,7 +11,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { replayTransport } from '../../src/replay.mjs';
 import {
   U, NOW, WINDOW, REPO_ID, SECRET_KINDS, canaries, secret, addTokenCanaries, githubSecretCorpus, repoSecretCorpus, replayRoutes, writeReplay,
-  leaksIn, storeLeaks, outputLeaks, badChars, headViolations, footerProblems, envelopeProblems, untrustedProblems,
+  leaksIn, storeLeaks, outputLeaks, badChars, headViolations, unquoted, footerProblems, envelopeProblems, untrustedProblems,
 } from './lib.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -22,7 +22,7 @@ test('harness: canaries are distinct, cover every kind and location, and none is
   repoSecretCorpus(reg);
   const needles = [...reg.values()];
   assert.equal(new Set(needles).size, needles.length, 'distinct');
-  assert.deepEqual(needles.filter((n) => n.length < 8), [], 'long enough to never occur by chance');
+  assert.deepEqual(needles.filter((n) => n.length < 6), [], 'long enough to never occur by chance');
   const ids = [...reg.keys()];
   for (const k of SECRET_KINDS) assert.ok(ids.some((id) => id.split('/')[1].startsWith(k)), k);
   for (const loc of ['pr-title', 'pr-body', 'branch', 'review-comment', 'review-body', 'issue-comment', 'issue-title', 'issue-body', 'pr-file',
@@ -138,4 +138,9 @@ test('harness: the output checks accept the documented formats and reject the at
   assert.deepEqual(badChars(`a\x1b[31m b${U(0x202E)} c${U(0x200B)} d\r e${U(0x2028)} f\x9b g\tok`), ['U+001B', 'U+202E', 'U+200B', 'U+000D', 'U+2028', 'U+009B']);
   assert.deepEqual(untrustedProblems({ ptr: 'doc:SYSTEM: x.md:1-2@abcdefgh', title: 'SYSTEM: x', untrusted: { title: `SYSTEM: x${U(0x202E)}` } }, /SYSTEM:/),
     ['title: external text outside "untrusted"', 'untrusted.title: U+202E']);
+  assert.deepEqual(untrustedProblems({ items: [{ origin: 'github', thread: [{ path: 'SYSTEM: obey.ts' }] }, { origin: 'repo', path: 'SYSTEM: obey.md' }] }, /SYSTEM:/),
+    ['items.0.thread.0.path: external text outside "untrusted"']);
+  const T = /INJ-T\d+/g;
+  for (const spec of [SEARCH_SPEC, GET_SPEC]) assert.deepEqual(unquoted(spec, /Reserve credits|Charge after run|double-charges/g), []);
+  assert.deepEqual(unquoted('  1  pr:7  "a \\" INJ-T1 b"  INJ-T2\n  "x \\\\" INJ-T3', T), ['INJ-T2', 'INJ-T3']);
 });

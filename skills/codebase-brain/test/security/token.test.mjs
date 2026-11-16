@@ -5,7 +5,7 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  NOW, BASE, PULLS_Q, FAILPOINTS, STREAMS, canaries, secret, rnd, addTokenCanaries, githubSecretCorpus, replayRoutes, override, writeReplay, ok, pr,
+  NOW, BASE, PULLS_Q, FAILPOINTS, STREAMS, ACTIVE_TOKEN, canaries, secret, rnd, addTokenCanaries, githubSecretCorpus, replayRoutes, override, writeReplay, ok, pr,
   setupRepo, sync, parseJson, brief, resetGithub, storeLeaks, outputLeaks,
 } from './lib.mjs';
 
@@ -19,6 +19,8 @@ const date = new Date(NOW).toUTCString();
 const SCENARIOS = [
   { name: '401 Bad credentials at getRepo', expect: 'failed',
     mutate: (r) => override(r, '', {}, [{ status: 401, headers: { date }, body: { message: 'Bad credentials', documentation_url: 'https://docs.github.com/rest', status: '401' } }]) },
+  { name: '401 whose message echoes the active token (redactValues, not the masker, must catch it)', expect: 'failed',
+    mutate: (r) => override(r, '', {}, [{ status: 401, headers: { date }, body: { message: `Bad credentials: ${ACTIVE_TOKEN}` } }]) },
   { name: '500 on pulls page 2 until the retries run out, a secret in the body and in a header', expect: 'failed',
     mutate: (r) => override(r, '/pulls', { ...PULLS_Q, page: '2' }, [{ status: 500, headers: { date, 'x-debug-echo': secret(reg, 'error-header@500', 'bearer') },
       body: { message: `Server Error near ${secret(reg, 'error-body@500', 'github-token')}` } }]) },
@@ -62,6 +64,8 @@ for (const name of FAILPOINTS) {
   });
 }
 
+// Black-box, only a stored page is visible: a client that sends the request and then fails before storing it passes
+// here. Seeing the request itself needs a request log from the replay seam (reported as a contract request).
 test('token: a Link rel="next" to another host is never followed (the token would go with it)', () => {
   resetGithub(fx);
   const marker = canaries();
