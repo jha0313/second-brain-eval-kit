@@ -34,7 +34,8 @@ after(async () => { await owner?.end().catch(() => {}); await branch?.drop(); })
 
 const rows = async (text, params) => (await owner.query(text, params)).rows;
 
-it('the publish driver: recorded early failures, a first publish with no credential in any child, two runs on a base, V22', { timeout: 600_000 }, async () => {
+// the budget covers the harness's slot wait (up to 15 min while two other suites hold the slots) and then the runs
+it('the publish driver: recorded early failures, a first publish with no credential in any child, two runs on a base, V22', { timeout: 1_500_000 }, async () => {
   await ready();
   const reg = canaries();
   const fx = setupRepo(repoSecretCorpus(reg));
