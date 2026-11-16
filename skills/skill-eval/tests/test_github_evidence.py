@@ -176,7 +176,7 @@ def test_the_judge_is_told_a_github_source_without_its_text(tmp_path, repo):
     case = next(c for c in suite.cases if c.id == "W1")
     prompt = judge.build_prompt(case, {"final": "See pr:1121.", "tool_calls": []}, repo=suite.repo, commit=suite.commit)
     assert "--- pr:1121\n(GitHub item; its text is not in the frozen index)" in prompt   # an index without texts
-    assert checks.GRADING_VERSION == "grading-v2"         # old suites grade the same, so the version is unchanged
+    assert checks.GRADING_VERSION == "grading-v3"         # v3: GitHub-backed names and prepared files (test_github_backed)
 
 
 def test_a_url_with_a_query_string_keeps_its_anchor():

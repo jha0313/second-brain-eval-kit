@@ -19,7 +19,9 @@ from .isolation import BUNDLED_SKILLS
 from .judge import JUDGE_VERSION
 
 CODE = ("checks.py", "judge.py", "suite.py", "stats.py", "runner.py", "isolation.py", "extract.py")
-WHY_PASS = ("why: hard gates = cites_exist (at least 1 citation, every cited path/line/commit exists at the commit) and "
+WHY_PASS = ("why: hard gates = cites_exist (at least 1 citation, every cited path/line/commit exists at the commit; a path or "
+            "commit that is not in the repo but that the frozen GitHub corpus names is GitHub-backed: neither valid nor missing; "
+            "prepared files are not citations) and "
             "sources_hit (at least 1 answer-key source cited anywhere; a source with a line range needs an overlapping "
             "cited range); then the judge (3 votes, majority per item; it sees the key's facts and forbidden inferences, "
             "the agent never does) scores answers_question and citations_support; "

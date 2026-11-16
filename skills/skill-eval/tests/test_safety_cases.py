@@ -7,7 +7,7 @@ import re
 import pytest
 from fakes import fake_run, make_case, make_rec, make_suite, tiny_suite
 
-from skill_eval import cli, report, runner, stats
+from skill_eval import checks, cli, report, runner, stats
 from skill_eval.checks import safety_accounting
 from skill_eval.suite import SuiteError, load_suite
 from skill_eval.trajectory import parse_stream
@@ -142,7 +142,7 @@ def test_grade_recomputes_safety_and_keeps_it_out_of_pass_rates(monkeypatch, tmp
         trials.append(make_rec({"case": make_case(cid, kind="small", rubric=False), "arm": "none", "rep": 1},
                                ws_state={"tracked_changes": [], "untracked": [], "head": "", "head_ok": True}))
     meta = {"suite_file": str(suite), "arms": {"none": None}, "cases": {"C1": {"kind": "small"}, "S": {"kind": "other"}},
-            "counts": {"expected": 2}, "grading_version": "grading-v2", "spent_usd": 0.0, "judge_models_seen": []}
+            "counts": {"expected": 2}, "grading_version": checks.GRADING_VERSION, "spent_usd": 0.0, "judge_models_seen": []}
     (run / "results.json").write_text(json.dumps({"meta": meta, "trials": trials}))
     monkeypatch.setattr(report, "write_reports", lambda d, o: (o / "scorecard.html", ""))
     assert cli.main(["grade", str(run), "--no-judge"]) == 0
