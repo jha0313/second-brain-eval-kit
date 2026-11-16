@@ -11,6 +11,7 @@ import { SANITIZE_VERSION, SECRET_KINDS, normalize, mask, flagSuspicious, saniti
   from '../../src/sanitize.mjs';
 import { createDb, inTransaction, setMeta } from '../../src/db.mjs';
 import { sections } from '../../src/index-knowledge.mjs';
+import { canonicalNodeKeys } from '../../src/pg/contract.mjs';
 import { fixtureRepo } from './helpers.mjs';
 
 const R = (s, n) => s.repeat(n);
@@ -242,6 +243,57 @@ test('sweepSecrets: canaries planted in nodes, edges, unresolved, links, meta, c
   db.close();
   const bytes = readFileSync(path);
   for (const [where, canary] of Object.entries(c)) assert.equal(occurrences(bytes, canary), 0, `${where} canary in code.db bytes`);
+});
+
+test('sweepSecrets: a key is rebuilt from its swept path and name, so a symbol under an assignment-shaped path keeps <path>#Name (Phase 2 lane B)', () => {
+  const v = 'Zq7Wv' + '9LxQ', dv = 'Hb4Rk' + '2TmP';                                     // the assignment values: the canaries
+  const P = 'src/token=' + v + '.ts', D = 'lib/secret=' + dv;
+  const path = join(mkdtempSync(join(tmpdir(), 'sweep-key-')), 'code.db');
+  const db = createDb(path);
+  inTransaction(db, () => {
+    const node = db.prepare("INSERT INTO nodes(id, key, kind, name, path, parent, lang) VALUES (?, ?, ?, ?, ?, ?, 'ts')");
+    node.run(1, P, 'file', P.split('/').pop(), P, null);
+    node.run(2, `${P}#Name`, 'function', 'Name', P, 1);
+    node.run(3, `${P}#Name@type`, 'type', 'Name', P, 1);                                // the clash suffix (index-ts.mjs)
+    node.run(4, `${P}#Box`, 'class', 'Box', P, 1);
+    node.run(5, `${P}#Box.open`, 'method', 'open', P, 4);                               // a member: <path>#Parent.name
+    node.run(6, `dir:${D}`, 'dir', D.split('/').pop(), D, null);
+    node.run(7, 'src/clean.ts', 'file', 'clean.ts', 'src/clean.ts', null);
+    db.prepare("INSERT INTO edges(src, dst, kind, path, line, col) VALUES (7, 2, 'call', 'src/clean.ts', 1, 0), (2, 5, 'call', ?, 2, 0)").run(P);
+    db.prepare("INSERT INTO chunks(id, source, path, start_line, end_line, title, body, body_line) VALUES (1, 'doc', 'docs/a.md', 1, 2, 'A', 'see Name', 1)").run();
+    db.prepare("INSERT INTO links(chunk, node, kind, evidence) VALUES (1, 2, 'mentions-symbol', 'Name')").run();
+  });
+  inTransaction(db, () => sweepSecrets(db));
+  const rows = db.prepare('SELECT id, key, kind, name, path, parent FROM nodes ORDER BY id').all().map((r) => ({ ...r }));
+  const at = Object.fromEntries(rows.map((r) => [r.id, r]));
+  const file = at[1].path;
+  assert.match(file, /^src\/token=\[REDACTED:assignment:[0-9a-f]{4}\]$/);
+  assert.deepEqual(rows.slice(0, 5).map((r) => r.key), [file, `${file}#Name`, `${file}#Name@type`, `${file}#Box`, `${file}#Box.open`]);
+  assert.ok(rows.slice(0, 5).every((r) => r.path === file));
+  assert.equal(at[6].key, `dir:${at[6].path}`);
+  assert.equal(at[7].key, 'src/clean.ts');
+  assert.doesNotThrow(() => canonicalNodeKeys(rows));                                    // the Phase 2 snapshot accepts every key
+  const edge = (src) => db.prepare('SELECT d.key, e.path FROM edges e JOIN nodes d ON d.id = e.dst WHERE e.src = ?').get(src);
+  assert.deepEqual({ ...edge(7) }, { key: `${file}#Name`, path: 'src/clean.ts' });
+  assert.deepEqual({ ...edge(2) }, { key: `${file}#Box.open`, path: file });              // edges.path = the swept file path
+  assert.equal(db.prepare('SELECT n.key FROM links l JOIN nodes n ON n.id = l.node').get().key, `${file}#Name`);
+  assert.equal(inTransaction(db, () => sweepSecrets(db)).rows, 0);                         // idempotent
+  db.close();
+  const bytes = readFileSync(path);
+  for (const c of [v, dv]) assert.equal(occurrences(bytes, c), 0, 'canary in code.db bytes');
+});
+
+test('build: a .ts file under an assignment-shaped name gives symbol keys <swept path>#Name that the Phase 2 snapshot accepts', () => {
+  const v = 'Zq7Wv' + '9LxQ';
+  const fx = fixtureRepo({ extraFiles: { [`src/lib/token=${v}.ts`]: 'export function Name() { return 1; }\nexport class Box { open() { return Name(); } }\n' } });
+  const db = new DatabaseSync(fx.codeDb, { readOnly: true });
+  const rows = db.prepare('SELECT id, key, kind, name, path, parent FROM nodes').all().map((r) => ({ ...r }));
+  db.close();
+  const file = rows.find((r) => r.kind === 'file' && r.path.startsWith('src/lib/token=')).path;
+  assert.ok(isRedacted(file));
+  assert.deepEqual(rows.filter((r) => r.path === file && r.kind !== 'file').map((r) => r.key).sort(), [`${file}#Box`, `${file}#Box.open`, `${file}#Name`]);
+  assert.doesNotThrow(() => canonicalNodeKeys(rows));
+  assert.equal(occurrences(readFileSync(fx.codeDb), v), 0);
 });
 
 test('build: canaries in a doc, a .ts file name, a symbol, an import spec, a commit, CHANGELOG and vault never reach code.db bytes', () => {

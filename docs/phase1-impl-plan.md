@@ -346,6 +346,7 @@ flowchart LR
 | A25 | 서버 `Date`가 저장된 cursor보다 이르면 sync 실패(cursor는 뒤로 가지 않는다). `--full`도 같다 | Phase 3 §5 "T는 앞으로만 간다" |
 | A26 | `detectSecrets(s)` → 비밀 종류 목록(아무것도 고쳐 쓰지 않음, `mask()`와 같은 규칙) | Phase 2 R16 업로드 전 검사가 어떤 문자열에도 부를 탐지기가 필요했다. `SANITIZE_VERSION`은 규칙이 바뀔 때 손으로 올리는 정수라 같은 글·같은 버전이면 결과가 같다 |
 | A27 | meta `repo` · `worktree` 없이도 모든 읽기 명령이 돈다(테스트로 고정) | Phase 2 mirror는 로컬 경로 meta를 올리지 않는다(R16) |
+| A28 | `sweepSecrets`는 노드 키를 통째로 가리지 않고 부분(경로, 이름, 부모 이름)을 따로 가린 뒤 다시 잇는다: file `path`, dir `dir:path`, symbol `path#[Parent.]Name[@kind]`. 그 밖의 모양만 통째로 가린다 | Phase 2 레인 B가 찾은 버그. `token=…` 꼴 경로는 키를 통째로 가리면 할당 규칙의 값이 `#Name`까지 먹어서 키의 표시가 자기 경로의 표시와 달라졌고, Phase 2 `canonicalNodeKey`가 그 키에서 throw했다(게시 안 됨, 새는 것 없음). 다시 이은 키에는 이미 가려진 path·name 열에 있는 글만 들어간다 |
 
 Phase 2가 Phase 1에 요청한 것 중 이미 맞는 것: T = 첫 응답(`getRepo`)의 `Date`(G가 이미 그렇다), 링크 결과는 노드 키 문자열(D: file → 경로, symbol → `path#Name`, grep → `path:line`; Phase 2 `canonicalResolved`가 정규 키로 바꾼다), vault는 로컬 전용(Phase 2 snapshot이 vault 청크를 거부한다). async store와 `@r<n>`은 Phase 2 레인 C 몫이다.
 

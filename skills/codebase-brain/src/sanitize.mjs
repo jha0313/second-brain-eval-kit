@@ -202,10 +202,10 @@ export function sweepSecrets(db) {
 
   for (const table of ['nodes', 'edges', 'unresolved', 'links', 'chunks']) {
     const cols = db.prepare(`SELECT name FROM pragma_table_info(?) WHERE upper(type) = 'TEXT'`).all(table).map((r) => r.name);
-    const fix = cols.map((c) => (PROSE[table]?.has(c) ? prose : ident));
+    const fix = cols.map((c) => (PROSE[table]?.has(c) ? prose : table === 'nodes' && c === 'key' ? null : ident));
     const updates = [];
     for (const r of db.prepare(`SELECT rowid AS rid_, ${cols.map((c) => `"${c}"`).join(', ')} FROM ${table}`).iterate()) {
-      const next = cols.map((c, i) => (typeof r[c] === 'string' ? fix[i](r[c]) : r[c]));
+      const next = cols.map((c, i) => (typeof r[c] !== 'string' ? r[c] : fix[i] ? fix[i](r[c]) : nodeKey(r, ident)));
       if (next.some((v, i) => v !== r[cols[i]])) updates.push([...next, r.rid_]);
     }
     if (updates.length) {
@@ -229,6 +229,32 @@ export function sweepSecrets(db) {
   // external-content FTS keeps its own copy of every token: rebuild both from the swept chunks
   db.exec(`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild'); INSERT INTO chunks_tri(chunks_tri) VALUES('rebuild');`);
   return { rows };
+}
+
+// A node key is built from its path and name (file: path, dir: dir:<path>, symbol: <path>#[Parent.]Name[@kind]). Mask
+// the parts and join them again: masked as one string, an assignment-shaped path ("token=…") would take the rest of
+// the key into its value and give the key a different marker than its own path (Phase 2 canonicalNodeKey). The
+// rebuilt key holds only text that the swept path and name columns hold too.
+function nodeKey({ key, kind, name, path }, ident) {
+  let k = null;
+  if (typeof path === 'string') {
+    if (key === path) k = ident(path);
+    else if (key === `dir:${path}`) k = `dir:${ident(path)}`;
+    else if (key.startsWith(`${path}#`) && typeof name === 'string') {
+      const rest = symbolKey(key.slice(path.length + 1), name, kind, ident);
+      if (rest !== null) k = `${ident(path)}#${rest}`;
+    }
+  }
+  return k ?? ident(key);                                  // any other shape: mask it as one string
+}
+
+// keyName[@kind] after "<path>#": keyName is name, or "<parent name>.name" for a member
+function symbolKey(rest, name, kind, ident) {
+  for (const [body, at] of [[rest, ''], rest.endsWith(`@${kind}`) ? [rest.slice(0, -kind.length - 1), `@${kind}`] : null].filter(Boolean)) {
+    if (body === name) return `${ident(name)}${at}`;
+    if (body.endsWith(`.${name}`)) return `${ident(body.slice(0, -name.length - 1))}.${ident(name)}${at}`;
+  }
+  return null;
 }
 
 /** Replace exact runtime values (the active token) wherever they appear: error messages, logs. */
