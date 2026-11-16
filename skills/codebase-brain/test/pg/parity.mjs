@@ -2,8 +2,11 @@
 // two code-shaped SQLite files (a local build's code.db and a mirror's brain.db) and compares the outputs. Query-only: it
 // never builds or changes either file (Phase 0's test/run.mjs builds and edits its fixture, so it is not used here).
 //   node test/pg/parity.mjs --a <code.db> --b <brain.db> --repo <checkout> --queries <file.json> [--out <file.json>] [--jobs N]
-//   queries: a JSON array of argv arrays after `brain`, e.g. [["refs", "src/x.ts#y"], ["why", "a question"]].
-//   --db, --repo, --local and --json are added; --local keeps a BRAIN_READER_URL (environment or .env.local) out.
+//   queries: a JSON array of argv arrays after `brain`, e.g. [["refs", "src/x.ts#y"], ["why", "a question"]]. Only the
+//   read commands below; a query may not carry --db, --repo, --local or --json: the harness puts them first, so no option
+//   of the query can take one of them as its value.
+//   The child gets no BRAIN_READER_URL or BRAIN_DB, and runs with --local. The kit's own .env.local is still read for
+//   the reader secrets the CLI cuts out of its output, so the harness refuses to run while that file names a reader URL.
 // Normalization (§7.2): the keys `ms` and `freshness` are dropped at every depth; key order is ignored. Each query is:
 //   same     equal after normalization, list order included
 //   order    equal only when every list is compared as a multiset (a list whose order is not defined)
@@ -13,12 +16,14 @@
 // them; a caller whose repo has more than 5,000 commits must leave such queries out or read their diffs with that rule.
 // Exit 0 when no query differs, 1 when one does, 2 on usage. The output file holds the queries: keep it where they may be.
 import { execFile } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const BRAIN = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'bin', 'brain');
+export const COMMANDS = new Set(['find', 'refs', 'callers', 'impact', 'deps', 'shared', 'why']);   // they read code.db only
+const OWN = ['--db', '--repo', '--local', '--json'];
 const DROP = new Set(['ms', 'freshness']);
 const canon = (v) => JSON.stringify(v);
 const byCanon = (x, y) => { const a = canon(x), b = canon(y); return a < b ? -1 : a > b ? 1 : 0; };
@@ -51,8 +56,8 @@ export function diffs(a, b, path = '$', out = []) {
   }
   if (a && b && typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b)) {
     for (const k of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {
-      if (!(k in b)) out.push({ path: `${path}.${k}`, onlyA: [a[k]], onlyB: [] });
-      else if (!(k in a)) out.push({ path: `${path}.${k}`, onlyA: [], onlyB: [b[k]] });
+      if (!Object.hasOwn(b, k)) out.push({ path: `${path}.${k}`, onlyA: [a[k]], onlyB: [] });
+      else if (!Object.hasOwn(a, k)) out.push({ path: `${path}.${k}`, onlyA: [], onlyB: [b[k]] });
       else diffs(a[k], b[k], `${path}.${k}`, out);
     }
     return out;
@@ -75,10 +80,20 @@ export function compare(ra, rb) {
 
 const childEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'BRAIN_READER_URL' && k !== 'BRAIN_DB'));
 
+/** why a query may not run (null: it may): a read command, none of the harness's own flags */
+export function badQuery(q) {
+  if (!Array.isArray(q) || !q.length || !q.every((x) => typeof x === 'string')) return 'not an array of strings';
+  if (!COMMANDS.has(q[0])) return `${JSON.stringify(q[0])} is not one of ${[...COMMANDS].join(', ')}`;
+  const own = q.find((x) => OWN.some((f) => x === f || x.startsWith(`${f}=`)));
+  return own ? `${own} is set by the harness` : null;
+}
+/** the child's argv: the harness's flags first, so the query's options cannot swallow them */
+export const argvFor = (db, repo, q) => ['--db', db, '--repo', repo, '--local', '--json', ...q];
+
 /** one query on one file → { exit, json, text }; text (stdout + stderr, db path replaced) only when stdout is not JSON */
 export function runQuery(db, repo, argv) {
   return new Promise((done) => {
-    execFile(BRAIN, [...argv, '--db', db, '--repo', repo, '--local', '--json'], { env: { ...childEnv(), NO_COLOR: '1' }, maxBuffer: 1 << 30, timeout: 300_000 },
+    execFile(BRAIN, argvFor(db, repo, argv), { env: { ...childEnv(), NO_COLOR: '1' }, maxBuffer: 1 << 30, timeout: 300_000 },
       (err, stdout, stderr) => {
         const exit = err ? (typeof err.code === 'number' ? err.code : String(err.signal ?? err.code)) : 0;
         let json = null;
@@ -90,6 +105,9 @@ export function runQuery(db, repo, argv) {
 
 /** @returns {Promise<{ summary: {same, order, differs}, results: object[] }>} results in query order */
 export async function parity({ a, b, repo, queries, jobs = 4 }) {
+  const bad = queries.map(badQuery).findIndex(Boolean);
+  if (bad >= 0) throw new Error(`query #${bad}: ${badQuery(queries[bad])}`);
+  if (!Number.isInteger(jobs) || jobs < 1 || jobs > 64) throw new Error(`jobs must be 1..64, not ${jobs}`);
   const results = new Array(queries.length);
   let next = 0;
   const worker = async () => {
@@ -98,7 +116,7 @@ export async function parity({ a, b, repo, queries, jobs = 4 }) {
       results[i] = { query: queries[i], exit: ra.exit, ...compare(ra, rb) };
     }
   };
-  await Promise.all(Array.from({ length: Math.max(1, jobs) }, worker));
+  await Promise.all(Array.from({ length: jobs }, worker));
   const summary = { same: 0, order: 0, differs: 0 };
   for (const r of results) summary[r.class]++;
   return { summary, results };
@@ -111,19 +129,27 @@ async function main() {
       out: { type: 'string' }, jobs: { type: 'string' } } }).values;
     for (const k of ['a', 'b', 'repo', 'queries']) if (!opt[k]) throw new Error(`--${k} is required`);
     for (const k of ['a', 'b', 'repo', 'queries']) if (!existsSync(opt[k])) throw new Error(`--${k}: no such file`);
+    if (opt.jobs !== undefined && !/^[1-9]\d?$/.test(opt.jobs)) throw new Error('--jobs must be 1..64');
+    const { readerUrl, ENV_FILE } = await import('../../src/store/server.mjs');
+    if (readerUrl({}, ENV_FILE)) throw new Error(`${ENV_FILE} names a BRAIN_READER_URL: the CLI would cut its secrets out of the outputs compared; move it away first`);
   } catch (e) {
     console.error(`parity: ${e.message}\nusage: node test/pg/parity.mjs --a <code.db> --b <brain.db> --repo <checkout> --queries <file.json> [--out <file.json>] [--jobs N]`);
     process.exit(2);
   }
   let queries = null;
   try { queries = JSON.parse(readFileSync(opt.queries, 'utf8')); } catch { /* reported below */ }
-  if (!Array.isArray(queries) || !queries.every((q) => Array.isArray(q) && q.length && q.every((x) => typeof x === 'string'))) {
-    console.error('parity: --queries must be a JSON array of string arrays'); process.exit(2);
+  const bad = Array.isArray(queries) ? queries.map(badQuery).findIndex(Boolean) : -1;
+  if (!Array.isArray(queries) || bad >= 0) {
+    console.error(`parity: --queries must be a JSON array of queries${bad >= 0 ? `; #${bad}: ${badQuery(queries[bad])}` : ''}`); process.exit(2);
   }
+  if (Number(opt.jobs ?? 4) > 64) { console.error('parity: --jobs must be 1..64'); process.exit(2); }
   const a = resolve(opt.a), b = resolve(opt.b), repo = resolve(opt.repo);
   const t0 = Date.now();
   const r = await parity({ a, b, repo, queries, jobs: Number(opt.jobs ?? 4) });
-  if (opt.out) writeFileSync(opt.out, JSON.stringify({ a, b, repo, at: new Date().toISOString(), ms: Date.now() - t0, ...r }, null, 1), { mode: 0o600 });
+  if (opt.out) {
+    writeFileSync(opt.out, JSON.stringify({ a, b, repo, at: new Date().toISOString(), ms: Date.now() - t0, ...r }, null, 1), { mode: 0o600 });
+    chmodSync(opt.out, 0o600);                                             // an existing file keeps its mode otherwise
+  }
   console.log(`parity: ${queries.length} queries: ${r.summary.same} same, ${r.summary.order} order only, ${r.summary.differs} differ`);
   r.results.forEach((x, i) => { if (x.class !== 'same') console.log(`  #${i} ${x.class}${x.diffs ? ` at ${x.diffs.map((d) => d.path).join(', ')}` : ''}`); });
   process.exit(r.summary.differs ? 1 : 0);
