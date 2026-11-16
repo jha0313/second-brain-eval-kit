@@ -9,7 +9,8 @@
 // Stages (contract CI_STAGES). Each prints `brain-stage <stage> <start|ok|fail> <ISO time>` (test/pg/slo.mjs reads them):
 //   prepare   the source commit, the binding's repo id, this run's created_at      no attempt yet: nothing is recorded
 //   record    beginAttempt (R1, R2). A5: shouldSkip -> the attempt ends 'skipped', exit 0
-//   mirror    pullMirror of the base run (R3); a cached mirror that does not match its run is pulled again in full (F2)
+//   mirror    pullMirror of the base run (R3); a cached mirror that does not match its run is pulled again in full (F2).
+//             Limit: CI_LIMITS mirror with a cached mirror, mirrorCold without one (a full pull)
 //   build     child `brain build`  } CI_LIMITS per stage: SIGTERM to its process group at the limit, SIGKILL CI_KILL_GRACE_MS
 //             later; a process the child started that outlives it gets the same.
 //   sync      child `brain sync`   } sync gets --request-timeout and --max-rate-wait from CI_LIMITS and GH_TOKEN
@@ -250,7 +251,10 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
       let pullUrl = url;
       if (is('mirror:connect')) { const u = new URL(url); u.hostname = '127.0.0.1'; u.port = '9'; u.password = ''; pullUrl = u.href; }
       let m;
-      try { m = await withLimit('mirror', limitOf('mirror'), () => pullMirror({ url: pullUrl, dir: cache, run: base.run, shapes: SHAPES, log: say })); }
+      const cached = existsSync(join(cache, MIRROR_DB)) && existsSync(githubDbPath(join(cache, MIRROR_DB)));   // as pullMirror reads it
+      const ms = faultMs && fault.stage === 'mirror' ? faultMs : limits[cached ? 'mirror' : 'mirrorCold'];
+      say(`mirror: ${cached ? 'a cached mirror' : 'no cached mirror (a full pull)'}: limit ${ms / 1000}s`);
+      try { m = await withLimit('mirror', ms, () => pullMirror({ url: pullUrl, dir: cache, run: base.run, shapes: SHAPES, log: say })); }
       catch (e) { throw e instanceof StageFail ? e : new StageFail('mirror', kindOf(e), `the mirror of run ${base.run} could not be pulled (${kindOf(e)})`); }
       const state = snapshot({ codeDb: m.codeDb, githubDb: m.githubDb, manifest: C.validateManifest(FULL) });
       if (state.run !== base.run || C.canonicalJson(C.checksum(state)) !== C.canonicalJson(base.checksum)) {

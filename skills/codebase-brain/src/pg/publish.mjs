@@ -240,7 +240,8 @@ async function openCounts(c) {
  */
 function descends(repoDir, older, newer) {
   try {
-    execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', older, newer], { stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+    execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', older, newer], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL',
+      env: { PATH: process.env.PATH, HOME: process.env.HOME } });   // a stuck git ends as not-descendant (nothing written)
     return true;
   } catch { return false; }
 }

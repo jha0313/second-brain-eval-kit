@@ -136,13 +136,17 @@ exec '${realGit}' "$@"
     execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', msg], { cwd: fx.repo });
     return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: fx.repo, encoding: 'utf8' }).trim();
   };
-  for (const [n, rel, text, pull] of [[2, 'docs/step-two.md', '# Step two\n\nRefunds wait for the ledger.\n', 'mirror already at run 1'],
-    [3, 'src/lib/step-three.ts', 'export function stepThree(n: number) { return n + 3; }\n', 'mirror run 2 \\(full\\)']]) {
+  // a cached mirror gets CI_LIMITS mirror (60 s); none (the cache evicted: a full pull) gets mirrorCold (300 s)
+  for (const [n, rel, text, pull, limit] of [[2, 'docs/step-two.md', '# Step two\n\nRefunds wait for the ledger.\n', 'mirror already at run 1',
+    'mirror: a cached mirror: limit 60s'],
+  [3, 'src/lib/step-three.ts', 'export function stepThree(n: number) { return n + 3; }\n', 'mirror run 2 \\(full\\)',
+    'mirror: no cached mirror \\(a full pull\\): limit 300s']]) {
     const sha = commit(rel, text, `step ${n}: add ${rel}`);
     if (n === 3) rmSync(cache, { recursive: true, force: true });  // the Actions cache was evicted
     const next = drive();
     assert.equal(next.status, 0, next.out);
     assert.match(next.out, new RegExp(pull));
+    assert.match(next.out, new RegExp(limit));
     assert.match(next.out, new RegExp(`mirror: run ${n - 1}, checksum matches`));
     assert.match(next.out, new RegExp(`published run ${n}\\b`));
     assert.match(next.out, new RegExp(`mirror run ${n - 1} -> ${n} \\(delta\\)`), 'verify moved the cache to the new run');
