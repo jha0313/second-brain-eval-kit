@@ -590,6 +590,12 @@ export const REFRESH_LIMITS = Object.freeze({
   httpMaxMs: 20_000,         // F8: AbortSignal.timeout(min(left, 20s))
   extraDispatchMax: 1,       // F7
 });
+/**
+ * The reader client (src/store/server.mjs connectReader): a connect ends after connectMs, a query after queryMs, a
+ * little after the role's statement_timeout (sql/002_roles.sql). A stalled socket then ends in the client itself,
+ * not on the CLI's timer alone.
+ */
+export const READER_LIMITS = Object.freeze({ statementTimeout: '15s', connectMs: 10_000, queryMs: 20_000 });
 /** Output lines (stdout, one line). runId may be null before the run id is known. */
 export const REFRESH_MESSAGES = Object.freeze({
   fresh: 'fresh',

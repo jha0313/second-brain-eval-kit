@@ -12,12 +12,14 @@ import { spawn, execFileSync } from 'node:child_process';
 import { copyFileSync, cpSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, symlinkSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { useBranch, neonSkip } from './harness.mjs';
 import { writeRun } from './write-run.mjs';
 import { buildStores, goldenState } from './golden/build-golden.mjs';
 import { githubDbPath } from '../../src/gh-schema.mjs';
-import { readerUrl, secretsOf, ensureMirror, mirrorDir } from '../../src/store/server.mjs';
+import { readerUrl, secretsOf, ensureMirror, mirrorDir, connectReader } from '../../src/store/server.mjs';
+import { READER_LIMITS } from '../../src/pg/contract.mjs';
 import { pgStore } from '../../src/store/pg.mjs';
 import { holdLockInChild, killChild } from '../phase1/helpers.mjs';
 
@@ -109,6 +111,32 @@ test('the reader URL: BRAIN_READER_URL from the environment, else from .env.loca
   assert.equal(readerUrl({}, file), u('file'));
   assert.equal(readerUrl({ BRAIN_READER_URL: u('env') }, file), u('env'));
   assert.equal(readerUrl({}, join(work, 'missing')), null);
+});
+
+test('the reader client ends a stalled connect and a stalled query itself (READER_LIMITS; options pass through)', async () => {
+  assert.match(readFileSync(join(KIT, 'sql', '002_roles.sql'), 'utf8'), new RegExp(`ALTER ROLE brain_reader SET statement_timeout = '${READER_LIMITS.statementTimeout}'`));
+  assert.ok(READER_LIMITS.queryMs > Number.parseInt(READER_LIMITS.statementTimeout, 10) * 1000);    // the server ends a query first
+  // a server that takes the connection and never answers; one that answers the startup (AuthenticationOk,
+  // ReadyForQuery) and then no query
+  const socks = new Set();
+  const serve = (startup) => new Promise((res) => {
+    const srv = net.createServer((s) => { socks.add(s); s.once('data', () => { if (startup) s.write(Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0, 0x5a, 0, 0, 0, 5, 0x49])); }); });
+    srv.listen(0, '127.0.0.1', () => res(srv));
+  });
+  const servers = [];
+  // a watchdog: a connect that never ends fails the test instead of hanging it
+  const within = (pr, ms) => { let t; return Promise.race([pr, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`still pending after ${ms} ms`)), ms); })]).finally(() => clearTimeout(t)); };
+  try {
+    servers.push(await serve(false), await serve(true));
+    for (const [srv, opt] of [[servers[0], { connectionTimeoutMillis: 300 }], [servers[1], { query_timeout: 300 }]]) {
+      // ssl: false whatever PGSSLMODE says (the fake servers speak no TLS)
+      await assert.rejects(within(connectReader(`postgresql://brain_reader:${'pw'}x@127.0.0.1:${srv.address().port}/db`, { origin: null, ssl: false, ...opt }), 5000),
+        (e) => { assert.equal(e.code, 'server', e.message); assert.match(e.message, /timeout/i); return true; });
+    }
+  } finally {
+    for (const s of socks) s.destroy();
+    for (const srv of servers) srv.close();
+  }
 });
 
 test('the reader password is cut from every output before any input is checked; a short one is refused', async () => {
