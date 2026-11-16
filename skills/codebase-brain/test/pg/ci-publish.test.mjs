@@ -122,8 +122,9 @@ exec '${realGit}' "$@"
   assert.deepEqual(leaksIn(reg, text.join('\n'), { folded: true }), []);
 
   const calls = [...new Set(readFileSync(join(spy, 'git'), 'utf8').trim().split('\n'))].sort();
-  assert.deepEqual(calls, ['build writer= source= gh= actions=', 'other writer= source= gh= actions=', 'sync writer= source= gh=1 actions='],
-    'no git call sees the writer URL or the Actions token; build and ci-publish see no token; sync sees only the read token');
+  // Phase 1 strips GH_* / GITHUB_* / BRAIN_* from every git env it builds (plan A29), so sync's git sees no token either
+  assert.deepEqual(calls, ['build writer= source= gh= actions=', 'other writer= source= gh= actions=', 'sync writer= source= gh= actions='],
+    'no git call sees the writer URL, the Actions token or the read token');
   assert.equal(existsSync(join(spy, 'ts-loaded')), false, "build never loaded the source repo's typescript");
 
   // 3. two runs with a base: new commits on main. verify left the cache at run 1, so run 2 finds it there; the cache is
