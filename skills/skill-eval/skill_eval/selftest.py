@@ -34,6 +34,8 @@ def _passes(args: dict, recall: float, precision: float) -> bool:
 
 
 def _cite(src: dict) -> str:
+    if "ptr" in src:
+        return src["ptr"]
     if "commit" in src:
         return f"commit {src['commit'][:8]}"
     return src["path"] + (f":{src['lines'][0]}-{src['lines'][1]}" if src.get("lines") else "")

@@ -7,6 +7,9 @@ A fresh folder is not a security boundary, so a trial gets several layers (probe
 - run settings: bundled skills off, disableAllHooks, auto-memory off, sandbox on, Read/Edit deny rules for
   answer keys, rubrics, skill sources, the token file and ~/.claude
 - an env allowlist: the child does not inherit this session's CLAUDE_CODE_* variables
+- no GitHub or git credential: GH_CONFIG_DIR is a new empty folder, git reads no global or system config (so no
+  credential helper such as osxkeychain), git and Git Credential Manager never prompt, and no GH_* / GITHUB_*
+  variable passes, not even from skill_env
 - the runner refuses a workspace whose parent folders hold CLAUDE.md, CLAUDE.local.md, AGENTS.md or .claude/
 Fallback "keychain" mode (no token file) uses the user's login without a clean config dir. It is for
 development only; results record which mode ran.
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -27,6 +31,9 @@ BUNDLED_SKILLS = [
     "workflow-authoring",
 ]
 ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR")   # USER: keychain needs it
+GH_ENV_RE = re.compile(r"^(?:GH|GITHUB)_")
+NO_GIT_CREDENTIALS = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+                      "GCM_INTERACTIVE": "never"}
 TOKEN_FILE = Path(os.environ.get("SKILL_EVAL_TOKEN_FILE", Path.home() / ".config" / "skill-eval" / "oauth-token"))
 INSTRUCTION_FILES = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".claude")
 # Keys that would change what a trial can see or do if an auto-synced file in the empty config dir carried them
@@ -77,12 +84,14 @@ def claude_cmd(prompt: str, *, model: str, settings: dict, tools: str, max_turns
 
 
 class TrialEnv:
-    """Environment for one child process: allowlisted variables, a fresh config dir, the token if present."""
+    """Environment for one child process: allowlisted variables, a fresh config dir, the token if present, and no
+    GitHub or git credential (a fresh empty GH_CONFIG_DIR, NO_GIT_CREDENTIALS, no GH_* / GITHUB_* variable)."""
 
     def __init__(self, extra: dict | None = None, config_dir: Path | None = None):
         self.extra = extra or {}
         self.fixture = config_dir                  # the probe's positive control passes a canary config dir
         self.dir: Path | None = None
+        self.gh_dir: Path | None = None
         self.config_keys: dict[str, list[str]] = {}   # files Claude Code wrote into the config dir -> key names
 
     def __enter__(self) -> dict:
@@ -94,6 +103,9 @@ class TrialEnv:
             env["CLAUDE_CONFIG_DIR"] = str(self.fixture or self.dir)
             env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
         env.update(self.extra)
+        env = {k: v for k, v in env.items() if not GH_ENV_RE.match(k)}   # extra (skill_env) may not add any either
+        self.gh_dir = Path(tempfile.mkdtemp(prefix="skill-eval-gh-"))
+        env.update(NO_GIT_CREDENTIALS, GH_CONFIG_DIR=str(self.gh_dir))    # last: extra cannot override them
         return env
 
     def __exit__(self, *exc):
@@ -102,6 +114,8 @@ class TrialEnv:
             self.config_keys = config_file_keys(d)
         if self.dir:
             shutil.rmtree(self.dir, ignore_errors=True)
+        if self.gh_dir:
+            shutil.rmtree(self.gh_dir, ignore_errors=True)
 
 
 def config_file_keys(d: Path) -> dict[str, list[str]]:

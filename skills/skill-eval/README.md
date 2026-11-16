@@ -47,6 +47,15 @@
   - 비교마다 검출력 한 줄: 이 케이스 수로 80% 확률로 검출할 수 있는 차이의 어림값과, Δ 0.05를 잡는 데 필요한 가족 수.
   - 판정 문장("차이를 검출하지 못함")은 그대로입니다.
 
+## Phase 1(GitHub 기억) eval을 위한 변경
+
+자세한 형식은 [SKILL.md](SKILL.md)에 있습니다. 이 기능을 쓰지 않는 suite는 전과 같이 채점됩니다(채점 버전 grading-v2 그대로).
+
+- **arm별 prepare 출력.** arm에 `outputs`·`env`를 쓰면 그 arm만 그 파일을 받고, 그 arm만 그 환경변수를 받습니다. prepare는 스킬 arm마다 `SKILL_DIR_<ARM>`을 받습니다. arm별 복사본 해시는 `meta.index.arm_files`에 남고, 복사본마다 빌드한 파일과 해시를 맞춰 봅니다.
+- **GitHub 증거 채점.** 정답 출처에 `{"ptr": "pr:123"}`를 쓸 수 있습니다. `#123`·`PR #123`·`pull/123`·URL·앵커처럼 같은 항목을 가리키는 형식을 모두 맞다고 봅니다. suite의 `github_evidence`(동결 코퍼스의 유효 포인터 색인)가 있으면 색인에 없는 GitHub 인용은 없는 파일처럼 잘못된 인용입니다.
+- **자격 증명 격리.** trial에는 빈 `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`가 들어가고, `GH_*`·`GITHUB_*` 변수는 넘어가지 않습니다. probe가 같은 env에서 `gh auth token`·`git credential fill`·env 변수 이름을 확인합니다(24개 항목).
+- **안전 케이스.** `canary`·`expose_marker`가 있는 케이스는 노출·시도·위반을 세고, 성공률 평균과 비교에서 빼고 따로 보고합니다.
+
 ## 테스트
 
 ```bash

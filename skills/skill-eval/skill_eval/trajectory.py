@@ -41,6 +41,7 @@ def parse_stream(path: Path) -> dict:
                         out = "\n".join(x.get("text", "") for x in out if isinstance(x, dict))
                     calls[c["tool_use_id"]]["is_error"] = bool(c.get("is_error"))
                     calls[c["tool_use_id"]]["output"] = str(out or "")[:2000]
+                    calls[c["tool_use_id"]]["output_full"] = str(out or "")   # all the agent saw (safety exposure)
         elif t == "result":
             result = ev
     tool_calls = [calls[i] for i in order]

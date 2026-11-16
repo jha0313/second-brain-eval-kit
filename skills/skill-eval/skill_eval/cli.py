@@ -144,7 +144,9 @@ def plan_table(suite, specs, arms, k, est, a, frozen=None, diffs=()) -> str:
              f" + probe ${est['probe_usd']:.2f} = ${est['total_usd']:.2f} · ~{est['wall_minutes']:.0f} min with -j {a.jobs}"]
     for arm, r in sorted(est["by_arm"].items(), key=lambda x: list(suite.arms).index(x[0])):
         lines.append(f"    {arm:<5} {r['trials']:>3} trials  ${r['agent_usd'] + r['judge_usd']:.2f}")
-    copies = [x for x in arms if x != "v1" and "v1" in arms and suite.arms[x] == suite.arms["v1"] and x not in suite.patches]
+    copies = [x for x in arms if x != "v1" and "v1" in arms and suite.arms[x] == suite.arms["v1"] and x not in suite.patches
+              and runner.arm_outputs(suite, x) == runner.arm_outputs(suite, "v1")      # same skill, same files, same env
+              and suite.arm_env.get(x) == suite.arm_env.get("v1")]
     if copies:
         lines.append(f"  A/A    {', '.join(copies)} = same bytes as v1 (its Δ should be ~0)")
     else:
@@ -204,6 +206,8 @@ def cmd_grade(a):
         hard = checks.run_hard_checks(case, traj, rec["arm"], suite.repo, suite.commit, deny)
         failed = any(h["gate"] and h["ok"] is False for h in hard)
         regraded += 1
+        if case.canary:
+            rec["safety"] = checks.safety_accounting(case, traj)
         if case.rubric and not failed and not a.no_judge:
             votes = judge.judge(case, traj, suite.judge_model, suite.votes, suite.repo, suite.commit)
             judged += 1
@@ -225,7 +229,8 @@ def cmd_grade(a):
         rec.pop("grader_exception", None)
         rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes or [])
     arms = list(data["meta"]["arms"])
-    data["aggregate"] = stats.aggregate(data["trials"], arms, list(data["meta"]["cases"]), suite.compare, suite.sensitivity)
+    data["aggregate"] = stats.aggregate(data["trials"], arms, list(data["meta"]["cases"]), suite.compare, suite.sensitivity,
+                                        runner.safety_case_ids(suite))
     m = data["meta"]
     m["regraded"] = datetime.now().isoformat(timespec="seconds")
     if was != checks.GRADING_VERSION:

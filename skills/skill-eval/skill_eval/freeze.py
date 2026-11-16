@@ -63,6 +63,7 @@ def manifest(suite) -> dict:
         "case_ids": [c.id for c in suite.cases],
         "families": {c.id: c.family for c in suite.cases},
         "keys": {Path(k).name: _sha(Path(k)) for k in keys},
+        "github_evidence": _sha(suite.github_evidence) if suite.github_evidence else None,   # absent = null: old freezes match
         "patches": {a: _sha(p) for a, p in suite.patches.items()},
         "v2_plan": _sha(plan) if plan.exists() else None,
         "extracts_plan": _sha(suite.dir / "preregistered-extracts.md") if (suite.dir / "preregistered-extracts.md").exists() else None,
