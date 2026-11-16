@@ -24,6 +24,7 @@ import { fixtureBuilds } from './fixture-builds.mjs';
 import { pullMirror } from '../../src/pg/mirror.mjs';
 import { failAttempt } from '../../src/pg/publish.mjs';
 import { commitProxy } from './commit-proxy.mjs';
+import { SLEEPER } from '../../src/pg/ci-publish.mjs';
 import { OWNER, REPO, REPO_ID, NOW, canaries, githubSecretCorpus, replayRoutes, writeReplay, setupRepo } from '../security/lib.mjs';
 import { spawn, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -149,8 +150,13 @@ export function dumpDiff(a, b, n = 3) {
 
 /**
  * Run a suite's scenarios on one branch. ctx = { branch, suite: <the suite's own state>, baseline } is passed to every
- * step. @param {{ name: string, setup?: (ctx) => Promise<void>, prepare: (ctx) => Promise<void>, clean: (ctx) => Promise<void>,
- *   scenarios: { name: string, fault: (ctx) => Promise<void>, after?: (ctx) => Promise<void> }[] }} suite
+ * step. Each scenario: fresh schema -> prepare -> arrange -> fault -> after (default: the suite's clean) -> the
+ * normalized dump must equal the baseline. A scenario marked `unchanged` (a failure that must write nothing but its
+ * attempt row) must also leave the raw dump (ids kept) exactly as arrange left it: a partial write that the clean run
+ * would later make look right still fails.
+ * @param {{ name: string, setup?: (ctx) => Promise<void>, prepare: (ctx) => Promise<void>, clean: (ctx) => Promise<void>,
+ *   scenarios: { name: string, unchanged?: boolean, arrange?: (ctx) => Promise<void>, fault: (ctx) => Promise<void>,
+ *     after?: (ctx) => Promise<void> }[] }} suite
  * @returns {Promise<{ name: string, ok: boolean, detail: string }[]>}
  */
 export async function runSuite(suite, { branch, only = null, log = (s) => console.log(s) }) {
@@ -170,7 +176,14 @@ export async function runSuite(suite, { branch, only = null, log = (s) => consol
     try {
       await resetSchema(branch);
       await suite.prepare(ctx);
+      await s.arrange?.(ctx);
+      const before = s.unchanged ? (await normalizedDump(branch)).raw : null;
       await s.fault(ctx);
+      if (before !== null) {
+        const mid = (await normalizedDump(branch)).raw;
+        const d = dumpDiff(before.split('\n'), mid.split('\n'));
+        if (d.gone || d.extra) throw new Error(`dump differs after the fault: ${d.gone} rows gone, ${d.extra} extra (it must write nothing)\n${d.sample.map((l) => `    ${l.slice(0, 240)}`).join('\n')}`);
+      }
       await (s.after ?? suite.clean)(ctx);
       const got = await normalizedDump(branch);
       const d = dumpDiff(ctx.baseline.lines, got.lines);
@@ -247,7 +260,6 @@ globalThis.fetch = async (u, o) => {
   if (/^https:\\/\\/api\\.github\\.com\\/repos\\/[^/]+\\/[^/]+$/.test(s)) return new Response(JSON.stringify({ id }), { status: 200 });
   return real(u, o);
 };`);
-const SLEEPER = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);';   // ci-publish's build:sleep child
 let ghaRun = 80_000;
 
 function ciFixture() {
@@ -312,9 +324,10 @@ function ciRuns() {
 }
 const none = async () => {};                                       // the fault run itself is the clean run
 
-/** A run at B with `fault` exits 1 and records attempt (stage, error). */
+/** A run at B with `fault` exits 1, records attempt (stage, error) and writes nothing else. */
 const failsAt = (name, fault, stage, error, { faultMs = null, check = null } = {}) => ({
   name,
+  unchanged: true,
   fault: async (ctx) => {
     const r = await ciRun(ctx, { sha: ctx.suite.fx.b, fault, faultMs });
     assert.equal(r.status, 1, r.out.slice(-2000));
@@ -340,7 +353,7 @@ export const CI_FAULTS = {
     failsAt('F3-build-fail', 'build:fail', 'build', 'build:exit'),
     failsAt('F3-T3-build-sleep', 'build:sleep', 'build', 'build:timeout', { faultMs: 2000, check: (r) => {
       assert.match(r.out, /build: over the 2s limit: SIGTERM/);
-      assert.match(r.out, /build: still running 10s later: SIGKILL/);     // the child ignores SIGTERM
+      assert.match(r.out, /build: still running 10s later: SIGKILL/);   // the build exits on SIGTERM; what it started does not
       assert.ok(r.ms < 2000 + 10_000 + 15_000, `the supervisor ended the build in time (${r.ms} ms)`);
       assert.equal(leftoverSleepers(), 0, 'no build child is left');
     } }),
@@ -351,7 +364,7 @@ export const CI_FAULTS = {
     failsAt('F7-after-items', 'publish:after-items', 'publish', 'publish:fault'),
     failsAt('F7-after-sync-state', 'publish:after-sync-state', 'publish', 'publish:fault'),
     failsAt('F7-after-attempt-ok', 'publish:after-attempt-ok', 'publish', 'publish:fault'),
-    { name: 'F8-kill-in-transaction', fault: async (ctx) => {          // the server drops the transaction; nothing records it
+    { name: 'F8-kill-in-transaction', unchanged: true, fault: async (ctx) => {          // the server drops the transaction; nothing records it
       const r = await ciRun(ctx, { sha: ctx.suite.fx.b, fault: 'publish:kill' });
       assert.equal(r.signal, 'SIGKILL', r.out.slice(-2000));
       assert.deepEqual(await lastAttempt(ctx), { status: 'running', stage: null, error: null });   // shown as abandoned
@@ -387,7 +400,7 @@ export const CI_FAULTS = {
       } finally { hold?.release(); await proxy.close(); }
     } },
     failsAt('F12-transaction-timeout', 'publish:sleep', 'publish', 'publish:timeout', { faultMs: 3000 }),
-    { name: 'F13-cancel-sigterm', fault: async (ctx) => {             // the job is cancelled while build hangs
+    { name: 'F13-cancel-sigterm', unchanged: true, fault: async (ctx) => {             // the job is cancelled while build hangs
       const r = await ciRun(ctx, { sha: ctx.suite.fx.b, fault: 'build:sleep', faultMs: 600_000,
         onLine: (l, p) => { if (/^brain-stage build start/.test(l)) setTimeout(() => p.kill('SIGTERM'), 1000); } });
       assert.equal(r.status, 1, r.out.slice(-2000));
@@ -396,6 +409,17 @@ export const CI_FAULTS = {
       assert.deepEqual(await lastAttempt(ctx), { status: 'failed', stage: 'build', error: 'build:signal' });
       await sleep(500);
       assert.equal(leftoverSleepers(), 0, 'the build child was killed with the job');
+    } },
+    { name: 'F13b-cancel-in-verify', after: none, fault: async (ctx) => {   // cancelled after COMMIT: a verify failure, exit 3
+      const r = await ciRun(ctx, { sha: ctx.suite.fx.b, onLine: (l, p) => {
+        if (/^brain-stage verify start/.test(l)) { p.kill('SIGSTOP'); p.kill('SIGTERM'); p.kill('SIGCONT'); }   // before verify ends
+      } });
+      assert.equal(r.status, 3, r.out.slice(-2000));
+      assert.match(r.out, /ci-publish: SIGTERM in stage verify: stopping/);
+      assert.match(r.out, /ci-publish: run 2 is committed, but verify did not finish/);
+      assert.doesNotMatch(r.out, /verified: the latest run/);
+      assert.deepEqual(await lastAttempt(ctx), { status: 'ok', stage: null, error: null });
+      assert.equal(await runCount(ctx), 2);
     } },
     { name: 'F14-kill-after-commit', after: none, fault: async (ctx) => {   // committed; verify never ran
       const r = await ciRun(ctx, { sha: ctx.suite.fx.b, fault: 'verify:kill' });
@@ -428,10 +452,10 @@ export const CI_FAULTS = {
  * it was either way, and the attempt row tells which way A5 went. T on the server is the replay's Date (NOW).
  */
 const later = (iso, h) => new Date(Date.parse(iso) + h * 3600e3).toISOString().replace(/\.\d+Z$/, 'Z');
-const a5 = (name, { env = {}, args = [], skip, before = null }) => ({
+const a5 = (name, { env = {}, args = [], skip }) => ({
   name,
+  unchanged: true,                                                   // a skip writes only its attempt row; so does a mirror failure
   fault: async (ctx) => {
-    await before?.(ctx);
     const r = await ciRun(ctx, { sha: ctx.suite.fx.b, fault: 'mirror:connect', args, env: { BRAIN_TEST_CREATED_AT: later(NOW, -1), ...env } });
     if (skip) {
       assert.equal(r.status, 0, r.out.slice(-2000));
@@ -458,7 +482,7 @@ export const CI_A5 = {
     a5('P22a-T-before-created-at', { skip: false, env: { BRAIN_TEST_CREATED_AT: later(NOW, 1) } }),
     a5('P22-created-at-unknown', { skip: false, env: { BRAIN_TEST_CREATED_AT: '' } }),
     a5('P22b-run-attempt-2', { skip: false, env: { GHA_RUN_ATTEMPT: '2' } }),
-    { ...a5('P22c-tool-version', { skip: false, before: setTool('other') }), after: setTool(null) },
+    { ...a5('P22c-tool-version', { skip: false }), arrange: setTool('other'), after: setTool(null) },
     a5('P22d-bootstrap', { skip: false, args: ['--mode', 'bootstrap'] }),
     a5('P22-full', { skip: false, args: ['--full'] }),
   ],

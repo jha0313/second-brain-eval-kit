@@ -326,6 +326,31 @@ it('V23: after a force-push a normal publish is refused; bootstrap goes through 
   await assert.rejects(publish(args(late, p, fx.s4, { mode: 'bootstrap' })), (e) => e.code === 'stale-base' && e.kind === 'base-moved');
 });
 
+it('S2: an abort while the publish connection opens writes nothing and records nothing (code aborted)', SLOW, async () => {
+  await branch.reset();
+  const r1 = await pub(null, fx.s1);
+  const before = await dump();
+  const a = await begin(fx.s2.meta.commit);
+  const p = plan(r1.after, fx.s2, a);
+  const ac = new AbortController();
+  const done = publish(args(a, p, fx.s2, { signal: ac.signal, recordFailure: false }));
+  ac.abort();                                                         // publish is waiting for its connection now
+  await assert.rejects(done, (e) => e.code === 'aborted' && e.recorded === false);
+  assert.equal(await dump(), before);
+  assert.deepEqual(await attempt(a.attemptId), { status: 'running', stage: null, error: null });
+});
+
+it('S2: the client deadline follows statement_timeout: a 46 s statement under the bootstrap limits commits', { timeout: 300_000 }, async () => {
+  await branch.reset();
+  const r1 = await pub(null, fx.s1);
+  const a = await begin(fx.s2.meta.commit);
+  const p = plan(r1.after, fx.s2, a);
+  const slow = async (s, { client }) => { if (s === 'locked') await client.query('SELECT pg_sleep(46)'); };   // over the old fixed 45 s
+  const r = await publish(args(a, p, fx.s2, { mode: 'bootstrap', limits: C.CI_LIMITS.bootstrap, onStage: slow }));
+  assert.ok(r.run > r1.run);
+  assert.deepEqual(await attempt(a.attemptId), { status: 'ok', stage: null, error: null });
+});
+
 test('input and connection failures are BrainErrors that echo no value (no server needed)', { timeout: 120_000 }, async () => {
   const fx0 = fixtureBuilds(), pw = ['pw', 'xyzzy', '0451'].join('-');
   const delta = diff(null, fx0.s1), checksum = C.checksum(applyDelta(null, delta));

@@ -68,6 +68,8 @@ async function close(c) {
   kill(c);
 }
 function kill(c) { try { c.connection.stream.destroy(); } catch { /* already gone */ } }
+/** '30s' -> 30000 (a duration publish's limits validated) */
+const durationMs = (d) => { const [, n, u] = /^([1-9][0-9]*)(ms|s|min)$/.exec(d); return Number(n) * { ms: 1, s: 1000, min: 60_000 }[u]; };
 
 /**
  * R1–R2: one short transaction. Checks (and, when brain.binding is empty, writes) the binding, inserts the attempt
@@ -259,9 +261,10 @@ function descends(repoDir, older, newer) {
  *   checksum: contract.checksum(applyDelta(base state, delta)); commit: the source commit (= delta.meta.commit and the
  *   attempt's source_sha); repoDir: the source checkout (git ancestry, normal mode); onStage: hook awaited after each
  *   stage ('locked', 'run', 'nodes', 'items', 'facts', 'counts', 'ok') with the transaction's client; limits: default
- *   transaction_timeout 60s (10min for the first publish), statement_timeout 30s, lock_timeout 15s; recordFailure:
- *   false leaves every failure unrecorded (recorded = false) for the caller; signal: abort destroys the socket (the
- *   server rolls back) and throws code 'aborted' without resolving or recording
+ *   transaction_timeout 60s (10min for the first publish), statement_timeout 30s, lock_timeout 15s (each query's
+ *   client deadline is statement_timeout + 15 s); recordFailure: false leaves every failure unrecorded (recorded =
+ *   false) for the caller; signal: abort destroys the socket (the server rolls back) and throws code 'aborted' without
+ *   resolving or recording
  * @returns {Promise<{ run: number }>}
  */
 export async function publish({ url, attemptId, base, delta, checksum, mode, commit, toolVersion, repoDir, onStage = null,
@@ -287,7 +290,7 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
   const record = (st, kind) => (recordFailure ? failAttempt({ url, attemptId, stage: st, error: kind }).then((r) => r.updated, () => false) : false);
   if (signal?.aborted) fail('aborted', 'publish', 'aborted before the publish connection');
   let c;
-  try { c = await connect(url, { queryTimeout: 45_000 }); } catch (e) {          // statement_timeout 30 s + margin
+  try { c = await connect(url, { queryTimeout: durationMs(lim.statementTimeout) + 15_000 }); } catch (e) {   // statement_timeout + margin
     const kind = errorKind(e);
     fail('publish-failed', 'connect', `could not connect to the server (${kind}): nothing was written`, { kind, recorded: await record('connect', kind) });
   }
@@ -296,6 +299,7 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
   signal?.addEventListener('abort', abort, { once: true });
   let committing = false;
   try {
+    if (signal?.aborted) fail('aborted', 'publish', 'aborted while the publish connection opened');   // the catch drops it
     await c.query(`SET transaction_timeout = '${lim.txTimeout}'`);
     await c.query('BEGIN');
     await c.query(`SET LOCAL statement_timeout = '${lim.statementTimeout}'`);

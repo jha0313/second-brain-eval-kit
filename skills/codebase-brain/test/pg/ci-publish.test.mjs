@@ -37,6 +37,18 @@ after(async () => { await owner?.end().catch(() => {}); await branch?.drop(); })
 
 const rows = async (text, params) => (await owner.query(text, params)).rows;
 
+test('usage errors exit 2 before anything starts: a flag without its value, a missing env (no server needed)', () => {
+  const env = { PATH: process.env.PATH, HOME: process.env.HOME };
+  for (const [argv, out] of [[['--source', '.', '--mirror', 'm', '--mode'], /ci-publish: usage: ERR_PARSE_ARGS_INVALID_OPTION_VALUE/],
+    [['--source', '.', '--mirror', 'm', '--bogus'], /ci-publish: usage: ERR_PARSE_ARGS_UNKNOWN_OPTION/],
+    [['--source', '.', '--mirror', 'm'], /ci-publish: usage: missing or bad BRAIN_WRITER_URL/]]) {
+    const r = spawnSync(process.execPath, [DRIVER, ...argv], { env, encoding: 'utf8' });
+    assert.equal(r.status, 2, `${argv.join(' ')}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, out);
+    assert.doesNotMatch(r.stderr, /at .*\.mjs:\d+/, 'no stack trace');
+  }
+});
+
 // the budget covers the harness's slot wait (up to 15 min while two other suites hold the slots) and then the runs
 it('ci-publish: recorded early failures, a first publish with no credential in any child, two runs on a base, V22', { timeout: 1_500_000 }, async () => {
   await ready();

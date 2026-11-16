@@ -1,7 +1,7 @@
 // S6: the fault runner (test/pg/faults.mjs). Offline: the multiset diff and the volatile-path drop. On one Neon branch:
 // the round trip (raw ids change, the normalized dump does not) passes, and each wrong outcome fails (an extra run, a
-// scenario that burns no id, a wrong stored checksum hash in the latest or an older run, a role or database setting left
-// behind), so a passing F-scenario means something.
+// scenario that burns no id, a wrong stored checksum hash in the latest or an older run, an `unchanged` scenario that
+// wrote rows the clean run then covers, a role or database setting left behind), so a passing F-scenario means something.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { neonSkip, createBranch } from './harness.mjs';
@@ -51,14 +51,18 @@ test('the round trip passes; each wrong outcome fails: an extra run, no burned i
           UPDATE brain.run SET checksum = jsonb_set(checksum, '{meta,sha256}', '"0"') WHERE run_id = (SELECT min(run_id) FROM brain.run);
           ALTER TABLE brain.run ENABLE TRIGGER refuse;`);
       } },
+      // a failure that wrote rows the clean run then makes look right: the final dump equals the baseline, but the
+      // dump right after the fault does not equal the one before it
+      { name: 'wrote-then-clean', unchanged: true, fault: async (ctx) => { await ROUNDTRIP.clean(ctx); }, after: async () => {} },
     ] };
     const bad = await runSuite(changed, { branch, log: quiet });
     assert.deepEqual(bad.map((r) => [r.name, r.ok]), [['extra-run', false], ['no-burn', false], ['bad-hash', false],
-      ['old-bad-hash', false]], 'none may compare equal');
+      ['old-bad-hash', false], ['wrote-then-clean', false]], 'none may compare equal');
     assert.match(bad[0].detail, /dump differs: \d+ rows gone, \d+ extra/);
     assert.match(bad[1].detail, /the raw dump did not change: the scenario proves nothing/);
     assert.match(bad[2].detail, /checksum/i);
     assert.match(bad[3].detail, /checksum/i);
+    assert.match(bad[4].detail, /dump differs after the fault: \d+ rows gone, \d+ extra \(it must write nothing\)/);
     // state outside the brain schemas survives resetSchema: a scenario that leaves it fails. One suite per leak, each
     // undone before the next, so neither passes on the other's leftover.
     for (const [name, set, reset] of [['leak', "ALTER ROLE brain_writer SET work_mem = '8MB'", 'ALTER ROLE brain_writer RESET work_mem'],

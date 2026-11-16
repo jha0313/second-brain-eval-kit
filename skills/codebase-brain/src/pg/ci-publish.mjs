@@ -9,7 +9,8 @@
 //   prepare   the source commit, the binding's repo id, this run's created_at      no attempt yet: nothing is recorded
 //   record    beginAttempt (R1, R2). A5: shouldSkip -> the attempt ends 'skipped', exit 0
 //   mirror    pullMirror of the base run (R3); a cached mirror that does not match its run is pulled again in full (F2)
-//   build     child `brain build`  } CI_LIMITS per stage: SIGTERM at the limit, SIGKILL CI_KILL_GRACE_MS later.
+//   build     child `brain build`  } CI_LIMITS per stage: SIGTERM to its process group at the limit, SIGKILL CI_KILL_GRACE_MS
+//             later; a process the child started that outlives it gets the same.
 //   sync      child `brain sync`   } sync gets --request-timeout and --max-rate-wait from CI_LIMITS and GH_TOKEN
 //   outbound  snapshot, diff, the upload check (R16)
 //   publish   one transaction (R9–R13) with the CI_LIMITS timeouts; a lost COMMIT is resolved under the lock (R12)
@@ -18,18 +19,19 @@
 // In-process stages (record, mirror, verify) are bounded by a deadline; publish by the server's timeouts.
 // Every failure after record is written as attempt.stage = the stage and attempt.error = `<stage>:<kind>` (contract
 // ciError), never free text. Exit codes: contract CI_EXIT. Children see no credential (only sync gets the source token, as
-// GH_TOKEN) and run with BRAIN_TYPESCRIPT=kit. SIGINT / SIGTERM: kill the child, destroy the publish socket (the server
-// rolls back), try failAttempt within CI_SIGNAL_CLEANUP_MS, exit 1. Every printed line is masked (R16).
+// GH_TOKEN) and run with BRAIN_TYPESCRIPT=kit. SIGINT / SIGTERM: kill the child's group, destroy the publish socket (the
+// server rolls back), try failAttempt within CI_SIGNAL_CLEANUP_MS, exit 1 (3 once COMMIT has returned, 4 while it is in
+// flight). Every printed line is masked (R16).
 // Fault injection (A6): BRAIN_FAULT=<stage>:<point> (contract FAULT_POINTS) with BRAIN_FAULT_ALLOW=1 fails the real code
 // path at that point. BRAIN_FAULT_LIMIT_MS (read only when a fault is set) shortens the faulted stage's limit for tests.
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { parseArgs } from 'node:util';
+import { parseArgs, promisify } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import * as C from './contract.mjs';
 import { snapshot, diff, applyDelta, checkOutbound } from './snapshot.mjs';
@@ -45,6 +47,9 @@ const SHAPES = ['code', 'github'];
 const API = 'https://api.github.com';
 // what a child process (and git) never sees
 const SECRET = /^(BRAIN_WRITER_URL|BRAIN_READER_URL|BRAIN_SOURCE_TOKEN|BRAIN_DISPATCH_TOKEN|GH_TOKEN|GITHUB_TOKEN|DATABASE_URL.*|ACTIONS_.*)$/;
+// build:sleep (T3): a build that hangs and exits on SIGTERM, but leaves a process that ignores it, its pipes closed
+export const SLEEPER = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);';
+const HANG = `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(SLEEPER)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`;
 const CONNECT_ERRORS = new Set(['econnrefused', 'econnreset', 'etimedout', 'ehostunreach', 'enetunreach', 'enotfound', 'eai_again', 'epipe']);
 
 /** The stage event line (test/pg/slo.mjs parses it). */
@@ -75,7 +80,7 @@ export function kindOf(e) {
   const code = String(e?.sqlstate ?? e?.kind ?? e?.code ?? '').toLowerCase();
   if (['57014', '25p04', '55p03'].includes(code) || /transaction timeout/i.test(e?.message ?? '')) return 'timeout';
   if (CONNECT_ERRORS.has(code) || /^08/.test(code) || /connection terminated/i.test(e?.message ?? '')) return 'connect';
-  if (/^[0-9a-z]{5}$/.test(code)) return 'sql';
+  if (/^[0-9a-z]{5}$/.test(code) && code !== 'error') return 'sql';   // 'error': publish.mjs's fallback, not a SQLSTATE
   return 'internal';
 }
 
@@ -127,27 +132,31 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
   const is = (point) => fault !== null && `${fault.stage}:${fault.point}` === point;
   if (fault) say(`ci-publish: fault injection ${fault.stage}:${fault.point}${faultMs ? ` (limit ${faultMs} ms)` : ''}`);
 
-  // ---- signals: kill the child, drop the publish socket, record within CI_SIGNAL_CLEANUP_MS, exit 1 ----
+  // ---- signals: kill the child, drop the publish socket, record within CI_SIGNAL_CLEANUP_MS, exit ----
+  // phase: 'committing' from the attempt-ok UPDATE until COMMIT returns, then 'committed' (the run is in)
   const abort = new AbortController();
-  let current = 'prepare', attemptId = null, child = null, stopping = null;
-  const killChild = (sig) => { if (child) { try { process.kill(-child.pid, sig); } catch { /* gone */ } } };
+  let current = 'prepare', attemptId = null, group = null, stopping = null, phase = 'writing', run = null;
+  const killChild = (sig) => { if (group) { try { process.kill(-group, sig); } catch { /* gone */ } } };
   const onSignal = (sig) => {
     stopping ??= (async () => {
       say(`ci-publish: ${sig} in stage ${current}: stopping`);
       say(stageLine(current, 'fail'));
       abort.abort();
       killChild('SIGTERM');
-      if (attemptId !== null) {
+      if (phase === 'committed') say(`ci-publish: run ${run} is committed, but verify did not finish: the next refresh checks the server`);
+      else if (attemptId !== null) {
         const r = await Promise.race([
           failAttempt({ url, attemptId, stage: current, error: C.ciError(current, 'signal') }).then((x) => (x.updated ? 'recorded' : 'the attempt was no longer running'), () => 'not recorded'),
           sleep(C.CI_SIGNAL_CLEANUP_MS).then(() => 'not recorded in time')]);
         say(`ci-publish: failure ${r}`);
       }
       killChild('SIGKILL');
-      process.exit(C.CI_EXIT.failed);
+      // after COMMIT the data is in (as a verify failure); during COMMIT the outcome is unknown (R12)
+      process.exit(phase === 'committed' ? C.CI_EXIT.verifyFailed : phase === 'committing' ? C.CI_EXIT.outcomeUnknown : C.CI_EXIT.failed);
     })();
   };
   process.on('SIGINT', onSignal).on('SIGTERM', onSignal);
+  const end = (code) => (stopping ? new Promise(() => {}) : code);  // after a signal its handler exits, with its own code
 
   // a stage: its events, its name for failure records and signals
   const stage = async (name, fn) => {
@@ -155,25 +164,32 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
     say(stageLine(name, 'start'));
     try { const v = await fn(); say(stageLine(name, 'ok')); return v; } catch (e) { say(stageLine(name, 'fail')); throw e; }
   };
-  const git = (args) => execFileSync('git', args, { env: childEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const git = async (args) => (await promisify(execFile)('git', args, { env: childEnv, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', signal: abort.signal })).stdout.trim();
   const runChild = (name, cmd, args, { cwd, extra = {}, limitMs, classify = () => 'exit' }) => new Promise((done, failed) => {
     const p = spawn(cmd, args, { cwd, env: { ...childEnv, BRAIN_TYPESCRIPT: 'kit', ...extra }, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
-    child = p;
+    group = p.pid;                                                   // detached: the child leads its own process group
     const lines = [];
     for (const out of [p.stdout, p.stderr]) createInterface({ input: out }).on('line', (l) => { lines.push(l); say(`  ${name}: ${l}`); });
-    let timedOut = false, term = null, kill = null;
-    if (limitMs) {
-      term = setTimeout(() => {
-        timedOut = true;
-        say(`${name}: over the ${limitMs / 1000}s limit: SIGTERM`);
-        killChild('SIGTERM');
-        kill = setTimeout(() => { say(`${name}: still running ${C.CI_KILL_GRACE_MS / 1000}s later: SIGKILL`); killChild('SIGKILL'); }, C.CI_KILL_GRACE_MS);
-      }, limitMs);
-    }
-    const end = () => { clearTimeout(term); clearTimeout(kill); child = null; };
-    p.on('error', (e) => { end(); failed(new StageFail(name, 'exit', `${name} could not start (${e.code ?? 'error'})`)); });
-    p.on('close', (code, signal) => {
-      end();
+    const left = () => { try { process.kill(-p.pid, 0); return true; } catch { return false; } };   // any process of the group
+    let timedOut = false, termAt = null, kill = null;
+    const term = () => {                                             // SIGTERM to the group, SIGKILL to what is left after the grace
+      if (termAt !== null) return;
+      termAt = Date.now();
+      killChild('SIGTERM');
+      kill = setTimeout(() => { if (left()) { say(`${name}: still running ${C.CI_KILL_GRACE_MS / 1000}s later: SIGKILL`); killChild('SIGKILL'); } }, C.CI_KILL_GRACE_MS);
+    };
+    const limit = limitMs ? setTimeout(() => { timedOut = true; say(`${name}: over the ${limitMs / 1000}s limit: SIGTERM`); term(); }, limitMs) : null;
+    p.on('error', (e) => { clearTimeout(limit); clearTimeout(kill); group = null; failed(new StageFail(name, 'exit', `${name} could not start (${e.code ?? 'error'})`)); });
+    p.on('close', async (code, signal) => {
+      clearTimeout(limit);
+      // the child is gone; a process it started may not be (one that ignores SIGTERM and closed its pipes): end the group
+      if (left()) {
+        if (termAt === null) say(`${name}: ended, but processes it started still run: SIGTERM`);
+        term();
+        while (left() && Date.now() - termAt < C.CI_KILL_GRACE_MS + 5000) await sleep(100);
+      }
+      clearTimeout(kill);
+      group = null;
       if (timedOut) failed(new StageFail(name, 'timeout', `${name} ran over its ${limitMs / 1000}s limit`));
       else if (code === 0) done(lines);
       else if (signal) failed(new StageFail(name, 'signal', `${name} ended by ${signal}`));
@@ -190,7 +206,7 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
     const src = resolve(source), cache = resolve(mirrorDir);
     const prep = await stage('prepare', async () => {
       let sourceSha;
-      try { sourceSha = git(['-C', src, 'rev-parse', 'HEAD']); } catch { throw new StageFail('prepare', 'internal', 'the source checkout has no HEAD'); }
+      try { sourceSha = await git(['-C', src, 'rev-parse', 'HEAD']); } catch { throw new StageFail('prepare', 'internal', 'the source checkout has no HEAD'); }
       // owner/repo/.github/workflows/brain-publish.yml@refs/heads/main -> .github/workflows/brain-publish.yml
       const workflow = env.GITHUB_WORKFLOW_REF.slice(env.GITHUB_REPOSITORY.length + 1).replace(/@.*$/, '');
       const toolVersion = `codebase-brain@${JSON.parse(readFileSync(join(KIT, 'package.json'), 'utf8')).version}`;
@@ -217,7 +233,7 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
       runCreatedAt: prep.createdAt, latestTool: base.tool, tool: prep.toolVersion, latestSanitize: base.sanitize, sanitize: SANITIZE_VERSION })) {
       await skipAttempt({ url, attemptId });
       say(`attempt ${attemptId} skipped (A5): run ${base.run} already has this commit, this tool, and GitHub as of ${base.githubT}, after this run was created`);
-      return C.CI_EXIT.ok;
+      return end(C.CI_EXIT.ok);
     }
 
     // ---- mirror: the base state (R3) ----
@@ -243,8 +259,8 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
       mkdirSync(root, { recursive: true });
       const d = mkdtempSync(join(root, 'brain-ci-'));
       const codeDb = join(d, 'code.db');
-      if (is('build:sleep')) {                                       // a build that hangs and ignores SIGTERM (T3)
-        await runChild('build', process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { cwd: src, limitMs: limitOf('build') });
+      if (is('build:sleep')) {                                       // a build that hangs; a process it started ignores SIGTERM (T3)
+        await runChild('build', process.execPath, ['-e', HANG], { cwd: src, limitMs: limitOf('build') });
       }
       await runChild('build', BRAIN, ['build', is('build:fail') ? join(d, 'no-such-checkout') : '.', '--db', codeDb], { cwd: src, limitMs: limitOf('build') });
       return { d, codeDb };
@@ -277,20 +293,20 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
     });
 
     // ---- publish: one transaction ----
-    const tx = mode === 'bootstrap' || !base ? C.CI_LIMITS.bootstrap : C.CI_LIMITS.normal;
-    const txLimits = { txTimeout: is('publish:sleep') && faultMs ? `${faultMs}ms` : tx.txTimeout, statementTimeout: tx.statementTimeout, lockTimeout: tx.lockTimeout };
-    let run;
+    const txLimits = { txTimeout: is('publish:sleep') && faultMs ? `${faultMs}ms` : limits.txTimeout, statementTimeout: limits.statementTimeout, lockTimeout: limits.lockTimeout };
+    const hook = fault?.stage === 'publish' ? publishFault(fault.point, txLimits) : null;
     try {
       ({ run } = await stage('publish', () => publish({ url, attemptId, base: base?.run ?? null, delta: up.delta, checksum: up.checksum, mode,
         commit: prep.sourceSha, toolVersion: prep.toolVersion, repoDir: src, limits: txLimits, recordFailure: false, signal: abort.signal,
-        onStage: fault?.stage === 'publish' ? publishFault(fault.point, txLimits) : null })));
+        onStage: async (name, ctx) => { if (hook) await hook(name, ctx); if (name === 'ok') phase = 'committing'; } })));
     } catch (e) {
       if (e.code === 'outcome-unknown') {                            // R12: never written over
         say(`ci-publish: OUTCOME UNKNOWN (publish:${e.stage}): the COMMIT reply was lost; do not publish again until the next run resolves it`);
-        return C.CI_EXIT.outcomeUnknown;
+        return end(C.CI_EXIT.outcomeUnknown);
       }
       throw e instanceof StageFail ? e : new StageFail('publish', kindOf(e), e.message);
     }
+    phase = 'committed';
     say(`published run ${run}`);
     if (is('verify:kill')) process.kill(process.pid, 'SIGKILL');    // F14: after COMMIT, before verify
 
@@ -301,19 +317,20 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
         if (m.run !== run) throw new StageFail('verify', 'stale-base', `the latest run is ${m.run}, not ${run}`);
       });
     } catch (e) {
+      if (stopping) return end(C.CI_EXIT.verifyFailed);
       say(`ci-publish: run ${run} is committed, but verify failed (${kindOf(e)}): the next refresh checks the server`);
-      return C.CI_EXIT.verifyFailed;
+      return end(C.CI_EXIT.verifyFailed);
     }
     say(`verified: the latest run is ${run}; the mirror is at run ${run}`);
-    return C.CI_EXIT.ok;
+    return end(C.CI_EXIT.ok);
   } catch (e) {
-    if (stopping) return new Promise(() => {});                     // the signal handler ends the process
+    if (stopping) return end(C.CI_EXIT.failed);
     const st = e instanceof StageFail ? e.stage : current, kind = kindOf(e);
     say(`ci-publish: FAILED ${st}:${kind}: ${e.message}`);
     if (attemptId !== null) await record(st, kind);
-    return C.CI_EXIT.failed;
+    return end(C.CI_EXIT.failed);
   } finally {
-    process.off('SIGINT', onSignal).off('SIGTERM', onSignal);
+    if (!stopping) process.off('SIGINT', onSignal).off('SIGTERM', onSignal);   // a second signal during cleanup is ignored
   }
 }
 
@@ -354,7 +371,13 @@ function publishFault(point, limits) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const { values: o } = parseArgs({ options: { source: { type: 'string' }, mirror: { type: 'string' }, work: { type: 'string' },
-    full: { type: 'boolean', default: false }, mode: { type: 'string', default: 'normal' } } });
+  let o;
+  try {
+    ({ values: o } = parseArgs({ options: { source: { type: 'string' }, mirror: { type: 'string' }, work: { type: 'string' },
+      full: { type: 'boolean', default: false }, mode: { type: 'string', default: 'normal' } } }));
+  } catch (e) {
+    console.log(`ci-publish: usage: ${e.code ?? 'bad arguments'}: --source DIR --mirror DIR [--work DIR] [--full] [--mode normal|bootstrap]`);
+    process.exit(C.CI_EXIT.usage);
+  }
   ciPublish({ source: o.source, mirror: o.mirror, work: o.work ?? null, full: o.full, mode: o.mode }).then((code) => process.exit(code));
 }
