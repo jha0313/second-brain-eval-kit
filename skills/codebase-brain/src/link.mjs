@@ -6,14 +6,11 @@
 //   basename is unique, whether a route string is really a file path is decided at relink time.
 // - extraction never emits a target that isRedacted() (sanitize.mjs); such strings get no ref at all
 // - relink runs inside the caller's withWriteLock (build end, sync end). It opens github.db itself (read-write)
-//   and code.db read-only, and closes both in finally. No network. git grep only via execFile, no shell.
+//   and code.db read-only, and closes both in finally. No network. git only via execFile / spawn, no shell; tokens never go on a command line.
 // - relink resolves refs whose status is 'pending' or whose resolved_build differs from code.db meta.build_id
 // - resolved targets that point into code are repo paths taken from code.db (already sanitized), never raw grep text
 //   beyond "path:line"
-import { execFile } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { execFile, spawn } from 'node:child_process';
 import { openDb, getMeta, inTransaction } from './db.mjs';
 import { git, gitEnv } from './files.mjs';
 import { githubDbPath, openGithubDb } from './gh-schema.mjs';
@@ -28,7 +25,7 @@ import { isRedacted, sanitizeIdent } from './sanitize.mjs';
  *   state is 'merged' or merged_at is set: GitHub also gives open PRs a merge_commit_sha (a test merge).
  */
 
-export const BUDGET = { bytes: 16e6, ms: 20000 };
+export const BUDGET = { bytes: 2e9, ms: 20000 };   // token search: text bytes read from git, wall time
 const MAX_RESOLVED = 10;
 const BATCH = 500;
 
@@ -207,58 +204,105 @@ function commitTypes(repoDir, shas) {
   });
 }
 
-/**
- * One fixed-string git grep of the indexed commit for every token (tokens go in a file, never on the command line).
- * Output is read as it streams; a token found in more than MAX_RESOLVED files is decided ('too-many') at once.
- * @returns {Promise<{ files: Map<string, Map<string, string>>, open: Set<string>, over: boolean, failed: number|string|null }>}
- *   open: tokens not decided as too-many; over: the budget stopped git; failed: git's exit code or signal on an error
- */
-async function grepTokens(repoDir, commit, tokens, budget) {
-  const dir = mkdtempSync(join(tmpdir(), 'brain-relink-'));
-  try {
-    const list = join(dir, 'tokens');
-    writeFileSync(list, tokens.join('\n') + '\n', { mode: 0o600 });
-    const files = new Map(tokens.map((t) => [t, new Map()]));
-    const open = new Set(tokens);
-    const prefix = `${commit}:`;
-    let bytes = 0, rest = '', over = false, done = false;
-    // -z: "<commit>:<path>\0<line>\0<text>" with the path verbatim (no C-quoting of non-ASCII names, ':' safe)
-    const args = ['-C', repoDir, 'grep', '--no-color', '-n', '-z', '-I', '-F', '-f', list, commit, '--'];
-    const take = (line) => {
-      const a = line.indexOf('\0'), b = line.indexOf('\0', a + 1);
-      if (a < 0 || b < 0) return;
-      const head = line.slice(0, a), path = head.startsWith(prefix) ? head.slice(prefix.length) : head;
-      const no = line.slice(a + 1, b), text = line.slice(b + 1);
-      for (const t of open) {
-        if (!text.includes(t)) continue;
-        const f = files.get(t);
-        if (!f.has(path)) f.set(path, no);
-        if (f.size > MAX_RESOLVED) open.delete(t);
-      }
-    };
-    const failed = await new Promise((resolve) => {
-      const child = execFile('git', args, { encoding: 'utf8', maxBuffer: Infinity, env: gitEnv() }, (err) => {
-        clearTimeout(timer);
-        if (!err || over || done) return resolve(null);
-        resolve(err.code === 1 ? null : err.code ?? err.signal ?? 'error');      // exit 1: nothing matched
-      });
-      const timer = setTimeout(() => { over = true; child.kill(); }, budget.ms);
-      child.stdout.on('data', (chunk) => {
-        if (over || done) return;
-        const lines = (rest + chunk).split('\n');
-        rest = lines.pop();
-        for (const l of lines) take(l);
-        bytes += Buffer.byteLength(chunk);
-        if (bytes > budget.bytes) { over = true; child.kill(); }
-        else if (!open.size) { done = true; child.kill(); }                     // every token is too-many already
-      });
-    });
-    if (!over && !done && !failed && rest) take(rest);
-    return { files, open, over, failed };
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+// Token search: every token as a fixed byte string in every text blob of the indexed commit, in ONE pass (an
+// Aho–Corasick automaton). `git grep -F -f` tests each pattern on each line: 3,291 tokens on a 6,600-file repo took
+// 18 min, so the 20 s budget always ran out and the same refs stayed pending forever (plan A31). The answers are
+// those of `git grep -n -I -F`: the first matching line per file, files in tree order, and a blob with a NUL in its
+// first 8,000 bytes skipped as binary. Tokens never reach a command line or a shell; blobs come from cat-file.
+
+/** A full DFA over bytes: next[state * 256 + byte]; out[state] = indexes of the tokens that end there (or null). */
+function automaton(tokens) {
+  const kids = [new Map()], ends = [[]];
+  tokens.forEach((t, i) => {
+    let s = 0;
+    for (const b of Buffer.from(t, 'utf8')) {
+      let n = kids[s].get(b);
+      if (n === undefined) { n = kids.length; kids[s].set(b, n); kids.push(new Map()); ends.push([]); }
+      s = n;
+    }
+    ends[s].push(i);
+  });
+  const next = new Int32Array(kids.length * 256), fail = new Int32Array(kids.length), queue = [];
+  for (const [b, n] of kids[0]) { next[b] = n; queue.push(n); }                   // fail of a root child = root
+  for (let h = 0; h < queue.length; h++) {                                        // breadth first: fail[s] is done
+    const s = queue[h], f = fail[s];
+    ends[s] = ends[s].concat(ends[f]);
+    next.copyWithin(s * 256, f * 256, f * 256 + 256);
+    for (const [b, n] of kids[s]) { fail[n] = next[f * 256 + b]; next[s * 256 + b] = n; queue.push(n); }
+  }
+  return { next, out: ends.map((e) => (e.length ? e : null)) };
 }
 
-// a token git grep -f can take: 3–200 chars on one line (an empty or multi-line pattern changes what -f means)
+/** Stream the blobs through `git cat-file --batch`; each(blob, bytes) returns true to stop. @returns {Promise<null|number|string>} */
+function catBlobs(repoDir, blobs, each) {
+  return new Promise((resolve) => {
+    const child = spawn('git', ['-C', repoDir, 'cat-file', '--batch'], { env: gitEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
+    let chunks = [], have = 0, need = -1, i = 0, stopped = false;
+    const all = () => (chunks.length === 1 ? chunks[0] : (chunks = [Buffer.concat(chunks, have)])[0]);
+    child.stdout.on('data', (chunk) => {
+      if (stopped) return;
+      chunks.push(chunk); have += chunk.length;
+      for (;;) {
+        if (need < 0) {                                                           // "<sha> blob <size>\n" or "<sha> missing\n"
+          const buf = all(), nl = buf.indexOf(10);
+          if (nl < 0) return;
+          const head = buf.toString('latin1', 0, nl).split(' ');
+          chunks = [buf.subarray(nl + 1)]; have -= nl + 1;
+          if (head[1] === 'blob') need = Number(head[2]); else { i++; continue; }
+        }
+        if (have < need + 1) return;
+        const buf = all(), content = buf.subarray(0, need);
+        chunks = [buf.subarray(need + 1)]; have -= need + 1; need = -1;
+        if (each(blobs[i++], content)) { stopped = true; child.kill(); return; }
+      }
+    });
+    child.stdin.on('error', () => {});                                            // closed early when stopped
+    child.on('error', () => resolve('error'));
+    child.on('close', (code, signal) => resolve(stopped || code === 0 ? null : code ?? signal ?? 'error'));
+    child.stdin.end(blobs.map((b) => b.sha).join('\n') + '\n');
+  });
+}
+
+/**
+ * @returns {Promise<{ files: Map<string, Map<string, string>>, open: Set<string>, over: boolean, failed: number|string|null }>}
+ *   files: token -> path -> first line; open: tokens not decided as too-many (found in more than MAX_RESOLVED files);
+ *   over: the budget (text bytes read, ms) stopped the search; failed: git's exit code or signal on an error
+ */
+async function findTokens(repoDir, commit, tokens, budget) {
+  const files = new Map(tokens.map((t) => [t, new Map()]));
+  const open = new Set(tokens);
+  const { next, out } = automaton(tokens);
+  const blobs = git(repoDir, ['ls-tree', '-r', '-z', commit]).split('\0').filter(Boolean).map((l) => {
+    const tab = l.indexOf('\t'), [mode, type, sha] = l.slice(0, tab).split(' ');
+    return { mode, type, sha, path: l.slice(tab + 1) };
+  }).filter((b) => b.type === 'blob' && b.mode !== '120000');                     // no symlinks, no submodules
+  const started = Date.now();
+  let bytes = 0, over = false;
+  const failed = await catBlobs(repoDir, blobs, ({ path }, buf) => {
+    bytes += buf.length;
+    if (!buf.subarray(0, 8000).includes(0)) {                                     // -I: binary blobs are skipped
+      for (let k = 0, s = 0, line = 1; k < buf.length; k++) {
+        const b = buf[k];
+        if (b === 10) line++;
+        s = next[(s << 8) | b];
+        const hit = out[s];
+        if (hit === null) continue;
+        for (const t of hit) {
+          const tok = tokens[t];
+          if (!open.has(tok)) continue;
+          const f = files.get(tok);
+          if (!f.has(path)) { f.set(path, String(line)); if (f.size > MAX_RESOLVED) open.delete(tok); }
+        }
+      }
+    }
+    if (!open.size) return true;                                                  // every token is too-many already
+    if (bytes > budget.bytes || Date.now() - started > budget.ms) { over = true; return true; }
+    return false;
+  });
+  return { files, open, over, failed: over ? null : failed };
+}
+
+// a token the search takes: 3–200 chars on one line (shorter ones match nearly everything)
 const greppable = (t) => t.length >= 3 && t.length <= 200 && !/[\n\r\0]/.test(t);
 
 /**
@@ -279,7 +323,7 @@ export async function relink({ codeDbPath, repoDir, budget = BUDGET, log } = {})
       WHERE status = 'pending' OR resolved_build IS NOT ? OR (kind = 'item' AND reason = 'not-synced') ORDER BY rowid`).all(build);
     const verdicts = new Map();                                                 // refs rowid -> { status, reason, resolved }
     if (todo.length) {
-      // the files of the indexed commit (what git grep searches), not the checkout as it is now
+      // the files of the indexed commit (what the token search reads), not the checkout as it is now
       const tracked = git(repoDir, ['ls-tree', '-r', '-z', '--name-only', commit]).split('\0').filter(Boolean);
       const r = resolvers({ code, gh, tracked: tracked.map((p) => sanitizeIdent(p)) });
       const later = { commit: [], name: [], grep: [] };
@@ -319,9 +363,9 @@ export async function relink({ codeDbPath, repoDir, budget = BUDGET, log } = {})
       }
 
       const tokens = [...new Set(later.grep.map((x) => x.target).filter(greppable))];
-      const g = tokens.length ? await grepTokens(repoDir, commit, tokens, budget) : null;
-      if (g?.over) log?.(`  relink: git grep hit its budget (${budget.bytes} bytes, ${budget.ms} ms); the rest stays pending`);
-      if (g?.failed) log?.(`  relink: git grep failed (${g.failed}); its refs stay pending`);
+      const g = tokens.length ? await findTokens(repoDir, commit, tokens, budget) : null;
+      if (g?.over) log?.(`  relink: the token search hit its budget (${budget.bytes} bytes, ${budget.ms} ms); the rest stays pending`);
+      if (g?.failed) log?.(`  relink: the token search failed (git cat-file ${g.failed}); its refs stay pending`);
       for (const x of later.grep) {
         if (!greppable(x.target)) { verdicts.set(x.id, unlinked('no-match')); continue; }
         const hits = [...g.files.get(x.target)].map(([p, n]) => `${sanitizeIdent(p)}:${n}`);
