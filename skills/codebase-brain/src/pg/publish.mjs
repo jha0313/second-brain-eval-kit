@@ -10,11 +10,17 @@
 // back -> recorded failure, lock not acquired or no reply -> code 'outcome-unknown' (never written again). Every query
 // has a client deadline as well as the server's timeouts: a connection that stops answering cannot hang the job.
 //
-// Changes from the Q0 stub signatures (callers: ci/brain-publish.mjs now, Phase 3 S2 src/pg/ci-publish.mjs later):
+// Changes from the Q0 stub signatures (caller: src/pg/ci-publish.mjs, which replaced the Phase 2 driver ci/brain-publish.mjs):
 // - publish takes no meta, syncState or sanitizeVersion: they come from the delta (diff copies them from the new
 //   snapshot; commit must equal delta.meta.commit). New: repoDir (the source checkout, for git ancestry) and onStage (a
 //   test hook, awaited after each stage).
 // - beginAttempt, failAttempt and resolveAttempt keep the stub signatures.
+// Phase 3 S2 (src/pg/ci-publish.mjs) adds, all optional so Phase 2 callers are unchanged: beginAttempt's base also carries
+// the latest run's tool_version, sanitize_version and the server's GitHub T (A5); skipAttempt (A5); publish's limits
+// (transaction / statement / lock timeouts, CI_LIMITS), recordFailure: false (the caller records the failure as
+// `<stage>:<kind>`), signal (abort: the socket is destroyed, the server rolls back, nothing is resolved or recorded) and
+// onStage(name, { client }) with a last stage 'ok' after the attempt row turns ok, before COMMIT (fault points F7–F9);
+// failAttempt also stores the CI stage names and ciError strings.
 import pg from 'pg';
 import { execFileSync } from 'node:child_process';
 import { constants } from 'node:os';
@@ -29,22 +35,24 @@ const CODE_TABLES = ['node', 'item.repo', 'item.github', 'edge', 'unresolved', '
 // What attempt.stage and attempt.error may hold (R11, R16): the kinds below, a SQLSTATE, or an errno name. Anything else
 // is stored as 'other', so free text (and a secret in it) never reaches the server.
 const STAGES = new Set(['begin', 'mirror', 'build', 'sync', 'snapshot', 'outbound', 'input', 'connect', 'stale-base',
-  'sanitize', 'row-count', 'publish', 'commit']);
+  'sanitize', 'row-count', 'publish', 'commit', ...C.CI_STAGES]);
 const ERRORS = new Set([...[...STAGES].map((s) => `${s}-failed`), 'outbound-secret', 'contract', 'base-moved',
   'attempt-not-running', 'not-descendant', 'older', 'needs-full', 'not-resanitized', 'mismatch', 'delta-mismatch',
-  'wrong-commit', 'rolled-back', 'error', ...Object.keys(constants.errno).map((e) => e.toLowerCase()), 'enotfound', 'eai_again']);
+  'wrong-commit', 'rolled-back', 'error', ...Object.keys(constants.errno).map((e) => e.toLowerCase()), 'enotfound', 'eai_again',
+  ...C.CI_STAGES.flatMap((st) => C.CI_ERROR_KINDS.map((k) => `${st}:${k}`))]);
 const asKind = (s, known) => (typeof s === 'string' && (known.has(s) || (known === ERRORS && /^[0-9a-z]{5}$/.test(s))) ? s : 'other');
 const errorKind = (e) => asKind(String(e?.code ?? 'error').toLowerCase(), ERRORS);    // SQLSTATE or a socket error code
 
 const fail = (code, stage, msg, extra = {}) => { throw new BrainError(code, msg, { stage, recorded: false, ...extra }); };
 
 /**
- * A sleeping Neon compute wakes on the first connection (§6.5): retry after 1, 2, 4, 8 s, 30 s in all. A wrong password
- * or database (SQLSTATE class 28, 3D) is not retried. queryTimeout: the client deadline of every query on it.
+ * A sleeping Neon compute wakes on the first connection (§6.5): retry after CI_CONNECT_BACKOFF_MS (1, 2, 4, 8 s), 30 s in
+ * all. A wrong password or database (SQLSTATE class 28, 3D) is not retried. queryTimeout: the client deadline of every
+ * query on it.
  */
 async function connect(url, { queryTimeout }) {
   const until = Date.now() + 30_000;
-  for (const wait of [1000, 2000, 4000, 8000, null]) {
+  for (const wait of [...C.CI_CONNECT_BACKOFF_MS, null]) {
     const c = new pg.Client({ connectionString: url, connectionTimeoutMillis: Math.max(1000, until - Date.now()), query_timeout: queryTimeout });
     c.on('error', () => {});                                       // a dropped socket surfaces on the next query
     try { await c.connect(); return c; } catch (e) {
@@ -60,6 +68,8 @@ async function close(c) {
   kill(c);
 }
 function kill(c) { try { c.connection.stream.destroy(); } catch { /* already gone */ } }
+/** '30s' -> 30000 (a duration publish's limits validated) */
+const durationMs = (d) => { const [, n, u] = /^([1-9][0-9]*)(ms|s|min)$/.exec(d); return Number(n) * { ms: 1, s: 1000, min: 60_000 }[u]; };
 
 /**
  * R1–R2: one short transaction. Checks (and, when brain.binding is empty, writes) the binding, inserts the attempt
@@ -67,7 +77,8 @@ function kill(c) { try { c.connection.stream.destroy(); } catch { /* already gon
  * on the unique constraint. A binding with another source repo id refuses (code 'binding-mismatch', nothing written).
  * @param {{ url: string, gha: { runId: number, attempt: number }, sourceSha: string,
  *   binding: { sourceRepoId: number, sourceRepo: string, opsRepo: string, workflow: string } }} opts
- * @returns {Promise<{ attemptId: number, base: null | { run: number, commit: string, checksum: object } }>}
+ * @returns {Promise<{ attemptId: number, base: null | { run: number, commit: string, checksum: object, tool: string,
+ *   sanitize: number, githubT: string|null } }>} githubT: the newest GitHub cursor T on the server (A5)
  */
 export async function beginAttempt({ url, gha, sourceSha, binding }) {
   if (!/^[0-9a-f]{40}$/.test(sourceSha ?? '')) fail('contract', 'begin', 'sourceSha must be a 40-hex commit');
@@ -82,15 +93,31 @@ export async function beginAttempt({ url, gha, sourceSha, binding }) {
     } else if (Number(bound.source_repo_id) !== binding.sourceRepoId) {
       fail('binding-mismatch', 'begin', 'this database belongs to another source repository: nothing was written');
     }
-    const latest = (await c.query('SELECT run_id, commit_sha, checksum FROM brain.run ORDER BY run_id DESC LIMIT 1')).rows[0];
+    const latest = (await c.query(`SELECT run_id, commit_sha, checksum, tool_version, sanitize_version,
+      (SELECT s.state->'row'->>'cursor' FROM brain.sync_state s WHERE s.source = 'github' ORDER BY s.run_id DESC LIMIT 1) AS github_t
+      FROM brain.run ORDER BY run_id DESC LIMIT 1`)).rows[0];
     const a = await c.query('INSERT INTO brain.attempt (gha_run_id, gha_attempt, source_sha, base_run) VALUES ($1, $2, $3, $4) RETURNING attempt_id',
       [gha.runId, gha.attempt, sourceSha, latest?.run_id ?? null]);
     await c.query('COMMIT');
     return { attemptId: Number(a.rows[0].attempt_id),
-      base: latest ? { run: Number(latest.run_id), commit: latest.commit_sha, checksum: latest.checksum } : null };
+      base: latest ? { run: Number(latest.run_id), commit: latest.commit_sha, checksum: latest.checksum, tool: latest.tool_version,
+        sanitize: latest.sanitize_version, githubT: latest.github_t ?? null } : null };
   } catch (e) {
     await c.query('ROLLBACK').catch(() => {});
     throw e;
+  } finally { await close(c); }
+}
+
+/**
+ * A5: end a running attempt as 'skipped' (a publish of the same commit, tool and GitHub window is already on the server).
+ * One statement; no publish of this attempt can be in flight. @returns {Promise<{ updated: boolean }>}
+ */
+export async function skipAttempt({ url, attemptId }) {
+  const c = await connect(url, { queryTimeout: 45_000 });
+  try {
+    await c.query("SET statement_timeout = '30s'");
+    const r = await c.query("UPDATE brain.attempt SET status = 'skipped', finished_at = now() WHERE attempt_id = $1 AND status = 'running'", [attemptId]);
+    return { updated: r.rowCount === 1 };
   } finally { await close(c); }
 }
 
@@ -213,7 +240,8 @@ async function openCounts(c) {
  */
 function descends(repoDir, older, newer) {
   try {
-    execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', older, newer], { stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+    execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', older, newer], { stdio: 'ignore', timeout: 30_000, killSignal: 'SIGKILL',
+      env: { PATH: process.env.PATH, HOME: process.env.HOME } });   // a stuck git ends as not-descendant (nothing written)
     return true;
   } catch { return false; }
 }
@@ -228,13 +256,22 @@ function descends(repoDir, older, newer) {
  * The run's meta, sanitize_version and sync_state come from the delta (diff copies them from the new snapshot).
  * @param {{ url: string, attemptId: number, base: number|null, delta: import('./contract.mjs').Delta,
  *   checksum: Record<string, { rows: number, sha256: string }>, mode: 'normal'|'bootstrap', commit: string,
- *   toolVersion: string, repoDir: string, onStage?: (stage: string) => unknown }} opts
+ *   toolVersion: string, repoDir: string, onStage?: (stage: string, ctx: { client: object }) => unknown,
+ *   limits?: { txTimeout: string, statementTimeout: string, lockTimeout: string }, recordFailure?: boolean,
+ *   signal?: AbortSignal }} opts
  *   checksum: contract.checksum(applyDelta(base state, delta)); commit: the source commit (= delta.meta.commit and the
- *   attempt's source_sha); repoDir: the source checkout (git ancestry, normal mode); onStage: test hook, awaited after
- *   each stage ('locked', 'run', 'nodes', 'items', 'facts', 'counts')
+ *   attempt's source_sha); repoDir: the source checkout (git ancestry, normal mode); onStage: hook awaited after each
+ *   stage ('locked', 'run', 'nodes', 'items', 'facts', 'counts', 'ok'; then 'committed' once COMMIT has returned or a
+ *   lost COMMIT resolved as ok, or 'rolled-back' once it resolved as not committed, each before any connection closes
+ *   and with its errors ignored) with the client; limits: default
+ *   transaction_timeout 60s (10min for the first publish), statement_timeout 30s, lock_timeout 15s (each query's
+ *   client deadline is statement_timeout + 15 s); recordFailure: false leaves every failure unrecorded (recorded =
+ *   false) for the caller; signal: abort destroys the socket (the server rolls back) and throws code 'aborted' without
+ *   resolving or recording
  * @returns {Promise<{ run: number }>}
  */
-export async function publish({ url, attemptId, base, delta, checksum, mode, commit, toolVersion, repoDir, onStage = null }) {
+export async function publish({ url, attemptId, base, delta, checksum, mode, commit, toolVersion, repoDir, onStage = null,
+  limits = null, recordFailure = true, signal = null }) {
   // before any connection (recorded = false: the caller runs failAttempt)
   C.validateManifest(delta.manifest);
   if (base !== null && !(Number.isSafeInteger(base) && base > 0)) fail('contract', 'input', 'base must be null or a run id');
@@ -246,22 +283,31 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
   for (const t of [...C.CHECKSUM_SHAPES.code, ...C.CHECKSUM_SHAPES.github]) {
     if (!Number.isInteger(checksum?.[t]?.rows)) fail('contract', 'input', `checksum has no ${t}`);
   }
+  const first = base === null;
+  const lim = limits ?? { txTimeout: first ? '10min' : '60s', statementTimeout: '30s', lockTimeout: '15s' };
+  for (const v of [lim.txTimeout, lim.statementTimeout, lim.lockTimeout]) {
+    if (!/^[1-9][0-9]*(ms|s|min)$/.test(v ?? '')) fail('contract', 'input', 'limits must be durations like 60s or 10min');
+  }
   try { checkOutbound(delta); } catch (e) { Object.assign(e, { stage: 'outbound', recorded: false }); throw e; }
 
-  const first = base === null;
-  const record = (st, kind) => failAttempt({ url, attemptId, stage: st, error: kind }).then((r) => r.updated, () => false);
+  const record = (st, kind) => (recordFailure ? failAttempt({ url, attemptId, stage: st, error: kind }).then((r) => r.updated, () => false) : false);
+  if (signal?.aborted) fail('aborted', 'publish', 'aborted before the publish connection');
   let c;
-  try { c = await connect(url, { queryTimeout: 45_000 }); } catch (e) {          // statement_timeout 30 s + margin
+  try { c = await connect(url, { queryTimeout: durationMs(lim.statementTimeout) + 15_000 }); } catch (e) {   // statement_timeout + margin
+    if (signal?.aborted) fail('aborted', 'publish', 'aborted while the publish connection opened');   // not recorded
     const kind = errorKind(e);
     fail('publish-failed', 'connect', `could not connect to the server (${kind}): nothing was written`, { kind, recorded: await record('connect', kind) });
   }
-  const stage = async (name) => { if (onStage) await onStage(name); };
+  const stage = async (name) => { if (onStage) await onStage(name, { client: c }); };
+  const abort = () => kill(c);                                     // the server sees the socket close and rolls back
+  signal?.addEventListener('abort', abort, { once: true });
   let committing = false;
   try {
-    await c.query(`SET transaction_timeout = '${first ? '10min' : '60s'}'`);
+    if (signal?.aborted) fail('aborted', 'publish', 'aborted while the publish connection opened');   // the catch drops it
+    await c.query(`SET transaction_timeout = '${lim.txTimeout}'`);
     await c.query('BEGIN');
-    await c.query("SET LOCAL statement_timeout = '30s'");
-    await c.query("SET LOCAL lock_timeout = '15s'");
+    await c.query(`SET LOCAL statement_timeout = '${lim.statementTimeout}'`);
+    await c.query(`SET LOCAL lock_timeout = '${lim.lockTimeout}'`);
     await c.query('SELECT pg_advisory_xact_lock($1)', [C.PUBLISH_LOCK_KEY]);
     await stage('locked');
     const latest = (await c.query('SELECT run_id, commit_sha, sanitize_version FROM brain.run ORDER BY run_id DESC LIMIT 1')).rows[0] ?? null;
@@ -302,16 +348,22 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
     await stage('counts');
     const ok = await c.query("UPDATE brain.attempt SET status = 'ok', finished_at = now() WHERE attempt_id = $1 AND status = 'running'", [attemptId]);
     if (ok.rowCount !== 1) fail('stale-base', 'stale-base', 'the attempt is no longer running', { kind: 'attempt-not-running' });
+    await stage('ok');
     committing = true;
     await c.query({ text: 'COMMIT', query_timeout: 15_000 });
+    await stage('committed').catch(() => {});                       // a hook cannot undo a commit
     return { run };
   } catch (e) {
+    if (signal?.aborted) {                                         // the caller is shutting down: it resolves and records
+      kill(c);
+      fail('aborted', committing ? 'commit' : 'publish', 'the publish was aborted', { kind: committing ? 'outcome-unknown' : 'aborted' });
+    }
     if (committing) {                                              // R12: the COMMIT reply is lost (or COMMIT failed)
       kill(c);
-      const r = await resolveAttempt({ url, attemptId });
+      const r = await resolveAttempt({ url, attemptId, onOutcome: (o) => stage(o === 'ok' ? 'committed' : 'rolled-back') });
       if (r.outcome === 'ok') return { run: r.run };
       if (r.outcome === 'rolled-back') {
-        fail('publish-failed', 'commit', 'the COMMIT did not happen: nothing was written', { recorded: await record('commit', 'rolled-back') });
+        fail('publish-failed', 'commit', 'the COMMIT did not happen: nothing was written', { kind: 'rolled-back', recorded: await record('commit', 'rolled-back') });
       }
       fail('outcome-unknown', 'commit', 'the COMMIT reply was lost and the outcome is unknown: do not publish again until it is resolved');
     }
@@ -322,7 +374,7 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
     const why = typeof e.message === 'string' && e.message.startsWith('brain.') ? `: ${e.message.slice(0, 200)}` : '';   // guard messages name tables only
     return fail('publish-failed', 'publish', `the publish transaction failed (${kind}${why}): nothing was written`,
       { kind, recorded: await record('publish', kind) });
-  } finally { await close(c); }
+  } finally { signal?.removeEventListener('abort', abort); await close(c); }
 }
 
 /**
@@ -351,11 +403,12 @@ export async function failAttempt({ url, attemptId, stage, error = null }) {
 /**
  * R12: after a lost COMMIT reply. New connection, the publish lock with lock_timeout 60s, then: a run row for the
  * attempt -> 'ok'; none -> 'rolled-back' (the caller then runs failAttempt). Lock not acquired, no connection or no answer
- * within the client deadline (75 s) -> 'unknown'. Never writes.
- * @param {{ url: string, attemptId: number }} opts
+ * within the client deadline (75 s) -> 'unknown'. Never writes. onOutcome('ok'|'rolled-back') is awaited as soon as the
+ * server has answered, before the lock is released and the connection closed; its errors are ignored.
+ * @param {{ url: string, attemptId: number, onOutcome?: (outcome: 'ok'|'rolled-back') => void }} opts
  * @returns {Promise<{ outcome: 'ok'|'rolled-back'|'unknown', run: number|null }>}
  */
-export async function resolveAttempt({ url, attemptId }) {
+export async function resolveAttempt({ url, attemptId, onOutcome = null }) {
   let c;
   try {
     c = await connect(url, { queryTimeout: 75_000 });
@@ -363,7 +416,9 @@ export async function resolveAttempt({ url, attemptId }) {
     await c.query("SET LOCAL lock_timeout = '60s'");
     await c.query('SELECT pg_advisory_xact_lock($1)', [C.PUBLISH_LOCK_KEY]);
     const r = (await c.query('SELECT run_id FROM brain.run WHERE attempt_id = $1', [attemptId])).rows[0];
-    return r ? { outcome: 'ok', run: Number(r.run_id) } : { outcome: 'rolled-back', run: null };
+    const out = r ? { outcome: 'ok', run: Number(r.run_id) } : { outcome: 'rolled-back', run: null };
+    try { await onOutcome?.(out.outcome); } catch { /* a hook cannot change the outcome */ }
+    return out;
   } catch { return { outcome: 'unknown', run: null }; }               // 55P03 lock_not_available, a timeout, a dead socket
   finally {
     if (c) {

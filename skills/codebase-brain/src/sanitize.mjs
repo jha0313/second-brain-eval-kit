@@ -156,6 +156,13 @@ export function sanitize(text) {
   return { ...m, suspicious: flagSuspicious(m.text) };
 }
 
+/**
+ * Detector only (Phase 2 R16, upload check): the secret kinds found in any string, nothing rewritten. The same rules as
+ * mask(), so the answer depends only on the text and SANITIZE_VERSION (bump it whenever a rule changes).
+ * @param {unknown} s @returns {string[]} kinds from SECRET_KINDS, empty when clean
+ */
+export function detectSecrets(s) { return [...new Set(mask(normalize(String(s ?? ''))).kinds)]; }
+
 /** One-line external value (login, branch, title, file path from GitHub): sanitize, then fold newlines to spaces. */
 export function sanitizeLine(s) { return sanitize(s).text.replace(/\n/g, ' '); }
 

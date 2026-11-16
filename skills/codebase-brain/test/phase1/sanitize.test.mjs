@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { SANITIZE_VERSION, SECRET_KINDS, normalize, mask, flagSuspicious, sanitize, sanitizeLine, sanitizeIdent, isRedacted, sweepSecrets }
+import { SANITIZE_VERSION, SECRET_KINDS, normalize, mask, flagSuspicious, sanitize, sanitizeLine, sanitizeIdent, isRedacted, sweepSecrets, detectSecrets }
   from '../../src/sanitize.mjs';
 import { createDb, inTransaction, setMeta } from '../../src/db.mjs';
 import { sections } from '../../src/index-knowledge.mjs';
@@ -307,4 +307,15 @@ test('build: canaries in a doc, a .ts file name, a symbol, an import spec, a com
   assert.ok(keyChunks.length >= 2 && keyChunks.some((ch) => ch.start_line === 41 && ch.body.startsWith('[REDACTED:private-key]')));
   assert.equal(db.prepare("SELECT count(*) AS n FROM chunks WHERE source = 'commit' AND body_line IS NOT NULL").get().n, 0);
   db.close();
+});
+
+
+test('integration: detectSecrets names the kinds in any string and rewrites nothing (Phase 2 upload check)', () => {
+  const gh = 'gh' + 'p_' + R('Dd4e', 9);
+  assert.deepEqual(detectSecrets(`import x from "./${gh}"`), ['github-token']);
+  assert.deepEqual(detectSecrets('src/lib/credits.ts#reserve'), []);
+  assert.deepEqual(detectSecrets(null), []);
+  assert.deepEqual(detectSecrets(`a ${gh} b ${gh}`), ['github-token']);           // kinds, once each
+  for (const k of SECRET_KINDS) assert.ok(typeof k === 'string');
+  assert.equal(detectSecrets(gh).length, mask(gh).kinds.length > 0 ? 1 : 0);      // the same rules as mask()
 });

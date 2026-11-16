@@ -86,7 +86,7 @@ brain why "how is IOBuf meant to be used?"     # 문서 1건뿐: 지식 공백
 5. Actions 탭에서 `brain-publish`를 `main`에서 수동으로 돌립니다. 첫 실행은 `full`을 켭니다. GitHub를 처음부터 전부 받으므로(PR 1,300개 repo에서 약 2,700 호출, rate limit에 따라 수십 분) `full`일 때만 job 상한이 330분이고, 평소에는 30분입니다. 첫 실행이 데이터베이스를 소스 repo의 숫자 id에 묶습니다(`brain.binding`). 그 뒤 다른 repo를 가리키는 실행은 아무것도 쓰지 않습니다(V22).
 6. sanitize 규칙이 바뀐 kit로 올린 뒤에도 한 번 `full`을 켜고 돌립니다(GitHub를 전부 다시 받아 새 규칙으로 정리, R15). 켜지 않으면 publish가 거부됩니다.
 
-publish 단계는 attempt 기록 → mirror 확인(R3) → `brain build` · `brain sync` → delta와 업로드 전 비밀 검사(R16) → 한 트랜잭션입니다. build와 sync는 자식 프로세스에서 돕니다. 자식에게는 `BRAIN_WRITER_URL`을 주지 않습니다. 소스 읽기 token은 sync만 `GH_TOKEN`으로 받습니다. 자식은 `BRAIN_TYPESCRIPT=kit`으로 kit의 TypeScript만 씁니다. 소스 repo에 들어 있는 `typescript`를 부르면 그 repo의 코드가 쓰기 비밀 옆에서 실행되기 때문입니다. 종료 코드: 0 성공, 1 실패(attempt에 단계와 종류가 남음, 데이터는 그대로), 2 COMMIT 결과를 모름(다시 돌리기 전에 확인).
+publish 단계는 attempt 기록 → mirror 확인(R3) → `brain build` · `brain sync` → delta와 업로드 전 비밀 검사(R16) → 한 트랜잭션입니다. build와 sync는 자식 프로세스에서 돕니다. 자식에게는 `BRAIN_WRITER_URL`을 주지 않습니다. 소스 읽기 token은 sync만 `GH_TOKEN`으로 받습니다. 자식은 `BRAIN_TYPESCRIPT=kit`으로 kit의 TypeScript만 씁니다. 소스 repo에 들어 있는 `typescript`를 부르면 그 repo의 코드가 쓰기 비밀 옆에서 실행되기 때문입니다. 종료 코드(contract `CI_EXIT`): 0 성공(A5로 건너뛴 run 포함), 1 실패(attempt에 단계와 `단계:종류`가 남음, 데이터는 그대로), 2 사용법 오류(시작 전, attempt 없음), 3 확인 실패(데이터는 커밋됨, attempt는 ok), 4 COMMIT 결과를 모름(다시 돌리기 전에 확인).
 
 **V22 확인 (sandbox).** 소스 repo의 아무 브랜치에 아래 workflow를 push하면 값이 비어 있어야 합니다. 소스 repo에는 쓰기 비밀이 없기 때문입니다.
 

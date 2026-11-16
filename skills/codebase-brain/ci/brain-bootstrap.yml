@@ -1,0 +1,110 @@
+# brain-bootstrap: a full publish with the bootstrap limits (Phase 3 design §6.1). Copy to
+# .github/workflows/brain-bootstrap.yml in the OPS repo next to brain-publish.yml, with the same BRAIN_SOURCE_REPO.
+# Use it for the first run, after a force-push of the source main (the base run is then not an ancestor, R9), and after
+# a sanitize_version bump (R15). It fetches all of GitHub: about 2,700 requests for a repo with 1,300 PRs.
+#
+# The gate: the dispatch token that agents hold can dispatch any workflow of this repo, so the first step stops the job
+# before it reaches the database unless the repo variable BRAIN_BOOTSTRAP_UNTIL (UTC) is later than now and at most
+# 2 hours ahead. Changing a variable needs Variables write, which the dispatch token does not have. An admin opens it:
+#   gh variable set BRAIN_BOOTSTRAP_UNTIL --repo <ops repo> --body 2026-01-01T13:00:00Z   # a UTC time at most 2 h ahead
+#   gh workflow run brain-bootstrap.yml --repo <ops repo> --ref main
+#   gh variable delete BRAIN_BOOTSTRAP_UNTIL --repo <ops repo>        # after the run's gate step has passed
+name: brain-bootstrap
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# the same group as brain-publish.yml: at most one writer runs at a time. A run that waits in the group is replaced
+# by a newer one (GitHub keeps one pending run per group); if a scheduled publish replaces this run, dispatch again.
+concurrency:
+  group: brain-publish
+  cancel-in-progress: false
+
+env:
+  BRAIN_SOURCE_REPO: your-org/your-service
+  BRAIN_DIR: skills/codebase-brain
+
+jobs:
+  bootstrap:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: bootstrap gate
+        timeout-minutes: 1
+        env:
+          UNTIL: ${{ vars.BRAIN_BOOTSTRAP_UNTIL }}
+        run: |
+          now=$(date -u +%s)
+          end=$(date -u -d "${UNTIL:-1970-01-01T00:00:00Z}" +%s) || { echo "bootstrap gate: BRAIN_BOOTSTRAP_UNTIL is not a date"; exit 1; }
+          if [ "$end" -gt "$now" ] && [ "$end" -le $((now + 7200)) ]; then
+            echo "bootstrap gate open until $UNTIL"
+          else
+            echo "bootstrap gate closed: BRAIN_BOOTSTRAP_UNTIL must be later than now and at most 2 hours ahead"
+            exit 1
+          fi
+
+      - name: check out the ops repo (the kit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+
+      # fetch-depth 0: the commit memory needs the history
+      - name: check out the source repo main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 2
+        with:
+          repository: ${{ env.BRAIN_SOURCE_REPO }}
+          ref: main
+          path: src-repo
+          fetch-depth: 0
+          token: ${{ secrets.BRAIN_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        timeout-minutes: 1
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ${{ env.BRAIN_DIR }}/package-lock.json
+
+      - name: install the kit
+        working-directory: ${{ env.BRAIN_DIR }}
+        timeout-minutes: 2
+        run: npm ci --ignore-scripts
+
+      - name: restore the mirror
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        timeout-minutes: 1
+        with:
+          path: .brain-mirror
+          key: brain-mirror-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: brain-mirror-
+
+      # bootstrap limits (CI_LIMITS.bootstrap): no sync limit and no rate-limit wait limit (one request is still 30s),
+      # transaction_timeout 10min, statement_timeout 5min; build stays 3 min. The descendant check is skipped
+      # (run.mode bootstrap); the lock and "latest run = base" checks stay. No A5 skip, so no GITHUB_TOKEN here.
+      - name: publish (bootstrap)
+        timeout-minutes: 350
+        env:
+          BRAIN_TYPESCRIPT: kit
+          BRAIN_WRITER_URL: ${{ secrets.BRAIN_WRITER_URL }}
+          BRAIN_SOURCE_TOKEN: ${{ secrets.BRAIN_SOURCE_TOKEN }}
+          GHA_RUN_ID: ${{ github.run_id }}
+          GHA_RUN_ATTEMPT: ${{ github.run_attempt }}
+          # a first run binds the database to a workflow, the one refresh dispatches: brain-publish, never this one
+          BRAIN_PUBLISH_WORKFLOW: .github/workflows/brain-publish.yml
+        # exec: GitHub sends the cancel signals to the step's own process; ci-publish must be that process (bin/brain execs node)
+        run: 'exec "$BRAIN_DIR/bin/brain" ci-publish --source src-repo --mirror .brain-mirror --full --mode bootstrap'
+
+      - name: save the mirror
+        if: success()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        timeout-minutes: 1
+        with:
+          path: .brain-mirror
+          key: brain-mirror-${{ github.run_id }}-${{ github.run_attempt }}
