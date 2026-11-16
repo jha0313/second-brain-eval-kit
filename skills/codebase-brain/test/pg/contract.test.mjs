@@ -216,3 +216,35 @@ test('the DDL checks the same publish lock key; lane stubs throw NotImplementedE
   }
   assert.deepEqual([...C.STORE_METHODS], ['candidates', 'get', 'thread', 'refs', 'source', 'resolveAsOf', 'close']);
 });
+
+test('Phase 3 S0: staleness, footer phrases, attempt display, refresh and ci-publish constants, faults', async () => {
+  const c = await import('../../src/pg/contract.mjs');
+  const s = (code, memory) => ({ code: { state: code }, memory: { state: memory } });
+  for (const code of c.CODE_STATES) for (const memory of c.MEMORY_STATES)
+    assert.equal(c.needsRefresh(s(code, memory)), ['behind', 'differs'].includes(code) || ['old', 'never'].includes(memory), `${code}/${memory}`);
+  assert.equal(c.FOOTER_PHRASES.code.behind(3), '3 commits behind main');
+  assert.equal(c.FOOTER_PHRASES.memory.old('27h'), 'github as of 27h ago (stale)');
+  for (const t of c.REFRESH_TRIGGERS) assert.ok([c.FOOTER_PHRASES.code.behind(2), c.FOOTER_PHRASES.code.differs,
+    c.FOOTER_PHRASES.memory.old('1h'), c.FOOTER_PHRASES.memory.never].some((p) => p.includes(t)), t);
+  assert.equal(c.attemptDisplay({ db: null, actions: 'queued' }), 'queued');
+  assert.equal(c.attemptDisplay({ db: null, actions: 'cancelled' }), 'failed before start');
+  assert.equal(c.attemptDisplay({ db: 'running', actions: 'in_progress' }), 'running');
+  assert.equal(c.attemptDisplay({ db: 'running', actions: 'completed_failure' }), 'abandoned');
+  assert.equal(c.attemptDisplay({ db: 'running', actions: 'unknown', startedAtMs: 0, nowMs: 31 * 60_000 }), 'abandoned?');
+  assert.equal(c.attemptDisplay({ db: 'running', actions: 'unknown', startedAtMs: 0, nowMs: 29 * 60_000 }), 'running?');
+  assert.equal(c.attemptDisplay({ db: 'ok', actions: 'completed_failure' }), 'ok');
+  assert.equal(c.attemptDisplay({ db: 'running', actions: 'in_progress', commitUnconfirmed: true }), 'outcome unknown');
+  assert.deepEqual([c.ageText(59_000), c.ageText(12 * 60_000), c.ageText(27 * 3600_000), c.ageText(80 * 3600_000)], ['59s', '12m', '27h', '3d']);
+  assert.deepEqual(c.REFRESH_EXIT, { fresh: 0, failed: 1, unavailable: 2, running: 75 });
+  assert.equal(c.ciError('publish', 'timeout'), 'publish:timeout');
+  assert.throws(() => c.ciError('publish', 'free text with a secret'));
+  const base = { firstAttempt: true, mode: 'normal', full: false, latestCommit: 'a', sourceCommit: 'a', latestT: '2026-11-16T10:00:00Z',
+    runCreatedAt: '2026-11-16T09:59:00Z', latestTool: 't', tool: 't', latestSanitize: 1, sanitize: 1 };
+  assert.equal(c.shouldSkip(base), true);
+  for (const over of [{ firstAttempt: false }, { mode: 'bootstrap' }, { full: true }, { sourceCommit: 'b' }, { latestT: '2026-11-16T09:58:00Z' },
+    { latestT: null }, { tool: 'u' }, { sanitize: 2 }]) assert.equal(c.shouldSkip({ ...base, ...over }), false, JSON.stringify(over));
+  assert.equal(c.parseFault({ BRAIN_FAULT: 'build:fail' }), null);
+  assert.deepEqual(c.parseFault({ BRAIN_FAULT: 'build:fail', BRAIN_FAULT_ALLOW: '1' }), { stage: 'build', point: 'fail' });
+  assert.throws(() => c.parseFault({ BRAIN_FAULT: 'nope:x', BRAIN_FAULT_ALLOW: '1' }));
+  for (const k of Object.keys(c.FAULT_POINTS)) assert.ok(c.CI_STAGES.includes(k.split(':')[0]), k);
+});

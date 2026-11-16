@@ -493,3 +493,177 @@ export const COLUMN_MAP = Object.freeze({
   'github.refs.resolved': to('ref_link.resolved_raw', 'ref_link.resolved'),
   'github.refs.resolved_build': to('sync_state.state.refs'),     // githubSyncState refs.build / refs.other
 });
+
+// =====================================================================================================================
+// Phase 3 contract (S0). docs/phase3-design.md §6.2 (stages), §6.4 A5–A6, §6.5 (attempt display, staleness), §6.6
+// (refresh), §7 (normalized dump). Pure: no network, no DB, no clock (callers pass `now`).
+//   lane A  S6 + S2 + S1: test/pg/faults.mjs, test/pg/slo.mjs, scripts/sandbox-setup.mjs, src/pg/ci-publish.mjs,
+//           ci/brain-publish.yml, ci/brain-bootstrap.yml
+//   lane B  S3 + S4 + S5: src/pg/status.mjs (staleness, footerLine), src/refresh.mjs, src/gh-actions.mjs, src/cli.mjs,
+//           SKILL.md, README.md
+
+// ---- staleness: four cells (§6.5) ----------------------------------------------------------------------------------
+export const CODE_STATES = Object.freeze(['same', 'behind', 'differs', 'unknown']);
+export const MEMORY_STATES = Object.freeze(['fresh', 'old', 'never', 'unknown']);
+export const ACTIVITY_STATES = Object.freeze(['idle', 'queued', 'running']);
+/** `last` values; 'failed' carries the stage: { state: 'failed', stage: 'sync' }. */
+export const LAST_STATES = Object.freeze(['ok', 'skipped', 'failed', 'failed before start', 'abandoned', 'outcome unknown']);
+/** memory is fresh when DB now() - GitHub T < this. Server clock only (P14). */
+export const MEMORY_FRESH_MS = 24 * 3600 * 1000;
+
+/**
+ * @typedef {{
+ *   code: { state: 'same'|'behind'|'differs'|'unknown', behind?: number, runCommit?: string|null, mainHead?: string|null },
+ *   memory: { state: 'fresh'|'old'|'never'|'unknown', ageMs?: number|null },
+ *   activity: { state: 'idle'|'queued'|'running', runId?: number|null, stage?: string|null, sinceMs?: number|null },
+ *   last: { state: string, stage?: string|null, agoMs?: number|null } | null,
+ *   run: number|null
+ * }} Staleness
+ */
+
+/** Refresh is needed when code is behind / differs or memory is old / never. `unknown` alone never dispatches (§6.5). */
+export const needsRefresh = (s) => ['behind', 'differs'].includes(s.code.state) || ['old', 'never'].includes(s.memory.state);
+
+/**
+ * Footer phrases (§6.5). The four trigger phrases are what SKILL.md tells the agent to look for; keep them verbatim.
+ * Example: `brain data: run 42 @9f3c2e1a · 3 commits behind main · github as of 27h ago (stale) · last attempt FAILED 40m ago (sync)`
+ */
+export const REFRESH_TRIGGERS = Object.freeze(['behind main', 'differs from main', '(stale)', 'never synced']);
+export const FRESHNESS_UNKNOWN = '(freshness unknown)';
+export const FOOTER_PHRASES = Object.freeze({
+  prefix: 'brain data:',
+  code: Object.freeze({ same: '= main', behind: (n) => `${n} commit${n === 1 ? '' : 's'} behind main`, differs: 'differs from main', unknown: FRESHNESS_UNKNOWN }),
+  memory: Object.freeze({ fresh: (age) => `github as of ${age} ago`, old: (age) => `github as of ${age} ago (stale)`, never: 'github never synced', unknown: FRESHNESS_UNKNOWN }),
+  activity: Object.freeze({ idle: null, queued: 'refresh queued', running: (stage) => `refresh running${stage ? ` (${stage})` : ''}` }),
+  last: Object.freeze({ failed: (ago, stage) => `last attempt FAILED ${ago} ago${stage ? ` (${stage})` : ''}`,
+    'failed before start': (ago) => `last attempt FAILED before start ${ago} ago`, abandoned: (ago) => `last attempt abandoned ${ago} ago`,
+    'outcome unknown': (ago) => `last attempt outcome unknown (${ago} ago)` }),
+});
+/** Age text used in footers: 59s -> '59s', 12m, 27h, 3d. */
+export function ageText(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 72 * 3600) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+// ---- attempt display (§6.5 table) ----------------------------------------------------------------------------------
+export const ABANDON_UNKNOWN_MS = 30 * 60 * 1000;
+/**
+ * Shown state of one Actions attempt, matched to the DB attempt by (run id, run attempt).
+ * @param {{ db: null|'running'|'ok'|'failed'|'skipped'|'abandoned', actions: null|'queued'|'in_progress'|'completed_failure'|'cancelled'|'completed_success'|'unknown',
+ *   startedAtMs?: number|null, nowMs?: number, commitUnconfirmed?: boolean }} a
+ * @returns {'queued'|'failed before start'|'running'|'abandoned'|'abandoned?'|'running?'|'ok'|'failed'|'skipped'|'outcome unknown'}
+ */
+export function attemptDisplay({ db, actions, startedAtMs = null, nowMs = 0, commitUnconfirmed = false }) {
+  if (commitUnconfirmed) return 'outcome unknown';
+  if (db === null) {
+    if (actions === 'queued' || actions === 'in_progress') return 'queued';
+    if (actions === 'completed_failure' || actions === 'cancelled') return 'failed before start';
+    return 'queued';
+  }
+  if (db !== 'running') return db;
+  if (actions === 'in_progress' || actions === 'queued') return 'running';
+  if (actions === 'completed_failure' || actions === 'cancelled' || actions === 'completed_success') return 'abandoned';
+  return startedAtMs !== null && nowMs - startedAtMs > ABANDON_UNKNOWN_MS ? 'abandoned?' : 'running?';
+}
+
+// ---- brain refresh (§6.6) ------------------------------------------------------------------------------------------
+export const REFRESH_EXIT = Object.freeze({ fresh: 0, failed: 1, unavailable: 2, running: 75 });
+export const REFRESH_LIMITS = Object.freeze({
+  callMs: 80_000,            // F8: one call
+  deadlineMs: 15 * 60_000,   // F8: from the first call; never extended
+  cooldownMs: 15 * 60_000,   // F3
+  httpMaxMs: 20_000,         // F8: AbortSignal.timeout(min(left, 20s))
+  extraDispatchMax: 1,       // F7
+});
+/** Output lines (stdout, one line). runId may be null before the run id is known. */
+export const REFRESH_MESSAGES = Object.freeze({
+  fresh: 'fresh',
+  refreshed: (runId) => `refreshed (run ${runId})`,
+  running: (runId, elapsed, stage) => `still running (run ${runId ?? '?'}, ${elapsed}${stage ? `, stage: ${stage}` : ''})`,
+  cooldown: (ago, stage) => `refresh FAILED (cooldown: last attempt failed ${ago} ago${stage ? ` in ${stage}` : ''}; data is stale)`,
+  failed: (reason) => `refresh FAILED (${reason})`,
+  mainMoved: 'refresh FAILED (main moved)',
+  deadline: 'refresh FAILED (deadline: 15m since the first call)',
+  noPermission: 'refresh unavailable: no dispatch permission',
+  noGithub: 'refresh unavailable: GitHub not reachable',
+});
+/**
+ * State file ~/.cache/brain/refresh/<binding id>.json (F11), mode 0600, locked with withWriteLock(<file>).
+ * @typedef {{ v: 1, startedAt: string, deadline: string, baseT: string|null, baseHead: string, runId: number|null,
+ *   dispatchedAt: string|null, extraDispatches: number }} RefreshState
+ */
+export const REFRESH_STATE_VERSION = 1;
+export const refreshStatePath = (home, bindingId) => `${home}/.cache/brain/refresh/${bindingId}.json`;
+
+// ---- ci-publish stages, limits, signals (§6.2, A2, A5) -------------------------------------------------------------
+export const CI_STAGES = Object.freeze(['prepare', 'record', 'mirror', 'build', 'sync', 'outbound', 'publish', 'verify']);
+/** Per-stage limits in ms (null = none). Child stages get SIGTERM at the limit and SIGKILL 10 s later. */
+export const CI_LIMITS = Object.freeze({
+  normal: Object.freeze({ record: 60_000, mirror: 60_000, build: 180_000, sync: 120_000, publish: 60_000, verify: 30_000,
+    requestMs: 30_000, rateWaitMs: 60_000, txTimeout: '60s', statementTimeout: '30s', lockTimeout: '15s' }),
+  bootstrap: Object.freeze({ record: 60_000, mirror: 60_000, build: 180_000, sync: null, publish: 600_000, verify: 30_000,
+    requestMs: 30_000, rateWaitMs: null, txTimeout: '10min', statementTimeout: '5min', lockTimeout: '15s' }),
+});
+export const CI_KILL_GRACE_MS = 10_000;
+export const CI_CONNECT_BACKOFF_MS = Object.freeze([1000, 2000, 4000, 8000]);   // a sleeping compute (S2, S5)
+export const CI_SIGNAL_CLEANUP_MS = 5000;   // SIGINT/SIGTERM: kill children, close DB, try failAttempt within 5 s
+/** ci-publish exit codes. verify-failed: data committed, attempt ok, job marked failed (§6.2 S6). */
+export const CI_EXIT = Object.freeze({ ok: 0, failed: 1, usage: 2, verifyFailed: 3, outcomeUnknown: 4 });
+/** attempt.error is `<stage>:<kind>`, never free text (R16 / §6.7). */
+export const CI_ERROR_KINDS = Object.freeze(['timeout', 'exit', 'signal', 'connect', 'checksum', 'http', 'rate-limit',
+  'outbound', 'stale-base', 'not-descendant', 'binding', 'sql', 'fault', 'internal']);
+export const ciError = (stage, kind) => {
+  if (!CI_STAGES.includes(stage) || !CI_ERROR_KINDS.includes(kind)) fail(`bad ci error ${stage}:${kind}`);
+  return `${stage}:${kind}`;
+};
+/** A5 skip: all four must hold. Times are ISO strings from GitHub's clock. */
+export const shouldSkip = ({ firstAttempt, mode, full, latestCommit, sourceCommit, latestT, runCreatedAt, latestTool, tool,
+  latestSanitize, sanitize }) =>
+  firstAttempt === true && mode === 'normal' && !full && latestCommit === sourceCommit && latestT !== null &&
+  Date.parse(latestT) >= Date.parse(runCreatedAt) && latestTool === tool && latestSanitize === sanitize;
+
+// ---- fault injection (A6, §7.2) ------------------------------------------------------------------------------------
+/** BRAIN_FAULT=<stage>:<point>; ignored unless BRAIN_FAULT_ALLOW=1. */
+export const FAULT_POINTS = Object.freeze({
+  'mirror:connect': 'F2 connection refused while pulling the mirror',
+  'mirror:checksum': 'F2 mirror checksum mismatch (pull again in full and continue)',
+  'build:fail': 'F3 build child exits non-zero',
+  'build:sleep': 'F3/T3 build child sleeps past the 3 min limit',
+  'sync:http500': 'F4 GitHub 500 after retries',
+  'sync:rate-limit': 'F5 rate limit with reset 5 min ahead',
+  'outbound:secret': 'F6 outbound check finds a secret',
+  'publish:after-nodes': 'F7 throw after node rows',
+  'publish:after-items': 'F7 throw after item rows',
+  'publish:after-sync-state': 'F7 throw after sync_state',
+  'publish:after-attempt-ok': 'F7 throw after attempt ok, before COMMIT',
+  'publish:kill': 'F8 SIGKILL self inside the transaction',
+  'publish:drop-before-commit': 'F9 destroy the socket right before COMMIT',
+  'publish:sleep': 'F12 pg_sleep past transaction_timeout',
+  'verify:kill': 'F14 SIGKILL self after COMMIT, before verify',
+});
+/** @returns {null | { stage: string, point: string }} */
+export function parseFault(env = process.env) {
+  if (env.BRAIN_FAULT_ALLOW !== '1' || !env.BRAIN_FAULT) return null;
+  if (!Object.hasOwn(FAULT_POINTS, env.BRAIN_FAULT)) fail(`unknown BRAIN_FAULT ${env.BRAIN_FAULT}`);
+  const [stage, point] = env.BRAIN_FAULT.split(':');
+  return { stage, point };
+}
+
+// ---- normalized domain dump (§7) -----------------------------------------------------------------------------------
+/**
+ * "Same as without the failure": dump every domain table, then normalize: surrogate ids -> natural keys, run ids -> run
+ * ordinal (1-based by run_id; rolled-back transactions burn identity values), drop the listed volatile columns, sort rows
+ * by canonicalJson. attempt is excluded. The harness (Phase 2 Q11 dump, Phase 3 S6 normalize) implements this.
+ */
+export const DUMP_EXCLUDE_TABLES = Object.freeze(['attempt']);
+export const DUMP_NATURAL_KEYS = Object.freeze({
+  node: ['key'], item: ['ptr'],
+  node_rev: ['node_id->node.key', 'rev_no'], item_rev: ['item_id->item.ptr', 'rev_no'],
+  chunk: ['rev_id->item_rev', 'ord'], ref: ['rev_id->item_rev', 'ord'],
+  edge: ['fact_key', 'valid_from'], unresolved: ['fact_key', 'valid_from'], link: ['fact_key', 'valid_from'],
+  ref_link: ['fact_key', 'valid_from'], run: ['run_id->ordinal'], sync_state: ['run_id->ordinal', 'source'], binding: ['id'],
+});
+export const DUMP_VOLATILE_COLUMNS = Object.freeze({ run: ['attempt_id', 'published_at'], binding: ['created_at'] });

@@ -643,3 +643,5 @@ flowchart LR
 | [major] `ci-publish` CLI 등록 주인이 없다 | 반영. S5가 등록, S1이 S5에 의존 |
 | [major] 성공 기준 2가 F10 · F11 · F14 · F15에도 "그대로"를 요구한다 | 반영. 기대를 셋으로 나눴다 |
 | [minor] 이어 가는 refresh가 fresh 지름길로 F7을 건너뛸 수 있다 | 반영. 지름길은 새 refresh만(F1) |
+
+**S0 계약 고정 (lead).** `src/pg/contract.mjs` 끝의 "Phase 3 contract (S0)" 절이 기준이다. 낡음 네 칸의 값과 `needsRefresh`, footer 문구와 SKILL.md가 찾는 네 문구(`behind main` · `differs from main` · `(stale)` · `never synced`), attempt 보여 주기(`attemptDisplay`, 30분 규칙), refresh exit 코드 · 출력 문장 · 상태 파일(`v: 1`, 0600, `withWriteLock`), `ci-publish` 단계 이름 · 상한(평소 · bootstrap) · 연결 재시도 1 · 2 · 4 · 8초 · 신호 정리 5초 · exit 코드(0 ok/skipped, 1 failed, 2 usage, 3 verify 실패(데이터는 커밋됨), 4 결과 모름), `attempt.error` = `<단계>:<종류>`, A5 `shouldSkip`, `BRAIN_FAULT` 지점 15개(F2–F14), 정규화 dump(제외 표 · 자연 키 · run 순번 · 변하는 열). 정한 것: 단계 이름은 `prepare` · `record` · `mirror` · `build` · `sync` · `outbound` · `publish` · `verify`. F10 · F11 · F15는 지점 이름 없이 proxy와 두 publish 경쟁으로 만든다.
