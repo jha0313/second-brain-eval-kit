@@ -253,6 +253,8 @@ flowchart LR
 | S9 | repo id 불일치 | `failed`, 아무것도 안 씀 |
 | S10 | relink 실패(`sync:relink`) | sync는 `ok`, 결과에 relink 오류 기록 |
 
+종단 테스트: `test/phase1/e2e.test.mjs`가 S1–S10을 실제 CLI(`bin/brain`)와 replay seam으로 돌린다(첫 sync → 증분 2회, `/repositories/<id>` Link 쪽, 30쪽 files 잘림 포함). "마지막 커밋 상태와 일치"는 항목마다 부분별로 본다: 행+본문 refs, files 단계(`detail_for`·`files-truncated`·`pr-files` refs), `reviews_at`이 각각 실행 전 상태나 한 번에 끝난 실행의 상태 중 하나와 같아야 한다(이번 실행에 새로 생긴 항목은 files·reviews 단계 전 상태도 허용). build → sync → relink → read(search/get/source, 이름을 바꾼 뒤 build가 다시 잇기)도 같은 파일에 있다.
+
 ### 5.3 단계 관문
 
 | 단계 | 통과 조건 |
