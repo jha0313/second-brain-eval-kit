@@ -51,22 +51,22 @@ test('the round trip passes; each wrong outcome fails: an extra run, no burned i
           UPDATE brain.run SET checksum = jsonb_set(checksum, '{meta,sha256}', '"0"') WHERE run_id = (SELECT min(run_id) FROM brain.run);
           ALTER TABLE brain.run ENABLE TRIGGER refuse;`);
       } },
-      // state outside the brain schemas survives resetSchema: the scenario that leaves it fails (a role, the database)
-      { name: 'leak', fault: async (ctx) => { await ctx.branch.query('owner', "ALTER ROLE brain_writer SET work_mem = '8MB'"); } },
-      { name: 'leak-db', fault: async (ctx) => { await ctx.branch.query('owner', "ALTER DATABASE neondb SET work_mem = '8MB'"); } },
     ] };
-    try {
-      const bad = await runSuite(changed, { branch, log: quiet });
-      assert.deepEqual(bad.map((r) => [r.name, r.ok]), [['extra-run', false], ['no-burn', false], ['bad-hash', false],
-        ['old-bad-hash', false], ['leak', false], ['leak-db', false]], 'none may compare equal');
-      assert.match(bad[0].detail, /dump differs: \d+ rows gone, \d+ extra/);
-      assert.match(bad[1].detail, /the raw dump did not change: the scenario proves nothing/);
-      assert.match(bad[2].detail, /checksum/i);
-      assert.match(bad[3].detail, /checksum/i);
-      assert.match(bad[4].detail, /roles, grants or schemas outside brain changed/);
-      assert.match(bad[5].detail, /roles, grants or schemas outside brain changed/);
-    } finally {
-      await branch.query('owner', 'ALTER ROLE brain_writer RESET work_mem');
-      await branch.query('owner', 'ALTER DATABASE neondb RESET work_mem');
+    const bad = await runSuite(changed, { branch, log: quiet });
+    assert.deepEqual(bad.map((r) => [r.name, r.ok]), [['extra-run', false], ['no-burn', false], ['bad-hash', false],
+      ['old-bad-hash', false]], 'none may compare equal');
+    assert.match(bad[0].detail, /dump differs: \d+ rows gone, \d+ extra/);
+    assert.match(bad[1].detail, /the raw dump did not change: the scenario proves nothing/);
+    assert.match(bad[2].detail, /checksum/i);
+    assert.match(bad[3].detail, /checksum/i);
+    // state outside the brain schemas survives resetSchema: a scenario that leaves it fails. One suite per leak, each
+    // undone before the next, so neither passes on the other's leftover.
+    for (const [name, set, reset] of [['leak', "ALTER ROLE brain_writer SET work_mem = '8MB'", 'ALTER ROLE brain_writer RESET work_mem'],
+      ['leak-db', "ALTER DATABASE neondb SET work_mem = '8MB'", 'ALTER DATABASE neondb RESET work_mem']]) {
+      try {
+        const [r] = await runSuite({ ...ROUNDTRIP, scenarios: [{ name, fault: async (ctx) => { await ctx.branch.query('owner', set); } }] }, { branch, log: quiet });
+        assert.equal(r.ok, false, name);
+        assert.match(r.detail, /roles, grants or schemas outside brain changed/, name);
+      } finally { await branch.query('owner', reset); }
     }
   });
