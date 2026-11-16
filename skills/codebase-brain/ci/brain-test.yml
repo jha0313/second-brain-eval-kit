@@ -1,0 +1,70 @@
+# brain-test: the Phase 0 / Phase 1 tests and the Phase 2 Neon suites (design §7.1, test/pg/harness.mjs).
+# Copy to .github/workflows/brain-test.yml in the repo that holds this kit. Manual only.
+# Every Neon suite makes its own branch from `production` of the TEST project, uses it and deletes it; the last step
+# deletes whatever this run left behind (a killed suite), and every branch also expires 2 hours after it was made.
+# Needs: secret NEON_API_KEY (an API key that can manage the test project), variable NEON_PROJECT_ID (the test project).
+# Never give this workflow the production BRAIN_WRITER_URL: the suites make their own roles and passwords per branch.
+name: brain-test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brain-test
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: skills/codebase-brain
+    env:
+      NEON_PROJECT_ID: ${{ vars.NEON_PROJECT_ID }}
+      BRAIN_TEST_BRANCH_PREFIX: ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install
+        run: npm ci
+
+      - name: Phase 0 and Phase 1 tests (no network)
+        run: npm test
+
+      - name: install the Neon CLI
+        run: npm install -g neon@9.5.0
+
+      - name: check the Neon configuration (an unset one would skip every Neon suite and still pass)
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+        run: |
+          test -n "$NEON_PROJECT_ID" || { echo "::error::variable NEON_PROJECT_ID is not set"; exit 1; }
+          test -n "$NEON_API_KEY" || { echo "::error::secret NEON_API_KEY is not set"; exit 1; }
+
+      - name: Phase 2 suites on Neon branches
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+        run: node --test --test-concurrency=1 --test-timeout=900000 "test/pg/*.test.mjs"
+
+      - name: delete branches this run left behind
+        if: always()
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+        run: |
+          set -euo pipefail
+          neon branches list --project-id "$NEON_PROJECT_ID" -o json --no-analytics \
+            | node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+                const j = JSON.parse(s), p = process.env.BRAIN_TEST_BRANCH_PREFIX + "-";
+                for (const b of j.branches ?? j) if (b.name.startsWith(p) && !b.default) console.log(b.id);
+              })' \
+            | while read -r id; do neon branches delete "$id" --project-id "$NEON_PROJECT_ID" --no-analytics -o json > /dev/null; done
