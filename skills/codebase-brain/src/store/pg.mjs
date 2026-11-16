@@ -5,9 +5,9 @@
 // - Visible at run R: valid_from <= R AND (valid_to IS NULL OR valid_to > R); chunks and refs follow their revision.
 // - Rows keep the Phase 1 SQLite shapes (code.db chunks, github.db items / refs rows, as the mirror writes them) and
 //   the mirror's ids ('c' + chunk_id, 'g' + item_id), so read.mjs shapes both stores alike and ties break as on a mirror
-//   of the same run. The lists follow src/store/sqlite.mjs one by one; FTS is chunk.tsv (brain.brain_english: stop
-//   words kept and the original Porter stemmer, as FTS5's porter, sql/003) ranked by ts_rank instead of FTS5 bm25,
-//   and the trigram lists are ILIKE (pg_trgm index) for every length.
+//   of the same run. The lists follow src/store/sqlite.mjs one by one; FTS is chunk.tsv (simple over brain.fts_text:
+//   tokens and stems as FTS5's, sql/003) ranked by ts_rank instead of FTS5 bm25, and the trigram lists are ILIKE
+//   (pg_trgm index) for every length.
 // - Repo memory pointers: <source>:<path>:<a>-<b>@r<n> (rev n of item <source>:<path>). A Phase 1 @<build> pointer
 //   reads the view run when its build is that run's build, else it is stale. Vault notes are never on the server.
 import { BrainError, NotFoundError, StalePtrError } from '../errors.mjs';
@@ -115,7 +115,10 @@ async function candidates(client, q, opts = {}) {
     ctes.push(`${c} AS (SELECT x.*, row_number() OVER (ORDER BY ${order}) AS o FROM (${select}) x ORDER BY o LIMIT ${CAP + 1})`);
     lists.push(`(SELECT jsonb_build_object('name', '${name}', 'rows', coalesce(jsonb_agg(jsonb_build_array(key, grp, d, ptr, flags) ORDER BY o), '[]'::jsonb)) FROM ${c})`);
   };
-  const tsq = t.ascii.length ? `websearch_to_tsquery('brain.brain_english', ${p(t.ascii.map((w) => `"${w}"`).join(' OR '))})` : null;
+  // each term through brain.fts_text as the indexed text (sql/003), then "t1" OR "t2" …; terms are [A-Za-z0-9_] only.
+  // Made once (MATERIALIZED): the lists read it as tq
+  const tsq = t.ascii.length > 0;
+  if (tsq) ctes.push(`tq AS MATERIALIZED (SELECT websearch_to_tsquery('simple', (SELECT string_agg('"' || brain.fts_text(w) || '"', ' OR ') FROM unnest(${p(t.ascii)}::text[]) w)) AS q)`);
   const P = f.path ? p(f.path) : null;
   const under = (x) => `(${x} = ${P} OR starts_with(${x}, ${P} || '/'))`;
   const seeded = t.names.length > 0;
@@ -160,7 +163,7 @@ async function candidates(client, q, opts = {}) {
       WHERE ${w.join(' AND ')})`);
     const G = (extra = '', from = '') => `SELECT g.id, 'g' || g.id AS key, 'g' || g.gid AS grp, g.d, g.ptr, g.flags${extra} FROM g${from}`;
     const text = ' JOIN brain.chunk c ON c.rev_id = g.rev_id AND c.ord = 0';   // the item's search chunk (title + body)
-    if (tsq) add('items_fts', `${G(', ts_rank(c.tsv, w.q) AS sc', `${text} CROSS JOIN (SELECT ${tsq} AS q) w`)} WHERE c.tsv @@ w.q`, 'sc DESC, id');
+    if (tsq) add('items_fts', `${G(', ts_rank(c.tsv, w.q) AS sc', `${text} CROSS JOIN tq w`)} WHERE c.tsv @@ w.q`, 'sc DESC, id');
     for (const s of t.tri) {
       const L = p(likeOf(s));
       add('items_tri', `${G(`, coalesce(c.title ILIKE ${L}, false) AS th`, text)} WHERE (c.title ILIKE ${L} OR c.body ILIKE ${L})`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
@@ -187,7 +190,7 @@ async function candidates(client, q, opts = {}) {
         NULL::text AS flags, c.tsv, c.title, c.body, c.prs, c.sha
       FROM brain.item_rev r JOIN brain.item i USING (item_id) JOIN brain.chunk c USING (rev_id) WHERE i.origin = 'repo' AND ${vis('r')} AND ${w.join(' AND ')})`);
     const K = 'SELECT id, key, grp, d, ptr, flags';
-    if (tsq) add('chunks_fts', `${K}, ts_rank(tsv, w.q) AS sc FROM ch CROSS JOIN (SELECT ${tsq} AS q) w WHERE tsv @@ w.q`, 'sc DESC, id');
+    if (tsq) add('chunks_fts', `${K}, ts_rank(tsv, w.q) AS sc FROM ch CROSS JOIN tq w WHERE tsv @@ w.q`, 'sc DESC, id');
     for (const s of t.tri) {
       const L = p(likeOf(s));
       add('chunks_tri', `${K}, coalesce(title ILIKE ${L}, false) AS th FROM ch WHERE title ILIKE ${L} OR body ILIKE ${L}`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
@@ -274,7 +277,11 @@ async function find(client, parsed, asOf, detail) {
         ELSE (SELECT max(run_id) FROM brain.run WHERE run_id < r.valid_to) END AS run) e   -- run ids have gaps (a rolled-back publish)
       LEFT JOIN LATERAL (SELECT state->'refs' AS refs FROM brain.sync_state WHERE run_id = e.run AND source = 'github') es ON true
       LEFT JOIN brain.run eb ON eb.run_id = e.run
-      WHERE h.n = 1) AS found`;
+      WHERE h.n = 1) AS found,
+    -- PRs and issues share numbers: for pr:N the issue:N visible at R, and back (named when pr:N is not found)
+    (SELECT coalesce(jsonb_object_agg(q.i, o.ptr), '{}'::jsonb) FROM q JOIN brain.item o
+      ON o.ptr = CASE split_part(q.ptr, ':', 1) WHEN 'pr' THEN 'issue:' WHEN 'issue' THEN 'pr:' END || split_part(q.ptr, ':', 2)
+      WHERE EXISTS (SELECT 1 FROM brain.item_rev x WHERE x.item_id = o.item_id AND ${vis('x')})) AS also`;
   const r = (await client.query(sql, params)).rows[0];
   const view = viewOf(r, noRun(asOf));
   // a Phase 1 pointer (@<build>) names the state of one build: stale unless it is this run's (checked before any lookup)
@@ -282,7 +289,7 @@ async function find(client, parsed, asOf, detail) {
     if (MEMORY_TYPES.includes(x.type) && x.type !== 'vault' && x.rev === null && x.build !== r.v.build) throw new StalePtrError(formatPtr(x), x.build, r.v.build ?? null);
   }
   const found = new Map(r.found.map((x) => [x.i, x.row]));
-  return { rows: parsed.map((x, i) => { const j = found.get(i); if (!j) throw new NotFoundError(ptrText(x)); return j; }), view };
+  return { rows: parsed.map((x, i) => { const j = found.get(i); if (!j) throw new NotFoundError(ptrText(x), r.also[i] ?? null); return j; }), view };
 }
 
 async function get(client, ptrs, opts = {}) {
