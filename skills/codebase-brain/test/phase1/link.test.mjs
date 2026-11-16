@@ -1,7 +1,7 @@
 // Lane D: extraction (pure) and relink against a real fixture build, a hand-made github.db and the fixture's git.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { existsSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -189,6 +189,17 @@ test('relink: a stale resolved_build is resolved again, a current one is left al
   assert.deepEqual(verdict(r['file src/lib/charge.ts text']), ['unlinked', 'not-in-index', []]);           // current: not looked at
 });
 
+test('relink: a not-synced item ref links once a later sync stores the item, with no new build', async () => {
+  freshGh([{ kind: 'item', target: '#46' }]);
+  await run();
+  assert.deepEqual(verdict(rows()['item #46 text']), ['unlinked', 'not-synced', []]);
+  const db = new DatabaseSync(fx.ghDb);
+  db.prepare("INSERT INTO items(ptr, kind, number) VALUES ('issue:46', 'issue', 46)").run();
+  db.close();
+  await run();
+  assert.deepEqual(verdict(rows()['item #46 text']), ['linked', null, ['issue:46']]);
+});
+
 test('relink: over the grep budget -> pending/budget, retried by the next relink', async () => {
   freshGh([{ kind: 'name', target: 'jobs.reserve' }, { kind: 'file', target: 'src/lib/credits.ts' }]);
   const logs = [];
@@ -244,4 +255,21 @@ test('brain build relinks an existing github.db against the new build', async ()
   assert.notEqual(after, before);
   assert.deepEqual(JSON.parse(out.stdout).relink, { linked: 1, ambiguous: 0, unlinked: 0, pending: 0, build: after });
   assert.equal(rows()['file src/lib/credits.ts text'].resolved_build, after);
+});
+
+// last: it moves the shared fixture's checkout past the indexed commit
+test('relink resolves paths against the indexed commit, not the checkout as it is now', async () => {
+  const sh = (...args) => execFileSync('git', ['-C', fx.repo, ...args], { encoding: 'utf8' });
+  writeFileSync(join(fx.repo, 'src/lib/added-later.ts'), 'export const later = 1;\n');
+  sh('rm', '-q', 'src/lib/charge.ts');
+  sh('add', '-A');
+  sh('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'after the build');
+  freshGh([
+    { kind: 'file', target: 'src/lib/charge.ts', origin: 'pr-files' },
+    { kind: 'file', target: 'src/lib/added-later.ts', origin: 'pr-files' },
+  ]);
+  await run();
+  const r = rows();
+  assert.deepEqual(verdict(r['file src/lib/charge.ts pr-files']), ['linked', null, ['src/lib/charge.ts']]);
+  assert.deepEqual(verdict(r['file src/lib/added-later.ts pr-files']), ['unlinked', 'not-in-index', []]);
 });

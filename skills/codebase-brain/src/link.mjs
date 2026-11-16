@@ -15,7 +15,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb, getMeta, inTransaction } from './db.mjs';
-import { trackedFiles } from './files.mjs';
+import { git } from './files.mjs';
 import { githubDbPath, openGithubDb } from './gh-schema.mjs';
 import { pathIndex, PATH_RE, IDENT_RE, MAX_NAME_OWNERS } from './index-knowledge.mjs';
 import { isRedacted, sanitizeIdent } from './sanitize.mjs';
@@ -192,11 +192,11 @@ function resolvers({ code, gh, tracked }) {
   };
 }
 
-// one `git cat-file --batch-check` for every SHA: sha -> 'commit' | 'ambiguous' | 'missing' | ...
+// one `git cat-file --batch-check` for every SHA: sha -> 'commit' | 'ambiguous' | 'missing' | ..., null when git failed
 function commitTypes(repoDir, shas) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const child = execFile('git', ['-C', repoDir, 'cat-file', '--batch-check'], { encoding: 'utf8', maxBuffer: Infinity }, (err, stdout) => {
-      if (err) return reject(err);
+      if (err) return resolve(null);
       const lines = stdout.split('\n');
       resolve(new Map(shas.map((s, i) => [s, lines[i]?.split(' ')[1]])));
     });
@@ -271,11 +271,14 @@ export async function relink({ codeDbPath, repoDir, budget = BUDGET, log } = {})
   try {
     code = openDb(codeDbPath);
     const { build_id: build, commit } = getMeta(code);
-    const todo = gh.prepare('SELECT rowid AS id, ptr, kind, target, origin FROM refs WHERE status = ? OR resolved_build IS NOT ? ORDER BY rowid')
-      .all('pending', build);
+    // not-synced item refs too: a later sync can add the item without a new build
+    const todo = gh.prepare(`SELECT rowid AS id, ptr, kind, target, origin FROM refs
+      WHERE status = 'pending' OR resolved_build IS NOT ? OR (kind = 'item' AND reason = 'not-synced') ORDER BY rowid`).all(build);
     const verdicts = new Map();                                                 // refs rowid -> { status, reason, resolved }
     if (todo.length) {
-      const r = resolvers({ code, gh, tracked: trackedFiles(repoDir).map((p) => sanitizeIdent(p)) });
+      // the files of the indexed commit (what git grep searches), not the checkout as it is now
+      const tracked = git(repoDir, ['ls-tree', '-r', '-z', '--name-only', commit]).split('\0').filter(Boolean);
+      const r = resolvers({ code, gh, tracked: tracked.map((p) => sanitizeIdent(p)) });
       const later = { commit: [], name: [], grep: [] };
       for (const ref of todo) {
         if (isRedacted(ref.target)) verdicts.set(ref.id, unlinked('redacted'));
@@ -289,9 +292,11 @@ export async function relink({ codeDbPath, repoDir, budget = BUDGET, log } = {})
       if (later.commit.length) {
         const shas = [...new Set(later.commit.map((x) => x.target).filter((t) => HEX_RE.test(t)))];
         const types = shas.length ? await commitTypes(repoDir, shas) : new Map();
+        if (!types) log?.('  relink: git cat-file failed; commit refs stay pending');
         for (const x of later.commit) {
-          const t = types.get(x.target);
-          verdicts.set(x.id, t === 'commit' ? linked([`commit:${x.target}`]) : t === 'ambiguous' ? ambiguous([]) : unlinked('not-local'));
+          const t = types?.get(x.target);
+          verdicts.set(x.id, !types ? { status: 'pending', reason: null, resolved: [] }
+            : t === 'commit' ? linked([`commit:${x.target}`]) : t === 'ambiguous' ? ambiguous([]) : unlinked('not-local'));
         }
       }
 
