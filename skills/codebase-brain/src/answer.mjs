@@ -26,7 +26,7 @@ function githubState(s, now) {
   if (s.run_status === 'running') return s.run_pid && alive(s.run_pid) ? 'running' : 'interrupted';
   if (s.run_status === 'failed' || s.run_status === 'interrupted') return s.run_status;
   if (!s.cursor) return 'never';
-  return now - Date.parse(s.last_ok_at ?? s.cursor) > DAY ? 'stale' : 'ok';
+  return now - Date.parse(s.cursor) > DAY ? 'stale' : 'ok';   // design §6.8: the data time T (cursor), not when the run ended
 }
 
 /** Precedence partial > truncated > complete; reasons list every fact that applies. @param {import('./context.mjs').Ctx} ctx @param {CoverageFacts} facts @returns {Coverage} */
@@ -102,7 +102,7 @@ function githubLine(g, now) {
   switch (g.state) {
     case 'never': return 'github never synced';
     case 'ok': return `github data as of ${at(g.asOf)} (synced ${age(g.syncedAt ?? g.asOf, now)} ago, ok · ${full})`;
-    case 'stale': return `github data as of ${at(g.asOf)} (${age(g.syncedAt ?? g.asOf, now)} old, stale: run brain sync · ${full})`;
+    case 'stale': return `github data as of ${at(g.asOf)} (${age(g.asOf, now)} old, stale: run brain sync · ${full})`;
     case 'failed': return `last github sync FAILED ${g.runAt ? `${age(g.runAt, now)} ago ` : ''}${g.error ? `(${ext(g.error, 80)}) ` : ''}· ${asOf}`;
     case 'interrupted': return `last github sync interrupted · ${asOf}`;
     default: return `github sync running${g.pid ? ` (pid ${g.pid})` : ''} · ${asOf}`;

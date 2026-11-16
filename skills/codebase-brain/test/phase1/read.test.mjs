@@ -371,3 +371,35 @@ test('DTOs: every external string lives under untrusted (planted in every extern
     [null, null, null, null, [], 'pending', null]);
   assert.deepEqual(dtos[2].items[2].type, 'rc');
 });
+
+test('integration: flags on search rows and thread entries; a child item names its parent and position', () => {
+  const items = MAIN.items.map((it) => (it.id === 88130 ? { ...it, flags: 'suspicious' } : it));
+  const ctx = brain({ ...MAIN, items });
+  const row = search(ctx, 'good catch rework').rows.find((r) => r.ptr === 'pr:1121');
+  assert.deepEqual(row.flags, ['suspicious']);                          // the PR itself and a matched reply are flagged
+  const clean = search(ctx, 'adds useLiveRunStatus').rows.find((r) => r.ptr === 'pr:1201');
+  assert.deepEqual(clean.flags, []);
+  const t = get(ctx, ['pr:1121']).items[0].thread;
+  assert.deepEqual(t.find((e) => e.ptr === 'rc:88130').flags, ['suspicious']);
+  assert.deepEqual(t.find((e) => e.ptr === 'rc:88123').flags, []);
+  const [rc, ic, pr] = get(ctx, ['rc:88123', 'ic:99120', 'pr:1121']).items;
+  assert.equal(rc.parent, 'pr:1121');
+  assert.deepEqual(rc.position, { side: 'RIGHT', startSide: 'RIGHT', start: 40, end: 42, commit: 'a1b2c3d4e5f6', outdated: false,
+    originalStart: 38, originalEnd: 40, originalCommit: '9f8e7d6c' });
+  assert.equal(rc.untrusted.path, 'lib/credits.ts');
+  assert.deepEqual([ic.parent, ic.position], ['pr:1121', null]);
+  assert.deepEqual([pr.parent, pr.position], [null, null]);
+  const issueComment = brain({ items: [{ kind: 'issue', number: 7, title: 'x', body: 'y' }, { kind: 'issue_comment', id: 5, number: 7, body: 'z' }] });
+  assert.equal(get(issueComment, ['ic:5']).items[0].parent, 'issue:7');
+});
+
+test('integration: search finds memory linked to the named code even when its text never spells the name (name -> code link)', () => {
+  const ctx = brain(MAIN);
+  const r = search(ctx, 'InsufficientCredits', { limit: 50 });
+  const ptrs = r.rows.map((x) => x.ptr);
+  assert.ok(ptrs.includes('pr:1121'), 'a PR whose file ref resolves to the symbol\'s file in this build');
+  assert.ok(ptrs.some((p) => p.startsWith('commit:')), 'a commit that touches the symbol\'s file');
+  // refs resolved against another build do not count (pr:1150's symbol ref is from OLD)
+  assert.ok(!search(ctx, 'src/lib/credits.ts#reserve', { limit: 50 }).rows.some((x) => x.ptr === 'pr:1150'));
+  assert.ok(search(ctx, 'src/lib/credits.ts#reserve', { limit: 50 }).rows.some((x) => x.ptr === 'issue:1100'));
+});

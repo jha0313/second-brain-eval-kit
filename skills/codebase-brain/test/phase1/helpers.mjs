@@ -1,10 +1,12 @@
 // Shared test helpers (P0). Lanes may add helpers inside their own test files; this file changes only via the lead.
-import { cpSync, mkdtempSync } from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { cpSync, mkdtempSync, existsSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openGithubDb, githubDbPath, writeSyncState } from '../../src/gh-schema.mjs';
+import { SANITIZE_VERSION } from '../../src/sanitize.mjs';
 export { virtualClock as fakeClock } from '../../src/replay.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -80,8 +82,52 @@ export function makeGithubDb(codeDbPath, { items = [], refs = [], syncState = {}
       .run(rf.ptr, rf.kind, rf.target, rf.origin ?? 'text', rf.status ?? 'pending', rf.reason ?? null,
         rf.resolved ? JSON.stringify(rf.resolved) : null, rf.resolved_build ?? null);
   }
-  writeSyncState(db, { repo_id: 1, repo: 'o/r', cursor: '2026-11-15T09:58:00Z', last_ok_at: '2026-11-15T10:01:00Z', run_status: 'ok', sanitize_version: 0, ...syncState });
+  writeSyncState(db, { repo_id: 1, repo: 'o/r', cursor: '2026-11-15T09:58:00Z', last_ok_at: '2026-11-15T10:01:00Z', run_status: 'ok', sanitize_version: SANITIZE_VERSION, ...syncState });
   db.exec('COMMIT');
   db.close();
   return path;
+}
+
+/**
+ * A child process that takes the write lock of codeDbPath (withWriteLock) and waits. Resolves once it holds it;
+ * stop it with child.kill() (SIGKILL: the OS drops its lock, the holder row stays unclean).
+ * @returns {Promise<import('node:child_process').ChildProcess>}
+ */
+export function holdLockInChild(codeDbPath) {
+  const mod = new URL('../../src/gh-schema.mjs', import.meta.url).href;
+  const child = spawn(process.execPath, ['--no-warnings', '--input-type=module', '-e',
+    `import { withWriteLock } from ${JSON.stringify(mod)};
+     await withWriteLock(process.argv[1], async () => { process.stdout.write('held\\n'); await new Promise(() => setInterval(() => {}, 1000)); });`, codeDbPath]);
+  return new Promise((res, rej) => {
+    child.stdout.on('data', (d) => { if (String(d).includes('held')) res(child); });
+    child.on('exit', (c) => rej(new Error(`lock child exited ${c}`)));
+  });
+}
+
+/** Kill a holdLockInChild child and wait for it to exit. */
+export async function killChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const gone = new Promise((r) => child.on('exit', r));
+  child.kill('SIGKILL');
+  await gone;
+}
+
+/**
+ * The write lock as another process sees it, read without taking it (gh-schema.mjs withWriteLock):
+ * 'none' (never taken), 'held' (a live holder), 'clean' (released normally), 'dirty' (the last holder died).
+ * Also: no `.lock.pid` may be left once the lock is free.
+ */
+export function lockState(codeDbPath) {
+  const lock = `${codeDbPath}.lock`;
+  if (!existsSync(lock)) return 'none';
+  const db = new DatabaseSync(lock, { readOnly: true });
+  try {
+    db.exec('PRAGMA busy_timeout = 0');
+    const row = db.prepare('SELECT clean FROM holder WHERE id = 1').get();
+    if (!row) return 'none';
+    return row.clean ? 'clean' : 'dirty';
+  } catch (e) {
+    if (e.errcode === 5 || e.errcode === 6) return 'held';
+    throw e;
+  } finally { db.close(); }
 }

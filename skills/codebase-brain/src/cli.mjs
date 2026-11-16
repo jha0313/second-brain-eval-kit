@@ -22,7 +22,7 @@ import { replaySeams } from './seams.mjs';
 import { SANITIZE_VERSION, sanitizeLine, redactValues } from './sanitize.mjs';
 import { parsePtr } from './ptr.mjs';
 import { BrainError } from './errors.mjs';
-import { git } from './files.mjs';
+import { git, gitEnv } from './files.mjs';
 
 const HELP = `brain — codebase map + memory (prototype)
 
@@ -83,7 +83,7 @@ const say = (s) => console.error(scrub(s));
 let checkout;
 function here(opt) {
   if (opt.repo) return resolve(opt.repo);
-  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return undefined; }
+  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv() }).trim(); } catch { return undefined; }
 }
 
 function dbPathFor(opt) {
@@ -255,8 +255,8 @@ const cmds = {
     const edges = db.prepare('SELECT count(*) n FROM edges').get().n;
     const chunks = Object.fromEntries(db.prepare('SELECT source, count(*) n FROM chunks GROUP BY source').all().map((r) => [r.source, r.n]));
     const ageMin = Math.round((Date.now() - Date.parse(m.built_at)) / 60000);
-    if (opt.json) return out(JSON.stringify({ ...f, counts, edges, chunks, ageMin, meta: undefined, stats: s, timings: m.timings, coverage: cov, freshness: jsonFresh(fr) }));
-    out(`${c.bold('brain status')}  ${cutLeft(safe(tilde(f.repo)), COLS - 16)}`);
+    if (opt.json) return out(JSON.stringify({ ...f, repo: f.repo == null ? f.repo : scrub(f.repo), counts, edges, chunks, ageMin, meta: undefined, stats: s, timings: m.timings, coverage: cov, freshness: jsonFresh(fr) }));
+    out(`${c.bold('brain status')}  ${cutLeft(scrub(tilde(f.repo)), COLS - 16)}`);
     out(table(['', ''], [
       ['index', `@${m.commit?.slice(0, 8)} (${m.commit_date}) · built ${ageMin} min ago in ${m.timings.total}s`],
       ['head', f.head ? `@${f.head.slice(0, 8)} · ${plural(f.changed.length, 'file')} changed since the index` : 'unknown (not a git repo?)'],
@@ -444,7 +444,7 @@ const cmds = {
     const client = createClient({ owner, repo, token, transport: seam ? seam.transport : fetchTransport, clock, log: say,
       ...(timeout !== undefined && { requestTimeoutMs: timeout * 1000 }), ...(rateWait !== undefined && { maxRateWaitMs: rateWait * 1000 }) });
     let r;
-    try { r = await ghSync({ codeDbPath, repoDir, client, full: !!opt.full, log: say, clock }); }
+    try { r = await ghSync({ codeDbPath, repoDir, client, full: !!opt.full, log: say, clock, token }); }
     catch (e) {
       if (e.code !== 'lock-busy') throw e;
       r = { status: 'busy', cursor: null, counts: null, error: e.message, staleLock: false, relink: null };

@@ -9,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
-import { fixtureRepo, makeGithubDb, runBrain } from './helpers.mjs';
+import { fixtureRepo, makeGithubDb, runBrain, holdLockInChild, killChild } from './helpers.mjs';
 import { SANITIZE_VERSION } from '../../src/sanitize.mjs';
 
 const ch = (n) => String.fromCodePoint(n);
@@ -88,10 +88,11 @@ test('Phase 0 JSON keeps its fields; freshness gains `github`, coverage is added
   assert.ok(answers.why.citations.length > 0 && 'ms' in answers.why);
   // with a github.db next to the index, its sync state is in every answer
   const db = copyIndex();
-  makeGithubDb(db, { syncState: { sanitize_version: SANITIZE_VERSION, last_ok_at: new Date().toISOString() } });
+  const asOf = new Date(Math.floor(Date.now() / 1000) * 1000 - 3_600_000).toISOString().replace('.000Z', 'Z');   // 1 h old: not stale
+  makeGithubDb(db, { syncState: { sanitize_version: SANITIZE_VERSION, cursor: asOf, last_ok_at: new Date().toISOString() } });
   const r = JSON.parse(F.brain(['refs', 'src/lib/credits.ts#reserve', '--json'], { BRAIN_DB: db }).stdout);
-  assert.deepEqual([r.freshness.github.state, r.freshness.github.asOf], ['ok', '2026-11-15T09:58:00Z']);
-  assert.match(F.brain(['find', 'reserve'], { BRAIN_DB: db }).stdout, /· github data as of 2026-11-15 09:58Z \(synced \d+m ago, ok · full sync never\)\n$/);
+  assert.deepEqual([r.freshness.github.state, r.freshness.github.asOf], ['ok', asOf]);
+  assert.match(F.brain(['find', 'reserve'], { BRAIN_DB: db }).stdout, new RegExp(`· github data as of ${asOf.slice(0, 10)} ${asOf.slice(11, 16)}Z \\(synced \\d+m ago, ok · full sync never\\)\\n$`));
 });
 
 test('viz: stdout is the file path only, its footer goes to stderr, the HTML marks people\'s text untrusted', () => {
@@ -216,11 +217,11 @@ test('build --if-stale rebuilds an index made by an older sanitizer, then keeps 
   assert.equal(build().skipped, true);
 });
 
-test('a write while another process holds the lock exits 3 (busy)', () => {
+test('a write while another process holds the lock exits 3 (busy)', async () => {
   const db = copyIndex();
-  writeFileSync(`${db}.lock`, String(process.pid));          // this test process: alive, and not the brain process
-  const r = F.brain(['build', '.', '--json'], { BRAIN_DB: db });
-  rmSync(`${db}.lock`);
+  const holder = await holdLockInChild(db);                  // a live process that is not the brain process
+  let r;
+  try { r = F.brain(['build', '.', '--json'], { BRAIN_DB: db }); } finally { await killChild(holder); }
   assert.equal(r.status, 3, r.stdout + r.stderr);
   assert.equal(JSON.parse(r.stdout).code, 'lock-busy');
 });

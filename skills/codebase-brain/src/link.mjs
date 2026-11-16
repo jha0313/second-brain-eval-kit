@@ -15,15 +15,17 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb, getMeta, inTransaction } from './db.mjs';
-import { git } from './files.mjs';
+import { git, gitEnv } from './files.mjs';
 import { githubDbPath, openGithubDb } from './gh-schema.mjs';
 import { pathIndex, PATH_RE, IDENT_RE, MAX_NAME_OWNERS } from './index-knowledge.mjs';
 import { isRedacted, sanitizeIdent } from './sanitize.mjs';
 
 /**
  * @typedef {{ kind: 'file'|'dir'|'symbol'|'commit'|'item'|'route'|'name', target: string, origin: 'text'|'merge-sha'|'inline'|'pr-files' }} RawRef
- * @typedef {{ ptr: string, kind: string, title?: string|null, body?: string|null, path?: string|null, merge_sha?: string|null }} RefSource
- *   a sanitized items row (or the subset of it extraction reads)
+ * @typedef {{ ptr: string, kind: string, title?: string|null, body?: string|null, path?: string|null, merge_sha?: string|null,
+ *   state?: string|null, merged_at?: string|null }} RefSource
+ *   a sanitized items row (or the subset of it extraction reads). The merge-sha commit ref is made only when
+ *   state is 'merged' or merged_at is set: GitHub also gives open PRs a merge_commit_sha (a test merge).
  */
 
 export const BUDGET = { bytes: 16e6, ms: 20000 };
@@ -195,7 +197,7 @@ function resolvers({ code, gh, tracked }) {
 // one `git cat-file --batch-check` for every SHA: sha -> 'commit' | 'ambiguous' | 'missing' | ..., null when git failed
 function commitTypes(repoDir, shas) {
   return new Promise((resolve) => {
-    const child = execFile('git', ['-C', repoDir, 'cat-file', '--batch-check'], { encoding: 'utf8', maxBuffer: Infinity }, (err, stdout) => {
+    const child = execFile('git', ['-C', repoDir, 'cat-file', '--batch-check'], { encoding: 'utf8', maxBuffer: Infinity, env: gitEnv() }, (err, stdout) => {
       if (err) return resolve(null);
       const lines = stdout.split('\n');
       resolve(new Map(shas.map((s, i) => [s, lines[i]?.split(' ')[1]])));
@@ -235,7 +237,7 @@ async function grepTokens(repoDir, commit, tokens, budget) {
       }
     };
     const failed = await new Promise((resolve) => {
-      const child = execFile('git', args, { encoding: 'utf8', maxBuffer: Infinity }, (err) => {
+      const child = execFile('git', args, { encoding: 'utf8', maxBuffer: Infinity, env: gitEnv() }, (err) => {
         clearTimeout(timer);
         if (!err || over || done) return resolve(null);
         resolve(err.code === 1 ? null : err.code ?? err.signal ?? 'error');      // exit 1: nothing matched
@@ -261,7 +263,8 @@ const greppable = (t) => t.length >= 3 && t.length <= 200 && !/[\n\r\0]/.test(t)
 
 /**
  * @param {{ codeDbPath: string, repoDir: string, budget?: { bytes: number, ms: number }, log?: (s: string) => void }} opts
- * @returns {Promise<null | { linked: number, ambiguous: number, unlinked: number, pending: number, build: string }>}
+ * @typedef {{ linked: number, ambiguous: number, unlinked: number, pending: number, build: string }} RelinkResult
+ * @returns {Promise<null | RelinkResult>} null: no github.db. A failure throws; build and sync record it as { error }
  *   null when there is no github.db next to the code DB
  */
 export async function relink({ codeDbPath, repoDir, budget = BUDGET, log } = {}) {

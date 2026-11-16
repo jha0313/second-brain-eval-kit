@@ -127,7 +127,8 @@ test('network errors and 5xx retry 3 times after 1s, 2s, 4s, then GhError', asyn
 test('primary rate limit waits until x-ratelimit-reset, at most 1 hour, and logs the wait', async () => {
   const reset = (s) => String(Date.parse(START) / 1000 + s);
   const limited = (s) => ({ status: 403, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': reset(s) }, body: { message: 'API rate limit exceeded' } });
-  for (const [secs, ms] of [[300, 300_000], [2400, 2_400_000], [7200, 3_600_000]]) {
+  // a reset past maxRateWaitMs (default 1 h) fails at once; the 1 h cap on one sleep: the maxRateWaitMs test below
+  for (const [secs, ms] of [[300, 300_000], [2400, 2_400_000]]) {
     const { client, clock, logs } = make(scripted(limited(secs), REPO_OK));
     assert.equal((await client.getRepo()).id, 42);
     assert.deepEqual(clock.slept, [ms]);
@@ -428,4 +429,13 @@ test('integration: a rate-limit wait over maxRateWaitMs fails at once instead of
   const ok = createClient({ owner: 'o', repo: 'r', token: TOKEN, transport: scripted({ ...limited, headers: { 'retry-after': '30' } }, REPO_OK),
     clock: virtualClock(START), maxRateWaitMs: 60_000 });
   assert.equal((await ok.getRepo()).id, 42);                               // a 30 s wait is within the limit
+  // the limit is checked against the whole wait, not the 1 h it would sleep first (Codex lane I review)
+  const far = { ...limited, headers: { ...limited.headers, 'x-ratelimit-reset': String(Date.parse(START) / 1000 + 7200) } };
+  const c2 = virtualClock(START);
+  await assert.rejects(createClient({ owner: 'o', repo: 'r', token: TOKEN, transport: scripted(far, REPO_OK), clock: c2 }).getRepo(),
+    (e) => e.kind === 'rate-limit' && /7200s is over the 3600s limit/.test(e.message));
+  assert.deepEqual(c2.slept, []);
+  const c3 = virtualClock(START);
+  assert.equal((await createClient({ owner: 'o', repo: 'r', token: TOKEN, transport: scripted(far, REPO_OK), clock: c3, maxRateWaitMs: 3 * 3600_000 }).getRepo()).id, 42);
+  assert.deepEqual(c3.slept, [3600_000]);                                  // allowed: still at most 1 h per sleep
 });

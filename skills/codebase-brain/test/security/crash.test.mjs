@@ -4,6 +4,7 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { basename } from 'node:path';
+import { lockState } from '../phase1/helpers.mjs';
 import {
   FAILPOINTS, canaries, addTokenCanaries, githubSecretCorpus, replayRoutes, writeReplay, setupRepo, sync, parseJson, brief, resetGithub,
   storeFiles, storeLeaks, outputLeaks,
@@ -33,7 +34,9 @@ for (const name of FAILPOINTS) {
     assert.equal(res?.status, 'ok', `the next sync: ${brief(reg, next)}`);
     assert.equal(res.staleLock, true, 'the next sync cleared the dead lock');
     assert.deepEqual([...outputLeaks(reg, [crash, next]), ...storeLeaks(reg, fx.codeDb)], []);
-    const leftovers = storeFiles(fx.codeDb).map((f) => basename(f)).filter((n) => /-journal$|\.full-tmp|\.lock/.test(n));
-    assert.deepEqual(leftovers, [], 'no journal, temp store or lock after a successful sync');
+    // the write lock is an SQLite file that stays (its bytes are scanned above); its diagnostic pid file must not
+    const leftovers = storeFiles(fx.codeDb).map((f) => basename(f)).filter((n) => /-journal$|\.full-tmp|\.lock\.|\.lock-/.test(n));
+    assert.deepEqual(leftovers, [], 'no journal, temp store or lock pid file after a successful sync');
+    assert.equal(lockState(fx.codeDb), 'clean', 'the next sync released the lock normally');
   });
 }

@@ -36,7 +36,7 @@ OTHER_ID_BEFORE = re.compile(r"\b(?:run|id|user|job|request|trace|session|uuid)\
 GH_NUM = r"[1-9]\d{0,15}"
 GH_CITE_RE = re.compile(
     rf"(?P<url>https?://(?:www\.)?(?i:github\.com)/(?P<owner>[\w.-]+)/(?P<name>[\w.-]+)/(?P<ukind>pull|issues)/(?P<unum>{GH_NUM})(?!\w)"
-    r"(?:/[^\s#<>()\[\]\"'`]*)?(?:#(?P<uanchor>[\w-]+))?)"
+    r"(?:/[^\s#?<>()\[\]\"'`]*)?(?:\?[^\s#<>()\[\]\"'`]*)?(?:#(?P<uanchor>[\w-]+))?)"
     r"|(?P<other>https?://[^\s<>()\[\]\"'`]+)"
     rf"|(?<![\w:/])(?P<ptype>pr|issue|review|rc|ic):(?P<pnum>{GH_NUM})(?!\.?\w)"
     rf"|\b(?P<bkind>pull|issues)/(?P<bnum>{GH_NUM})(?:#(?P<banchor>[\w-]+))?(?!\.?\w)"

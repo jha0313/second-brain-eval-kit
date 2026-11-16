@@ -91,7 +91,7 @@ def test_cites_exist_failure_labels(repo):
 
 def test_grading_version_is_recorded():
     assert checks.GRADING_VERSION == "grading-v2"
-    assert judge.JUDGE_VERSION == "judge-v4"
+    assert judge.JUDGE_VERSION == "judge-v5"
 
 
 def test_old_grading_version_is_not_silently_regraded(tmp_path, capsys):

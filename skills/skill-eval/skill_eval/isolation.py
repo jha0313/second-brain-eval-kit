@@ -7,6 +7,10 @@ A fresh folder is not a security boundary, so a trial gets several layers (probe
 - run settings: bundled skills off, disableAllHooks, auto-memory off, sandbox on, Read/Edit deny rules for
   answer keys, rubrics, skill sources, the token file and ~/.claude
 - an env allowlist: the child does not inherit this session's CLAUDE_CODE_* variables
+- Read/Edit deny rules (and so the sandbox's read rules for Bash) for host credential stores: ~/.config/gh
+  (gh's hosts.yml), ~/.git-credentials, ~/.config/git/credentials, ~/.netrc, ~/.ssh. An empty GH_CONFIG_DIR only
+  changes where gh looks; an injected `cat ~/.config/gh/hosts.yml` would still read the file without these
+- saved trial files (trajectory, stderr) go through redact(): the Claude token and any GitHub-token-shaped string
 - no GitHub or git credential: GH_CONFIG_DIR is a new empty folder, git reads no global or system config (so no
   credential helper such as osxkeychain), git and Git Credential Manager never prompt, and no GH_* / GITHUB_*
   variable passes, not even from skill_env
@@ -36,6 +40,23 @@ NO_GIT_CREDENTIALS = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "
                       "GCM_INTERACTIVE": "never"}
 TOKEN_FILE = Path(os.environ.get("SKILL_EVAL_TOKEN_FILE", Path.home() / ".config" / "skill-eval" / "oauth-token"))
 INSTRUCTION_FILES = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".claude")
+# Host credential stores a trial must never read (files and folders; deny rules cover both forms), including the gh and
+# git config folders that the host's GH_CONFIG_DIR / XDG_CONFIG_HOME move elsewhere
+
+
+def gh_config_dirs(env=os.environ) -> tuple[Path, ...]:
+    dirs = [Path.home() / ".config/gh", *([Path(env["XDG_CONFIG_HOME"]) / "gh"] if env.get("XDG_CONFIG_HOME") else []),
+            *([Path(env["GH_CONFIG_DIR"])] if env.get("GH_CONFIG_DIR") else [])]
+    return tuple(dict.fromkeys(dirs))
+
+
+def credential_paths(env=os.environ) -> tuple[Path, ...]:
+    git = [Path.home() / ".config/git/credentials", *([Path(env["XDG_CONFIG_HOME"]) / "git/credentials"] if env.get("XDG_CONFIG_HOME") else [])]
+    return tuple(dict.fromkeys([*gh_config_dirs(env), Path.home() / ".git-credentials", *git, Path.home() / ".netrc", Path.home() / ".ssh"]))
+
+
+# GitHub token shapes. A trial or probe that printed one anyway must not leave it in a saved file.
+GH_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})")
 # Keys that would change what a trial can see or do if an auto-synced file in the empty config dir carried them
 # (remote-settings.json / policy-limits.json come from the account). Only key NAMES are ever recorded.
 RISKY_KEYS = {"hooks", "permissions", "env", "plugins", "enabledPlugins", "extraKnownMarketplaces", "skills",
@@ -53,8 +74,9 @@ def token() -> str | None:
 
 def trial_settings(arm_skill: str | None, deny_dirs: list[Path], extra_off: list[str] = ()) -> dict:
     off = {s: "off" for s in [*BUNDLED_SKILLS, *extra_off] if s != arm_skill}
-    paths = [*map(str, deny_dirs), str(Path.home() / ".claude"), str(TOKEN_FILE.parent)]
-    deny = [f"{tool}(/{p}/**)" for p in paths for tool in ("Read", "Edit")]
+    paths = [*map(str, deny_dirs), str(Path.home() / ".claude"), str(TOKEN_FILE.parent), *map(str, credential_paths())]
+    # "//abs/path" is an absolute path rule; "/**" covers a folder's contents, the bare form a single file
+    deny = [f"{tool}(/{p}{tail})" for p in paths for tool in ("Read", "Edit") for tail in ("", "/**")]
     return {
         "skillOverrides": off,                 # only the arm's skill is visible
         "disableAllHooks": True,               # no hooks from any settings source
@@ -154,10 +176,12 @@ def ancestor_instructions(ws: Path) -> list[str]:
 
 
 def redact(text: str) -> str:
-    """Remove the token and the token file's folder (in any spelling) from text that will be saved or shown."""
+    """Remove the token, any GitHub-token-shaped string and the token file's folder (in any spelling) from text that
+    will be saved or shown."""
     tok = token()
     if tok:
         text = text.replace(tok, "[REDACTED-TOKEN]")
+    text = GH_TOKEN_RE.sub("[REDACTED-GITHUB-TOKEN]", text)
     folder = str(TOKEN_FILE.parent)
     home = str(Path.home())
     for form in {folder, os.path.realpath(folder), folder.replace(home, "~", 1), folder.replace(home, "$HOME", 1)}:

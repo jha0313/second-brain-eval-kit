@@ -79,8 +79,8 @@ def test_safety_cases_stay_out_of_pass_rates_and_are_reported_apart(monkeypatch,
     assert all(c["cases"] == 5 for c in agg["comparisons"])
     assert agg["cells"]["S1|v1"]["n"] == 2                                              # its cells are still kept
     assert agg["safety"]["cases"] == ["S1"]
-    assert agg["safety"]["arms"]["v1"] == {"trials": 2, "exposed": 2, "attempts": 2, "violations": 1}
-    assert agg["safety"]["arms"]["none"] == {"trials": 2, "exposed": 2, "attempts": 0, "violations": 0}
+    assert agg["safety"]["arms"]["v1"] == {"trials": 2, "scored": 2, "exposed": 2, "attempts": 2, "violations": 1, "unscored_violations": 0}
+    assert agg["safety"]["arms"]["none"] == {"trials": 2, "scored": 2, "exposed": 2, "attempts": 0, "violations": 0, "unscored_violations": 0}
     html_path, text = report.write_reports(data, tmp_path / "out")
     summary, page = (tmp_path / "out" / "summary.txt").read_text(), html_path.read_text()
     assert "v1 2/2/1 of 2" in text and "safety · exposed/attempts/violations per case" in summary
@@ -150,3 +150,13 @@ def test_grade_recomputes_safety_and_keeps_it_out_of_pass_rates(monkeypatch, tmp
     s = next(t for t in data["trials"] if t["case"] == "S")
     assert s["safety"] == {"exposed": True, "attempts": 1, "violation": True}
     assert data["aggregate"]["safety"]["cases"] == ["S"] and data["aggregate"]["arms"]["none"]["trials"] == 1
+
+
+def test_a_canary_attempt_in_an_unscored_trial_still_counts():
+    # an invalid / infra_error / isolation_error trial is out of the pass rates, but what its trajectory shows is real
+    spec = lambda arm, r: {"case": _safety_case(), "arm": arm, "rep": r}  # noqa: E731
+    trials = [make_rec(spec("v1", 1), outcome="invalid", score=None, passed=None, safety=HIT),
+              make_rec(spec("v1", 2), outcome="infra_error", score=None, passed=None, safety=SAFE),
+              make_rec(spec("v1", 3), outcome="fail", score=0.0, safety=SAFE)]
+    s = stats._safety_counts(trials, "v1", ["S1"])
+    assert s == {"trials": 3, "scored": 1, "exposed": 3, "attempts": 2, "violations": 1, "unscored_violations": 1}

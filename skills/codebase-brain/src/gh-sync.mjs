@@ -26,7 +26,10 @@ import { extractRefs, fileRefs, relink } from './link.mjs';
  * @typedef {{ sanitize: Function, sanitizeLine: Function, extractRefs: Function, fileRefs: Function, relink: Function }} SyncDeps
  * @typedef {{ status: 'ok'|'failed'|'busy', cursor: string|null, counts: { prs: number, issues: number, reviews: number,
  *   reviewComments: number, issueComments: number, files: number, requests: number }, error: string|null, staleLock: boolean,
- *   relink: object|null }} SyncResult
+ *   relink: import('./link.mjs').RelinkResult | { error: string } | null }} SyncResult
+ *   status 'busy': another write holds the lock; sync returns it (never throws LockBusyError), nothing is written.
+ *   relink: null when relink did not run (nothing was written: repo id mismatch, getRepo failure, a failure at
+ *   sync:after-repo, a failed --full, busy); { error } when it failed (the sync is still ok, plan §3.1).
  */
 
 const DEFAULT_DEPS = { sanitize, sanitizeLine, extractRefs, fileRefs, relink };
@@ -64,7 +67,9 @@ function tx(db, fn) {
 
 /**
  * @param {{ codeDbPath: string, repoDir: string, client: import('./gh-client.mjs').GhClient, full?: boolean,
- *   log?: (s: string) => void, clock?: import('./gh-client.mjs').Clock, deps?: Partial<SyncDeps> }} opts
+ *   log?: (s: string) => void, clock?: import('./gh-client.mjs').Clock, deps?: Partial<SyncDeps>, token?: string|null }} opts
+ *   token: the active token, used only to cut it out by value (redactValues) of last_error, result.error and
+ *   result.relink.error; the client already holds it for requests.
  * @returns {Promise<SyncResult>}
  */
 export async function sync({ codeDbPath, repoDir, client, full = false, log = () => {}, clock = { now: () => Date.now() }, deps = {}, token = null }) {
@@ -257,6 +262,7 @@ export function upsertPage(db, entries) {
  * @param {'pr'|'issue'|'review'|'review_comment'|'issue_comment'} kind
  * @param {object[]} raws raw REST objects (reviews need { ...review, pull_number })
  * @param {{ selfRepo: string, deps?: Partial<SyncDeps> }} opts
+ * @returns {{ inserted: number, updated: number, skipped: number, items: ItemRow[] }} items: the rows as stored
  */
 export function ingestRaw(db, kind, raws, { selfRepo, deps = {} } = {}) {
   if (!COUNT_KEY[kind]) throw new BrainError('bad-kind', `unknown item kind: ${String(kind).slice(0, 40)}`);

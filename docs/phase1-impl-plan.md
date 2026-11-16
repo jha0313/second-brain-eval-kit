@@ -141,15 +141,19 @@ flowchart LR
 - **정확한 요청 표**(경로 + query 키 집합 + 헤더)가 파일 머리에 있다. replay fixture(G·S·I)는 이 표에 맞춘다.
 - 재시도 1·2·4초, 1차 rate limit은 reset까지(최대 1시간), 2차는 `retry-after` 또는 60초 배수 ×3. 다 실패하면 `GhError`.
 - **GET만.** 다른 메서드는 코드에 없다. 토큰은 `Authorization` 헤더에만, 오류·로그·`stats()`에 없다.
+- **요청 주소(A14).** 모든 요청은 `https://api.github.com`의 `/repos/{owner}/{repo}/…` 또는 `/repositories/{repo id}/…` 아래다. GitHub의 Link `rel="next"`와 repo 이동 응답은 id 형식을 쓴다. id는 `getRepo()`가 돌려준 값만 받는다. 다른 host·경로의 Link는 따라가지 않고 `GhError('protocol')`. replay fixture(G·S·I)의 2쪽 이후 경로도 두 형식 모두 될 수 있다. replay seam은 `<dir>/requests.log`에 `METHOD URL`을 남긴다(헤더 없음). S의 토큰 테스트가 이것으로 host·경로를 확인한다.
+- **`files(n).truncated`(A15).** 3,000개가 왔거나(30쪽 꽉 참, GitHub 상한) 30쪽 뒤에도 next가 남으면 `true`. GitHub는 3,000에서 말없이 멈추고 next를 주지 않을 수 있다. 정확히 3,000개인 PR도 잘림으로 본다(coverage `partial` 쪽으로 틀린다).
 - `readToken`: `GH_TOKEN` → `GITHUB_TOKEN` → (`allowGh`일 때만) `gh auth token`. 없으면 `null`.
 
 ### 3.5 linker — `src/link.mjs` (D)
 
 - **추출(순수, 색인 없음):** `extractRefs(item, { selfRepo })`가 문법만 보고 후보를 낸다. 경로 모양 → `file`(끝이 `/`면 `dir`), 백틱 식별자 → `symbol`, 7–40자 hex → `commit`, `#N`·같은 repo URL → `item`, `/api/…` 모양 → `route`, 그 밖의 이름 → `name`. 공유 정규식은 `index-knowledge.mjs`의 `PATH_RE` · `IDENT_RE`(전역 플래그: `matchAll` 또는 복사본만).
 - **해석(색인 있음):** `relink()`가 `pathIndex(tracked).resolvePath` · `resolveBase`(유일한 basename), code.db `nodes`, `git cat-file`, github.db `items`로 푼다. "이미 file로 풀린 이름은 name으로 다시 풀지 않는다"는 relink에서 본다.
-- `git grep`은 `execFile`(셸 없음), `-n -I -F -f <토큰 파일> <commit> --`. 대상이 `-`로 시작하거나 `$(…)`를 담아도 인자가 되지 않는다.
+- `git grep`은 `execFile`(셸 없음), `--no-color -n -z -I -F -f <토큰 파일> <commit> --`. 대상이 `-`로 시작하거나 `$(…)`를 담아도 인자가 되지 않는다. `-z`가 없으면 git이 한국어 경로를 C 인용하고 경로 속 `:`가 `path:line` 나누기를 깬다. `color.grep=always`는 ANSI를 넣는다(A16).
+- file·dir 해석은 `git ls-tree -r -z --name-only <meta.commit>`(색인한 커밋의 경로). commit은 `git cat-file --batch-check` 한 프로세스. relink는 reason `not-synced`인 `item` ref도 다시 푼다.
 - 예산 `{ bytes: 16e6, ms: 20000 }`을 넘으면 남은 refs는 `pending`, reason `budget`. `resolved_build`가 지금 build id와 다르면 다시 푼다.
-- 반환 `{ linked, ambiguous, unlinked, pending, build }`, github.db가 없으면 `null`.
+- 반환 `RelinkResult = { linked, ambiguous, unlinked, pending, build }`, github.db가 없으면 `null`. 실패는 throw. build와 sync는 그것을 결과의 `relink: { error }`로 적고 실패로 만들지 않는다(§3.1).
+- `RefSource`에 `state` · `merged_at`이 있다. merge-sha commit ref는 머지된 PR에서만 만든다(열린 PR의 `merge_commit_sha`는 GitHub의 시험 머지).
 
 ### 3.6 sync — `src/gh-sync.mjs` (G)
 
@@ -194,6 +198,9 @@ flowchart LR
 
 - `brain source <ptr>`: 첫 줄 `── quote <ptr> · untrusted · <origin> · …`, 본문은 모두 `│ `로 시작, `── end quote <ptr> · …`는 정확히 하나, 그 뒤 `  coverage: …`, `  freshness: …`.
 - 텍스트 출력의 외부 문자열은 `"…"` 안에 있어 줄 맨 앞에 오지 않는다. C0·C1 제어문자(탭·LF 제외), bidi, zero-width 문자는 어디에도 없다.
+- 체크아웃의 파일 경로와 심볼 이름(Phase 0 표: `find` · `refs` · `callers` · `impact` · `why`)도 외부 문자열이다. `ident()`가 공백·따옴표·역슬래시를 담은 것만 따옴표로 싸서 줄 맨 앞에 오지 못하게 한다. `get`의 GitHub 파일 경로 · login · 브랜치 이름은 줄 가운데에 따옴표 없이 올 수 있다(설계 §6.7 예시). 제목 · snippet · 첫 줄은 언제나 따옴표(A17).
+- `suspicious`는 봉투 끝줄, `get`의 `flags` 줄, 검색 행 아래 `flags:` 줄, thread 항목 끝 `flag: suspicious`에 보인다(설계 §6.5 L8).
+- `--json`의 런타임 되울림(`search`의 `query`, `status`의 체크아웃 경로, 오류 메시지)도 `redactValues` → `sanitizeLine`을 지난다(A18).
 - 비밀 corpus의 원문은 code.db · github.db · `*-journal` · `*.full-tmp` 바이트, stdout, stderr, viz HTML 어디에도 0건. **판정은 정확한 canary 문자열로 한다**(마스커의 정규식을 쓰면 그 사각지대를 그대로 물려받는다).
 
 ---
@@ -245,6 +252,8 @@ flowchart LR
 | S8 | `sanitize_version`이 낮은 store에 증분 sync | `GuardError('github')`, 아무것도 안 씀. `--full`은 성공 |
 | S9 | repo id 불일치 | `failed`, 아무것도 안 씀 |
 | S10 | relink 실패(`sync:relink`) | sync는 `ok`, 결과에 relink 오류 기록 |
+
+종단 테스트: `test/phase1/e2e.test.mjs`가 S1–S10을 실제 CLI(`bin/brain`)와 replay seam으로 돌린다(첫 sync → 증분 2회, `/repositories/<id>` Link 쪽, 30쪽 files 잘림 포함). "마지막 커밋 상태와 일치"는 항목마다 부분별로 본다: 행+본문 refs, files 단계(`detail_for`·`files-truncated`·`pr-files` refs), `reviews_at`이 각각 실행 전 상태나 한 번에 끝난 실행의 상태 중 하나와 같아야 한다(이번 실행에 새로 생긴 항목은 files·reviews 단계 전 상태도 허용). build → sync → relink → read(search/get/source, 이름을 바꾼 뒤 build가 다시 잇기)도 같은 파일에 있다.
 
 ### 5.3 단계 관문
 
@@ -324,6 +333,36 @@ flowchart LR
 | A12 | build 실패 시 DB 닫고 삭제 | Codex 확인 라운드: sweep 전 실패가 마스킹 안 된 파일을 남겼다 |
 | A13 | `git()` stderr를 잡는다 | Codex 확인 라운드: git stderr가 CLI의 마스킹 출구를 우회했다 |
 | A9 | eval arm `none · dump · v2` → `none · v1 · dump · v2` | 한 칸에 한 가지만 바뀌어야 효과를 나눠 말할 수 있다 |
+| A14 | 요청 주소: `/repos/{owner}/{repo}` 또는 `/repositories/{getRepo id}` 아래만. replay `requests.log` | C·S 계약 요청: 실제 Link 헤더는 id 형식이라 "보낸 그대로 따라감"과 "repo 경로 아래만"이 부딪쳤다 |
+| A15 | `files().truncated` = 3,000개 도착 또는 30쪽 뒤 next | C: GitHub는 3,000에서 next 없이 멈출 수 있다 |
+| A16 | `git grep --no-color -z`, `ls-tree -z`, `cat-file --batch-check`, `not-synced` item 재해석 | D: 한국어 경로 인용 · ANSI · 커밋당 프로세스 2,000개 |
+| A17 | 체크아웃 경로·심볼은 `ident()`, GitHub 경로·login·브랜치는 줄 가운데 맨 글자 | S: 설계 L4와 §6.7 예시가 달랐다 |
+| A18 | `--json` 런타임 되울림도 마스킹. `status`의 체크아웃 경로 포함 | S: 체크아웃 경로의 비밀이 `status` 출력에 나왔다(보안 테스트로 확인 후 수정) |
+| A19 | GitHub `stale` = cursor T가 24시간보다 오래됨(설계 §6.8). E1은 `last_ok_at`을 썼다 | 데이터 기준 시각은 T다. 방금 끝난 run이라도 T가 오래면 오래된 데이터다 |
+| A20 | replay seam의 토큰 = `GH_TOKEN` → `GITHUB_TOKEN` → `"replay-token"` | S: 실제 활성 토큰이 오류·로그·저장 경로에 새지 않는지를 보려면 테스트의 canary가 활성 토큰이어야 한다 |
+| A21 | `SearchRow.flags`, `ThreadEntry.flags`, `GetItem.parent` · `position` · `untrusted.path`(rc), `get` 6개 이상은 `BrainError('too-many-pointers')` | E2: L8의 "표에도 표시"를 지킬 칸이 없었고, `get rc:<id>`가 자기 PR과 줄 위치를 못 보였다 |
+| A22 | `--state closed` = 열려 있지 않음(닫힌 이슈, 머지·미머지로 닫힌 PR). `--kind review` = 리뷰 + 인라인 댓글, `--kind comment` = 인라인 댓글 + 대화 댓글 | E2: 값 목록만 있고 뜻이 없었다. GitHub의 뜻을 따랐다 |
+| A23 | sync는 busy를 `{ status: 'busy' }`로 돌려준다(throw 안 함). `SyncResult.relink` = `RelinkResult` · `{ error }` · `null`. sync opts에 `token`(값으로 지우기 전용). CLI가 넘긴다 | E1 · G: 모양이 정해지지 않았다. CLI가 token을 넘기지 않아 `last_error`의 `redactValues`가 아무것도 안 했다 |
+
+| A24 | `createClient`의 `requestTimeoutMs`(기본 60초, 시도마다 `AbortSignal.timeout`, 넘으면 네트워크 오류로 재시도)와 `maxRateWaitMs`(기본 1시간, 넘는 대기는 기다리지 않고 `GhError('rate-limit')`). CLI `brain sync --request-timeout S --max-rate-wait S` | Phase 3 S4(요청 하나 30초, rate limit 대기 60초)와 F8: Phase 1 fetch에는 시간 상한이 없었다 |
+| A25 | 서버 `Date`가 저장된 cursor보다 이르면 sync 실패(cursor는 뒤로 가지 않는다). `--full`도 같다 | Phase 3 §5 "T는 앞으로만 간다" |
+| A26 | `detectSecrets(s)` → 비밀 종류 목록(아무것도 고쳐 쓰지 않음, `mask()`와 같은 규칙) | Phase 2 R16 업로드 전 검사가 어떤 문자열에도 부를 탐지기가 필요했다. `SANITIZE_VERSION`은 규칙이 바뀔 때 손으로 올리는 정수라 같은 글·같은 버전이면 결과가 같다 |
+| A27 | meta `repo` · `worktree` 없이도 모든 읽기 명령이 돈다(테스트로 고정) | Phase 2 mirror는 로컬 경로 meta를 올리지 않는다(R16) |
+| A28 | `sweepSecrets`는 노드 키를 통째로 가리지 않고 부분(경로, 이름, 부모 이름)을 따로 가린 뒤 다시 잇는다: file `path`, dir `dir:path`, symbol `path#[Parent.]Name[@kind]`. 그 밖의 모양만 통째로 가린다 | Phase 2 레인 B가 찾은 버그. `token=…` 꼴 경로는 키를 통째로 가리면 할당 규칙의 값이 `#Name`까지 먹어서 키의 표시가 자기 경로의 표시와 달라졌고, Phase 2 `canonicalNodeKey`가 그 키에서 throw했다(게시 안 됨, 새는 것 없음). 다시 이은 키에는 이미 가려진 path·name 열에 있는 글만 들어간다 |
+| A29 | brain이 부르는 git(`files.mjs` `git()`, relink의 `cat-file`·`grep`, repo 루트 찾기)은 `GH_*`·`GITHUB_*`·`BRAIN_*` 변수를 뺀 env로 돈다(`gitEnv()`; PATH·HOME·`GIT_*`는 그대로) | Phase 2 레인 B 요청. git에는 토큰이 필요 없다. 테스트: PATH 앞의 git 래퍼가 받은 변수 이름을 적고, build·sync·relink 뒤 0개 |
+| A30 | `detectSecrets`는 redaction 표시 사이의 조각을 따로 검사한다(표시가 match를 끝낸다). `mask()`의 규칙은 그대로(`SANITIZE_VERSION` 그대로) | Codex 최종 리뷰: A28로 다시 이은 키 `src/token=[REDACTED:assignment:…]#Name`을 할당 규칙이 새 값으로 읽어 Phase 2 R16 검사가 거부했다. 표시 뒤의 모양 있는 비밀(`ghp_…` 등)은 여전히 잡는다 |
+
+Phase 2가 Phase 1에 요청한 것 중 이미 맞는 것: T = 첫 응답(`getRepo`)의 `Date`(G가 이미 그렇다), 링크 결과는 노드 키 문자열(D: file → 경로, symbol → `path#Name`, grep → `path:line`; Phase 2 `canonicalResolved`가 정규 키로 바꾼다), vault는 로컬 전용(Phase 2 snapshot이 vault 청크를 거부한다). async store와 `@r<n>`은 Phase 2 레인 C 몫이다.
+
+**계약 요청 중 받지 않은 것(I 판단).**
+
+| 요청 | 판단 |
+|---|---|
+| 실패한 `--full`이 옛 github.db에 `failed` · `last_error`를 적기(G) | 받지 않음. "`--full` 실패는 옛 저장소를 바이트까지 그대로 둔다"가 더 강한 불변식이고 테스트가 그것을 본다. 오류는 sync 결과에 나온다 |
+| sweep 때 제어문자를 담은 식별자 고쳐 쓰기(B) | 받지 않음. 출력 경계(`fmt.safe`)가 언제나 지운다. 저장값을 바꾸면 그래프 키가 바뀐다 |
+| `meta.swept`를 따로 저장(B) | 받지 않음. 숫자는 `brain build --json`의 `stats.swept`에 있다. meta 키를 늘리면 Phase 2 golden이 바뀐다 |
+| ref reason `stale-build`(E2, 선택) · 청크별 `redactions` · `suspicious` 열(E2, 선택) | 미룸. 읽을 때 계산으로 충분하다 |
+| `answer.guard`가 cursor 없이 행만 있는 github.db도 막기(G) | 이미 됨. G가 첫 쓰기에 `sanitize_version`을 적고, guard는 cursor가 없어도 버전이 있으면 본다 |
 
 ## 부록 B: Codex 계획 리뷰 처리
 

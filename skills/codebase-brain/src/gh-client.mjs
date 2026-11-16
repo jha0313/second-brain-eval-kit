@@ -3,13 +3,15 @@
 // Contract (design §6.2 R1, R3–R5, §6.3):
 // - all methods are async; they return only data from successful responses, or throw GhError (errors.mjs)
 // - retries live here: network errors and 5xx retry 3 times with exponential backoff (1s, 2s, 4s via clock.sleep);
-//   primary rate limit (x-ratelimit-remaining: 0) waits until x-ratelimit-reset, at most 1 hour, logging the wait;
+//   primary rate limit (x-ratelimit-remaining: 0) waits until x-ratelimit-reset, at most 1 hour per sleep, logging the wait;
+//   a wait longer than maxRateWaitMs (default 1 hour, --max-rate-wait) fails at once instead;
 //   secondary rate limit (403/429 with retry-after or "secondary rate limit" message) waits retry-after seconds,
 //   else 60s doubling, 3 times; then GhError('rate-limit')
 // - 401 -> GhError('auth'), 403 (not rate limit) -> 'forbidden', 404 -> 'not-found', anything unparsable -> 'protocol'
 // - the token never appears in an error, a log line, or a return value; HTTP errors are logged without headers
 // - per_page=100 everywhere; Link rel="next" is followed only where the stream is not keyset-paged
-// - every request is GET under https://api.github.com/repos/{owner}/{repo}; nothing else is fetched (R13)
+// - every request is GET on https://api.github.com under /repos/{owner}/{repo}/ or /repositories/{id}/ (id from getRepo(),
+//   the form GitHub's Link headers use); any other host or path, Link or redirect, is GhError('protocol') (R13, plan A14)
 //
 // EXACT requests (replay fixtures in lanes G, S, I match these query key sets exactly; order does not matter).
 // B = /repos/{owner}/{repo}. since = ISO 8601 UTC to the second, "2026-11-15T09:58:00Z" (no milliseconds).
@@ -22,7 +24,8 @@
 //     since: omitted when null (first sync). page: omitted for page 1; present (2, 3, …) only while paging inside a
 //     same-second batch (R4). Link headers are ignored on these three streams.
 //   reviews(n) page 1       GET B/pulls/{n}/reviews       { per_page: 100 }      then Link rel="next" as sent
-//   files(n) page 1         GET B/pulls/{n}/files         { per_page: 100 }      then Link rel="next" as sent, max 30 pages
+//   files(n) page 1         GET B/pulls/{n}/files         { per_page: 100 }      then Link rel="next" as sent, max 30 pages;
+//     truncated = 3,000 files came back (GitHub's cap, which may end with no next link) or a next link remains after page 30
 // Request headers: Accept: application/vnd.github+json · X-GitHub-Api-Version: 2022-11-28 ·
 //   User-Agent: codebase-brain · Authorization: Bearer <token> (only when token is non-null)
 //
@@ -116,7 +119,7 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
     const after = res.headers.get('retry-after');
     if (after != null && Number(after) >= 0) return Number(after) * 1000;
     const untilReset = Number(res.headers.get('x-ratelimit-reset')) * 1000 - clock.now();
-    if (res.headers.get('x-ratelimit-remaining') === '0' && untilReset > 0) return Math.min(untilReset, HOUR);
+    if (res.headers.get('x-ratelimit-remaining') === '0' && untilReset > 0) return untilReset;   // capped at 1 h when waited
     return MINUTE * 2 ** i;
   };
 
@@ -159,7 +162,8 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
             { status: res.status, retryAfter });
         }
         counters.rateLimitWaits++;
-        await wait(ms, `github ${label}: rate limited (HTTP ${res.status}), waiting ${Math.ceil(ms / 1000)}s (${limits}/${RETRIES})`);
+        const nap = Math.min(ms, HOUR);                    // a reset further away: wait 1 h, then ask again
+        await wait(nap, `github ${label}: rate limited (HTTP ${res.status}), waiting ${Math.ceil(nap / 1000)}s (${limits}/${RETRIES})`);
         continue;
       }
       const [kind, hint] = HTTP_KIND[res.status] ?? ['protocol', 'unexpected status'];

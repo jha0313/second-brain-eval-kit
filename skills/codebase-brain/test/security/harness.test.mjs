@@ -28,7 +28,6 @@ test('harness: canaries are distinct, cover every kind and location, and none is
   for (const loc of ['pr-title', 'pr-body', 'branch', 'review-comment', 'review-body', 'issue-comment', 'issue-title', 'issue-body', 'pr-file',
     'repo-doc', 'repo-change-note', 'repo-commit-message', 'repo-file-name', 'repo-symbol']) assert.ok(ids.some((id) => id.startsWith(loc)), loc);
   const sources = readdirSync(here).map((f) => readFileSync(join(here, f), 'utf8')).join('\n');
-  reg.delete('seam/active-token');                                    // a public constant of seams.mjs, not a secret
   assert.deepEqual(leaksIn(reg, sources), [], 'a complete secret-shaped literal would trip push protection');
 });
 

@@ -2,7 +2,9 @@
 // only through these environment variables; nothing else in the code reads test-only state.
 //
 //   BRAIN_REPLAY_DIR=<dir>   `brain sync` uses replayTransport(<dir>) + virtualClock(manifest.now) and the token
-//                            "replay-token"; readToken() is never called and no network request is made
+//                            GH_TOKEN || GITHUB_TOKEN || "replay-token" from the environment, so black-box tests see the
+//                            active token travel the real paths; readToken() and gh are never called, no network request
+//                            is made. Every request goes to <dir>/requests.log as "METHOD URL" (never headers)
 //   BRAIN_FAIL_AT=<name>     failpoint(<name>) throws BrainError('injected') (a normal failure: finally blocks run)
 //   BRAIN_CRASH_AT=<name>    failpoint(<name>) kills the process with SIGKILL (a crash: no finally, lock left behind)
 //
@@ -22,7 +24,8 @@ export function replaySeams(env = process.env) {
   const dir = env.BRAIN_REPLAY_DIR;
   if (!dir) return null;
   const transport = replayTransport(dir);
-  return { transport, clock: virtualClock(transport.now), token: 'replay-token', replay: true };
+  const token = env.GH_TOKEN || env.GITHUB_TOKEN || 'replay-token';
+  return { transport, clock: virtualClock(transport.now), token, replay: true };
 }
 
 /** @param {string} name @param {NodeJS.ProcessEnv} [env] */
