@@ -8,7 +8,9 @@
 //   of the same run. The lists follow src/store/sqlite.mjs one by one; FTS is chunk.tsv (simple over brain.fts_text:
 //   tokens and stems as FTS5's, sql/003) ranked by ts_rank instead of FTS5 bm25, and the trigram lists are ILIKE
 //   for every length: a term of 3+ characters one list part each (the pg_trgm indexes when it has a trigram and the
-//   planner takes them), a shorter one (never a trigram) in one shared scan (tr in candidates).
+//   planner takes them), a shorter one (never a trigram) in one shared scan (tr in candidates). Every list breaks
+//   ties by content (CHUNK_ORDER, an item's ptr) as sqlite.mjs does, not by id: a local build and the server number rows
+//   apart.
 // - Search payload (§6.9): candidates with top ranks the lists in SQL and returns only the shown groups; rows with
 //   prefix cuts long bodies (read.mjs proves each snippet from the prefix, or reads that row again whole).
 // - Repo memory pointers: <source>:<path>:<a>-<b>@r<n> (rev n of item <source>:<path>). A Phase 1 @<build> pointer
@@ -23,6 +25,8 @@ import { SUSPICIOUS } from '../sanitize.mjs';
 const R = '(SELECT run_id FROM v)';
 const vis = (t, run = R) => `(${t}.valid_from <= ${run} AND (${t}.valid_to IS NULL OR ${t}.valid_to > ${run}))`;
 const BYTES = 'COLLATE "C"';                       // text order as SQLite compares it (dates, paths)
+// sqlite.mjs CHUNK_ORDER over the ch columns (SQLite puts NULL first in ascending order)
+const CHUNK_ORDER = `source ${BYTES}, path ${BYTES} NULLS FIRST, sha ${BYTES} NULLS FIRST, start_line NULLS FIRST, end_line NULLS FIRST, title ${BYTES} NULLS FIRST`;
 const likeOf = (s) => `%${String(s).replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 // sync_state refs.other key of a ref (contract.githubSyncState: canonicalJson([ptr, kind, target, origin]))
 // (parenthesized: ? ->> and || are all "other" operators of one precedence, left-associative)
@@ -224,20 +228,20 @@ async function candidates(client, q, opts = {}) {
       WHERE ${w.join(' AND ')})`);
     const G = (extra = '', from = '') => `SELECT g.id, 'g' || g.id AS key, 'g' || g.gid AS grp, g.d, g.ptr, g.flags${extra} FROM g${from}`;
     const text = ' JOIN brain.chunk c ON c.rev_id = g.rev_id AND c.ord = 0';   // the item's search chunk (title + body)
-    if (tsq) add('items_fts', `${G(', ts_rank(c.tsv, w.q) AS sc', `${text} CROSS JOIN tq w`)} WHERE c.tsv @@ w.q`, 'sc DESC, id');
+    if (tsq) add('items_fts', `${G(', ts_rank(c.tsv, w.q) AS sc', `${text} CROSS JOIN tq w`)} WHERE c.tsv @@ w.q`, `sc DESC, ptr ${BYTES}`);
     for (const s of t.tri) {
       const k = shortNo(s), L = k ? null : p(likeOf(s));
       add('items_tri', k ? `${G(`, ${k} = ANY(tr.th) AS th`, ' JOIN tr ON tr.rev_id = g.rev_id AND tr.ord = 0')} WHERE ${k} = ANY(tr.hit)`
-        : `${G(`, coalesce(c.title ILIKE ${L}, false) AS th`, text)} WHERE (c.title ILIKE ${L} OR c.body ILIKE ${L})`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
+        : `${G(`, coalesce(c.title ILIKE ${L}, false) AS th`, text)} WHERE (c.title ILIKE ${L} OR c.body ILIKE ${L})`, `th DESC, d ${BYTES} DESC NULLS LAST, ptr ${BYTES}`);
     }
     const nums = t.prs.flatMap((n) => [`pr:${n.slice(1)}`, `issue:${n.slice(1)}`]);
-    if (nums.length) add('items_keys', `${G()} WHERE g.ptr = ANY(${p(nums)}::text[])`, 'id');
-    for (const sha of t.shas) add('items_keys', `${G()} WHERE g.merge_sha LIKE ${p(`${sha}%`)}`, 'id');
+    if (nums.length) add('items_keys', `${G()} WHERE g.ptr = ANY(${p(nums)}::text[])`, `ptr ${BYTES}`);
+    for (const sha of t.shas) add('items_keys', `${G()} WHERE g.merge_sha LIKE ${p(`${sha}%`)}`, `ptr ${BYTES}`);
     if (seeded) {   // refs resolved in this build to a seed: a node key, or path:line inside a seed file
       ctes.push(`sp AS (SELECT DISTINCT rl.ptr FROM rl CROSS JOIN LATERAL ${RAW_LIST('rl.resolved_raw')} j(val, n)
         WHERE rl.cur AND rl.status IN ('linked', 'ambiguous')
           AND (j.val IN (SELECT key FROM seeds) OR split_part(j.val, ':', 1) IN (SELECT key FROM seeds WHERE kind = 'file')))`);
-      add('items_links', `${G()} WHERE g.ptr IN (SELECT ptr FROM sp)`, `d ${BYTES} DESC NULLS LAST, id`);
+      add('items_links', `${G()} WHERE g.ptr IN (SELECT ptr FROM sp)`, `d ${BYTES} DESC NULLS LAST, ptr ${BYTES}`);
     }
   }
 
@@ -249,20 +253,21 @@ async function candidates(client, q, opts = {}) {
         JOIN brain.node n ON n.node_id = l.node_id WHERE l.chunk_id = c.chunk_id AND ${vis('l')} AND ${under('n.path')}))`);
     }
     ctes.push(`ch AS NOT MATERIALIZED (SELECT c.chunk_id AS id, 'c' || c.chunk_id AS key, 'c' || c.chunk_id AS grp, c.date AS d, NULL::text AS ptr,
-        NULL::text AS flags, c.tsv, c.title, c.body, c.prs, c.sha
+        NULL::text AS flags, c.tsv, c.title, c.body, c.prs, c.sha, i.kind AS source,
+        CASE WHEN i.kind = 'commit' THEN NULL ELSE substr(i.ptr, length(i.kind) + 2) END AS path, c.start_line, c.end_line
       FROM brain.item_rev r JOIN brain.item i USING (item_id) JOIN brain.chunk c USING (rev_id) WHERE i.origin = 'repo' AND ${vis('r')} AND ${w.join(' AND ')})`);
-    const K = 'SELECT id, key, grp, d, ptr, flags';
-    if (tsq) add('chunks_fts', `${K}, ts_rank(tsv, w.q) AS sc FROM ch CROSS JOIN tq w WHERE tsv @@ w.q`, 'sc DESC, id');
+    const K = 'SELECT id, key, grp, d, ptr, flags', KC = `${K}, source, path, sha, start_line, end_line, title`;   // KC: for CHUNK_ORDER
+    if (tsq) add('chunks_fts', `${KC}, ts_rank(tsv, w.q) AS sc FROM ch CROSS JOIN tq w WHERE tsv @@ w.q`, `sc DESC, ${CHUNK_ORDER}`);
     for (const s of t.tri) {
       const k = shortNo(s), L = k ? null : p(likeOf(s));
-      add('chunks_tri', k ? `${K}, ${k} = ANY(tr.th) AS th FROM ch JOIN tr ON tr.chunk_id = ch.id WHERE ${k} = ANY(tr.hit)`
-        : `${K}, coalesce(title ILIKE ${L}, false) AS th FROM ch WHERE title ILIKE ${L} OR body ILIKE ${L}`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
+      add('chunks_tri', k ? `${KC}, ${k} = ANY(tr.th) AS th FROM ch JOIN tr ON tr.chunk_id = ch.id WHERE ${k} = ANY(tr.hit)`
+        : `${KC}, coalesce(title ILIKE ${L}, false) AS th FROM ch WHERE title ILIKE ${L} OR body ILIKE ${L}`, `th DESC, d ${BYTES} DESC NULLS LAST, ${CHUNK_ORDER}`);
     }
-    for (const n of t.prs) add('chunks_keys', `${K} FROM ch WHERE (' ' || prs || ' ') LIKE ${p(`% ${n} %`)}`, 'id');
-    for (const sha of t.shas) add('chunks_keys', `${K} FROM ch WHERE sha LIKE ${p(`${sha}%`)}`, 'id');
+    for (const n of t.prs) add('chunks_keys', `${KC} FROM ch WHERE (' ' || prs || ' ') LIKE ${p(`% ${n} %`)}`, CHUNK_ORDER);
+    for (const sha of t.shas) add('chunks_keys', `${KC} FROM ch WHERE sha LIKE ${p(`${sha}%`)}`, CHUNK_ORDER);
     if (seeded) {
-      add('chunks_links', `${K} FROM ch WHERE id IN (SELECT l.chunk_id FROM brain.link l WHERE ${vis('l')} AND l.node_id IN (SELECT id FROM seeds))`,
-        `d ${BYTES} DESC NULLS LAST, id`);
+      add('chunks_links', `${KC} FROM ch WHERE id IN (SELECT l.chunk_id FROM brain.link l WHERE ${vis('l')} AND l.node_id IN (SELECT id FROM seeds))`,
+        `d ${BYTES} DESC NULLS LAST, ${CHUNK_ORDER}`);
     }
   }
 
