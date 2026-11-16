@@ -5,10 +5,16 @@
 //   queries: a JSON array of argv arrays after `brain`, e.g. [["refs", "src/x.ts#y"], ["why", "a question"]]. Only the
 //   read commands below; a query may not carry --db, --repo, --local or --json: the harness puts them first, so no option
 //   of the query can take one of them as its value.
-//   --help is refused too (it answers before either file is opened).
+//   --help and --as-of are refused too: --help answers before either file is opened, and a map command with --as-of
+//   reads the server's mirror, not --db.
+//   Each command also reads <db>.github.db when it is there (the sanitizer guard): give both sides the same sidecar, or
+//   none. A query that fails on both sides is `same` when the errors match; the summary line counts them (failedBoth).
 //   The child's environment is PATH, HOME, TMPDIR, LANG and LC_ALL only: no reader URL, no BRAIN_DB, and no GitHub token
 //   (the CLI cuts every token it is given out of its output, which could make two outputs equal). Git runs with
-//   GIT_NO_LAZY_FETCH=1 and GIT_OPTIONAL_LOCKS=0: the freshness checks never fetch and never rewrite .git/index.
+//   GIT_NO_LAZY_FETCH=1 and GIT_OPTIONAL_LOCKS=0 (the freshness checks never fetch or rewrite .git/index), no global or
+//   system git config, and core.fsmonitor off. The checkout's own .git/config still applies (filters, for example): use
+//   a checkout you would run `brain build` in.
+//   --out may not name an input file.
 //   The kit's own .env.local is read by the CLI even with --local (its reader secrets are cut out the same way), so the
 //   harness refuses to run while that file names a reader URL.
 // Normalization (§7.2): the keys `ms` and `freshness` are dropped at every depth; key order is ignored. Each query is:
@@ -20,14 +26,14 @@
 // them; a caller whose repo has more than 5,000 commits must leave such queries out or read their diffs with that rule.
 // Exit 0 when no query differs, 1 when one does, 2 on usage. The output file holds the queries: keep it where they may be.
 import { execFile } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, chmodSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const BRAIN = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'bin', 'brain');
 export const COMMANDS = new Set(['find', 'refs', 'callers', 'impact', 'deps', 'shared', 'why']);   // they read code.db only
-const OWN = ['--db', '--repo', '--local', '--json', '--help'];
+const OWN = ['--db', '--repo', '--local', '--json', '--help', '--as-of'];
 const ENV_KEEP = ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL'];
 const DROP = new Set(['ms', 'freshness']);
 const canon = (v) => JSON.stringify(v);
@@ -84,7 +90,8 @@ export function compare(ra, rb) {
 }
 
 const childEnv = () => ({ ...Object.fromEntries(ENV_KEEP.filter((k) => process.env[k] !== undefined).map((k) => [k, process.env[k]])),
-  NO_COLOR: '1', GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' });
+  NO_COLOR: '1', GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fsmonitor', GIT_CONFIG_VALUE_0: 'false' });
 
 /** why the kit's CLI would alter what it prints (null: it would not): its .env.local names a reader URL */
 export async function envFileProblem() {
@@ -133,7 +140,7 @@ export async function parity({ a, b, repo, queries, jobs = 4 }) {
   await Promise.all(Array.from({ length: jobs }, worker));
   const summary = { same: 0, order: 0, differs: 0 };
   for (const r of results) summary[r.class]++;
-  return { summary, results };
+  return { summary, failedBoth: results.filter((r) => r.exit !== 0).length, results };
 }
 
 async function main() {
@@ -144,6 +151,8 @@ async function main() {
     for (const k of ['a', 'b', 'repo', 'queries']) if (!opt[k]) throw new Error(`--${k} is required`);
     for (const k of ['a', 'b', 'repo', 'queries']) if (!existsSync(opt[k])) throw new Error(`--${k}: no such file`);
     if (opt.jobs !== undefined && !/^[1-9]\d?$/.test(opt.jobs)) throw new Error('--jobs must be 1..64');
+    const real = (f) => (existsSync(f) ? realpathSync(f) : resolve(f));
+    if (opt.out && ['a', 'b', 'queries'].some((k) => real(opt.out) === real(opt[k]))) throw new Error('--out names an input file');
     const env = await envFileProblem();
     if (env) throw new Error(env);
   } catch (e) {
@@ -164,7 +173,7 @@ async function main() {
     writeFileSync(opt.out, JSON.stringify({ a, b, repo, at: new Date().toISOString(), ms: Date.now() - t0, ...r }, null, 1), { mode: 0o600 });
     chmodSync(opt.out, 0o600);                                             // an existing file keeps its mode otherwise
   }
-  console.log(`parity: ${queries.length} queries: ${r.summary.same} same, ${r.summary.order} order only, ${r.summary.differs} differ`);
+  console.log(`parity: ${queries.length} queries: ${r.summary.same} same, ${r.summary.order} order only, ${r.summary.differs} differ; ${r.failedBoth} failed on both sides`);
   r.results.forEach((x, i) => { if (x.class !== 'same') console.log(`  #${i} ${x.class}${x.diffs ? ` at ${x.diffs.map((d) => d.path).join(', ')}` : ''}`); });
   process.exit(r.summary.differs ? 1 : 0);
 }

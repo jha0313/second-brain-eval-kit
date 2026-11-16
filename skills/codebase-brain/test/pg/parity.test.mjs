@@ -39,7 +39,7 @@ test('compare: same, order, differs (lists as multisets, keys, scalars, exit cod
 test('queries: read commands only, never the harness flags; the harness flags come first and include --local', () => {
   assert.equal(badQuery(['refs', 'src/x.ts#y', '--limit', '10']), null);
   for (const q of [['build', '.'], ['sync'], ['viz', 'x', '--out', 'f'], ['search', 'x'], [], ['find', 1], 'find',
-    ['find', 'x', '--repo'], ['find', 'x', '--db', 'f'], ['find', 'x', '--db=f'], ['find', 'x', '--local'], ['find', 'x', '--json'], ['find', 'x', '--help']]) {
+    ['find', 'x', '--repo'], ['find', 'x', '--db', 'f'], ['find', 'x', '--db=f'], ['find', 'x', '--local'], ['find', 'x', '--json'], ['find', 'x', '--help'], ['find', 'x', '--as-of', 'run:1']]) {
     assert.ok(badQuery(q), JSON.stringify(q));
   }
   const argv = argvFor('/a.db', '/repo', ['find', 'x', '--limit']);
@@ -69,6 +69,7 @@ test('the CLI on two copies of the fixture: equal copies are all same (exit 0); 
   assert.ok(miss.exit !== 0 && said.includes('no/such/file.ts#nothing'), `the error names the target, not cut as a token: ${said}`);
   assert.deepEqual(same.summary, { same: queries.length, order: 0, differs: 0 }, JSON.stringify(same.results.filter((r) => r.class !== 'same')));
   assert.ok(same.results.at(-1).exit !== 0, 'a missing target fails on both sides, and the error text matches (db paths replaced)');
+  assert.equal(same.failedBoth, 1, 'and is counted');
   const run = (...args) => spawnSync(process.execPath, [HARNESS, ...args], { encoding: 'utf8' });
   assert.equal(run('--a', a, '--b', b, '--repo', repo, '--queries', qfile).status, 0);
 
@@ -86,6 +87,8 @@ test('the CLI on two copies of the fixture: equal copies are all same (exit 0); 
   assert.equal(rec.results[0].query[0], 'find');
 
   assert.equal(run('--a', a).status, 2, 'usage: missing flags');
+  assert.equal(run('--a', a, '--b', b, '--repo', repo, '--queries', qfile, '--out', b).status, 2, '--out may not be an input');
+  assert.equal(run('--a', a, '--b', b, '--repo', repo, '--queries', qfile, '--out', qfile).status, 2, '--out may not be the queries');
   for (const j of ['0', 'wat', 'Infinity', '65']) assert.equal(run('--a', a, '--b', b, '--repo', repo, '--queries', qfile, '--jobs', j).status, 2, `--jobs ${j}`);
   writeFileSync(qfile, JSON.stringify([['build', repo]]));
   assert.equal(run('--a', a, '--b', b, '--repo', repo, '--queries', qfile).status, 2, 'a write command is refused');
