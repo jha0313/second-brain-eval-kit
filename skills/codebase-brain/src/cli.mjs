@@ -229,7 +229,11 @@ const cmds = {
     if (opt['if-stale'] && existsSync(dbPath) && !opt.vault) {
       const db = openDb(dbPath), f = freshness(db, repo);
       db.close();
+      // a copy from another checkout only when that build read a clean tree: then the index is exactly the commit's
+      // files (meta.worktree hashes say nothing about which files were tracked, e.g. after `git rm --cached`)
+      const copied = f.meta.repo !== undefined && f.meta.repo !== f.repo;
       if (f.state === 'fresh' && Number(f.meta.sanitize_version ?? -1) >= SANITIZE_VERSION && f.repo === repo && !f.meta.vault
+        && !(copied && Object.keys(f.meta.worktree ?? {}).length)
         && JSON.stringify(f.meta.options) === JSON.stringify(options)) {
         say(`brain build: index @${f.commit.slice(0, 8)} is fresh — skipped (drop --if-stale to rebuild)`);
         return report({ skipped: true });

@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -239,7 +239,8 @@ test('relink: 2,000 tokens, a name and a route with thousands of hits, all decid
   assert.deepEqual(verdict(r['name BinaryOnlyToken text']), ['unlinked', 'no-match', []]);    // binary blobs are skipped (-I)
 });
 
-// a `git` on PATH in front of the real one: FAKE_GIT=stall makes `cat-file --batch` hang; FAKE_GIT=trickle sends its
+// a `git` on PATH in front of the real one: FAKE_GIT=stall makes `cat-file --batch` hang in a child of the wrapper
+// (it keeps stdout open after the wrapper dies, so only a process-group kill ends it); FAKE_GIT=trickle sends its
 // output a few bytes per write, so blob headers, bodies and tokens are cut at many chunk edges
 function withFakeGit(mode, fn) {
   const dir = mkdtempSync(join(tmpdir(), 'brain-fakegit-'));
@@ -247,7 +248,7 @@ function withFakeGit(mode, fn) {
   writeFileSync(join(dir, 'git'), `#!/bin/sh
 if [ "$3" = cat-file ] && [ "$4" = --batch ]; then
   case "$FAKE_GIT" in
-    stall) exec sleep 30 ;;
+    stall) sleep 37.25; exit 0 ;;
     trickle) "${real}" "$@" | perl -e 'binmode STDIN; binmode STDOUT; while (read(STDIN, my $b, 3)) { syswrite(STDOUT, $b) }'; exit $? ;;
   esac
 fi
@@ -275,6 +276,8 @@ test('relink: a git cat-file that stalls is killed at the time budget; its refs 
   const t0 = Date.now();
   const res = await withFakeGit('stall', () => run({ budget: { bytes: 2e9, ms: 1500 } }));
   assert.ok(Date.now() - t0 < 8000, `relink took ${Date.now() - t0} ms`);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(spawnSync('pgrep', ['-f', 'sleep 37.25']).status, 1, 'the stalled child is gone');
   const r = rows();
   assert.deepEqual(verdict(r['name jobs.reserve text']), ['pending', 'budget', []]);       // never "no-match" from a hung git
   assert.deepEqual(verdict(r['file src/lib/credits.ts text']), ['linked', null, ['src/lib/credits.ts']]);

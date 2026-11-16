@@ -241,9 +241,18 @@ function automaton(tokens) {
  */
 function catBlobs(repoDir, blobs, scan, limitMs) {
   return new Promise((resolve) => {
-    const child = spawn('git', ['-C', repoDir, 'cat-file', '--batch'], { env: gitEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
-    let head = [], left = -1, i = 0, why;                                        // left: body bytes + the trailing LF still to come; -1: in a header
-    const stop = (reason = null) => { if (why !== undefined) return; why = reason; clearTimeout(timer); child.kill('SIGKILL'); };
+    // its own process group: a stop kills git and anything it started (a wrapper's child keeps stdout open otherwise)
+    const child = spawn('git', ['-C', repoDir, 'cat-file', '--batch'], { env: gitEnv(), stdio: ['pipe', 'pipe', 'ignore'], detached: true });
+    let head = [], left = -1, i = 0, why, settled = false;                      // left: body bytes + the trailing LF still to come; -1: in a header
+    const settle = (v) => { if (settled) return; settled = true; clearTimeout(timer); resolve(v); };
+    // a stop answers at once: it never waits for 'close', which a stalled descendant can hold off forever
+    const stop = (reason = null) => {
+      if (why !== undefined) return;
+      why = reason;
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+      child.stdout.destroy(); child.stdin.destroy();
+      settle(reason);
+    };
     const timer = setTimeout(() => stop('timeout'), Math.max(0, limitMs));
     child.stdout.on('data', (chunk) => {
       for (let k = 0; why === undefined && k < chunk.length;) {
@@ -268,8 +277,8 @@ function catBlobs(repoDir, blobs, scan, limitMs) {
       }
     });
     child.stdin.on('error', () => {});                                            // closed early when stopped
-    child.on('error', () => { clearTimeout(timer); resolve('error'); });
-    child.on('close', (code, signal) => { clearTimeout(timer); resolve(why !== undefined ? why : code === 0 ? null : code ?? signal ?? 'error'); });
+    child.on('error', () => settle('error'));
+    child.on('close', (code, signal) => settle(code === 0 ? null : code ?? signal ?? 'error'));
     child.stdin.end(blobs.map((b) => b.sha).join('\n') + '\n');
   });
 }

@@ -231,7 +231,17 @@ test('build --if-stale keeps an index copied into another clone at the same comm
   const db2 = copyIndex();
   const r2 = JSON.parse(runBrain(['build', '.', '--if-stale', '--json'], { cwd: other, env: { BRAIN_DB: db2 } }).stdout);
   assert.equal(r2.skipped, false);                           // the index commit is not in this repo: never kept
-  rmSync(clone, { recursive: true, force: true });
+  // an index built in a dirty tree (here: a file untracked with `git rm --cached`, same bytes on disk) is not the
+  // commit's files: a copy of it is rebuilt even where the content hashes match
+  const dirty = mkdtempSync(join(tmpdir(), 'brain-e1-dirty-'));
+  execFileSync('git', ['clone', '-q', F.repo, dirty]);
+  execFileSync('git', ['-C', dirty, 'rm', '-q', '--cached', 'src/lib/credits.ts']);
+  const db3 = join(mkdtempSync(join(tmpdir(), 'brain-e1-')), 'brain.db');
+  assert.equal(runBrain(['build', '.', '--json'], { cwd: dirty, env: { BRAIN_DB: db3 } }).status, 0);
+  const clean = mkdtempSync(join(tmpdir(), 'brain-e1-clean-'));
+  execFileSync('git', ['clone', '-q', F.repo, clean]);
+  assert.equal(JSON.parse(runBrain(['build', '.', '--if-stale', '--json'], { cwd: clean, env: { BRAIN_DB: db3 } }).stdout).skipped, false);
+  for (const d of [clone, dirty, clean]) rmSync(d, { recursive: true, force: true });
 });
 
 test('a write while another process holds the lock exits 3 (busy)', async () => {
