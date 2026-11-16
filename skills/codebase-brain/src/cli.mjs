@@ -101,7 +101,7 @@ const outJson = (o) => write(JSON.stringify(o, (k, v) => (typeof v === 'string' 
 // out() / outJson() write; in server mode a password shorter than MIN_SECRET is refused: it cannot be cut without
 // cutting words)
 let activeToken = null, readerSecrets = [];
-const secrets = () => [activeToken, process.env.GH_TOKEN, process.env.GITHUB_TOKEN].filter(Boolean);
+const secrets = () => [activeToken, process.env.GH_TOKEN, process.env.GITHUB_TOKEN, process.env.BRAIN_DISPATCH_TOKEN].filter(Boolean);
 const MIN_SECRET = 8;
 const cutReader = (s) => readerSecrets.reduce((t, x) => t.split(x).join('[REDACTED:reader-url]'), s);
 const scrub = (s) => safe(sanitizeLine(redactValues(cutReader(String(s ?? '')), secrets())));
@@ -109,9 +109,10 @@ const say = (s) => console.error(scrub(s));
 
 // the checkout we are in: --repo, else the git repo around cwd
 let checkout;
-function here(opt) {
+// timeout: refresh's call budget (git is killed at it)
+function here(opt, timeout) {
   if (opt.repo) return resolve(opt.repo);
-  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv() }).trim(); } catch { return undefined; }
+  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv(), ...(timeout && { timeout }) }).trim(); } catch { return undefined; }
 }
 
 function dbPathFor(opt) {
@@ -138,7 +139,7 @@ function localOnly(opt, what) {
 // Phase 3 §6.5: the four staleness cells of the newest run, for the footer of every server answer that reads the newest
 // run (an --as-of run is old on purpose). The reader's one SELECT and `git ls-remote origin` only: Actions is read by
 // status and refresh, not by every answer. Bounded: a cell that cannot be read in time is unknown
-const FOOTER_STALENESS_MS = 8000, STATUS_STALENESS_MS = 30_000;
+const FOOTER_STALENESS_MS = 8000, STATUS_STALENESS_MS = 30_000, LOCAL_GIT_MS = 5000;
 async function cellsOf(s, { actions = null, ms = FOOTER_STALENESS_MS } = {}) {
   const st = await staleness({ reader: s.client, repoDir: checkout ?? process.cwd(), actions, deadline: Date.now() + ms });
   return { code: st.code, memory: st.memory, activity: st.activity, last: st.last, run: st.run, cells: footerCells(st), detail: st.detail };
@@ -337,7 +338,9 @@ async function serverStatus(url, opt) {
     }
     const ago = (ms) => `${ageText(ms ?? 0)} ago`;
     const when = (iso) => (iso ? `${safe(iso.slice(0, 16).replace('T', ' '))}Z` : 'never');
-    const code = st.code.state === 'behind' ? P.code.behind(st.code.behind) : st.code.state === 'unknown' ? `unknown (${d.db.ok ? `git ls-remote origin: ${safe(d.git.error)}` : 'server not read'})` : P.code[st.code.state];
+    const gitWhy = { 'ls-remote': 'failed', timeout: 'timed out', 'no-main': 'has no main' };
+    const code = st.code.state === 'behind' ? P.code.behind(st.code.behind) : st.code.state === 'unknown'
+      ? `unknown (${d.db.ok ? `git ls-remote origin ${gitWhy[d.git.error] ?? safe(d.git.error)}` : 'server not read'})` : P.code[st.code.state];
     const memory = st.memory.state === 'fresh' || st.memory.state === 'old' ? P.memory[st.memory.state](ageText(st.memory.ageMs ?? 0))
       : st.memory.state === 'unknown' ? `unknown${d.db.ok ? ' (the GitHub time is not a date)' : ' (server not read)'}` : P.memory.never;
     const activity = st.activity.state === 'idle' ? 'idle' : `${st.activity.state === 'queued' ? P.activity.queued : P.activity.running(st.activity.stage)}`
@@ -593,24 +596,34 @@ const cmds = {
 
   // §6.6: one line on stdout (--json: { exit, message, runId }), exit REFRESH_EXIT. Server mode only.
   async refresh({ opt }) {
-    const start = Date.now();
+    const start = Date.now(), end = start + callBudget(process.env);
+    const left = (cap) => Math.max(1, Math.min(cap, end - Date.now()));
     const done = (r) => { if (opt.json) outJson(r); else out(r.message); process.exit(r.exit); };
+    const failed = (msg) => done({ exit: REFRESH_EXIT.failed, message: REFRESH_MESSAGES.failed(msg), runId: null });
+    const unavailable = (message) => done({ exit: REFRESH_EXIT.unavailable, message, runId: null });
     const url = serverUrl(opt);
-    if (!url) return done({ exit: REFRESH_EXIT.unavailable, message: 'refresh unavailable: local mode (no BRAIN_READER_URL) — brain build and brain sync update a local index', runId: null });
-    // F8: connecting (and the reader check) is part of the call, bounded by the client-side timer; a connection that
-    // stalls past it ends with this process. A refusal (not-reader, wrong-repo, no-brain) is the error line (exit 2 / 1)
+    if (!url) return unavailable('refresh unavailable: local mode (no BRAIN_READER_URL) — brain build and brain sync update a local index');
+    // F8: all of it inside the call budget. The local git reads (the checkout, its origin) are killed at their timeout;
+    // connect + the reader check run under the client-side timer (a connection that stalls past it ends with this
+    // process). Every outcome keeps refresh's one-line form: a refusal (not-reader, wrong-repo) is exit 2
+    checkout = here(opt, left(LOCAL_GIT_MS));
+    let origin = null;
+    try { origin = parseRemote(git(checkout ?? process.cwd(), ['remote', 'get-url', 'origin'], { timeout: left(LOCAL_GIT_MS) })); } catch { /* no origin */ }
     let conn;
     try {
-      conn = await withDeadline(connectReader(url, { origin: originOf(checkout ?? process.cwd()) }), Math.min(REFRESH_LIMITS.httpMaxMs, callBudget(process.env)));
+      conn = await withDeadline(connectReader(url, { origin }), left(REFRESH_LIMITS.httpMaxMs));
     } catch (e) {
-      if (!['server', 'timeout'].includes(e?.code)) throw e;
-      return done({ exit: REFRESH_EXIT.unavailable, message: REFRESH_MESSAGES.noServer, runId: null });
+      const msg = scrub(e?.message ?? e);
+      if (['server', 'timeout'].includes(e?.code)) return unavailable(REFRESH_MESSAGES.noServer);
+      if (['not-reader', 'wrong-repo'].includes(e?.code)) return unavailable(`refresh unavailable: ${msg}`);
+      return failed(e?.code === 'no-brain' ? `${msg} — ask an admin to run the bootstrap (brain-bootstrap.yml)` : msg);
     }
     let r;
     try {
       r = await refresh({ wait: !!opt.wait, start, statePath: refreshStatePath(homedir(), conn.binding.id), reader: conn.client,
         actions: actionsFromEnv(process.env), repoDir: checkout ?? process.cwd(), env: process.env });
-    } finally { destroyReader(conn.client); }
+    } catch (e) { r = { exit: REFRESH_EXIT.failed, message: REFRESH_MESSAGES.failed(scrub(e?.message ?? e)), runId: null }; }
+    finally { destroyReader(conn.client); }
     done(r);
   },
 
@@ -688,8 +701,9 @@ process.stdout.on('error', (e) => { if (e.code === 'EPIPE') process.exit(0); thr
 const { pos, opt } = parse(process.argv.slice(2));
 const cmd = pos.shift();
 if (!cmd || opt.help || !cmds[cmd]) { out(HELP); process.exit(cmd && !opt.help ? 1 : 0); }
-// ci-publish runs in the ops repo's CI: it reads no checkout around cwd and never the reader URL
-if (cmd !== 'build' && cmd !== 'ci-publish') checkout = here(opt);
+// ci-publish runs in the ops repo's CI: it reads no checkout around cwd and never the reader URL. refresh reads the
+// checkout itself, inside its call budget
+if (!['build', 'ci-publish', 'refresh'].includes(cmd)) checkout = here(opt);
 try {
   if (cmd !== 'ci-publish') {
     const reader = secretsOf(readerUrl() ?? '');            // before anything can echo input; also as a JSON string holds them

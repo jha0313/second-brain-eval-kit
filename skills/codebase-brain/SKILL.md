@@ -101,7 +101,7 @@ Tables for people; add `--json` for exact lists. Every answer ends with two line
 (`truncated`: page with `--cursor N`; `partial`: the line says which part, e.g. refs not linked yet or a failed sync).
 `complete` is not "fresh": that is the `freshness:` line (`--json`: `freshness`). GitHub data is `stale` when its
 time (the cursor of the last complete sync) is more than 24 h old; a failed or interrupted last sync makes GitHub
-answers `partial`. Say so, or run `brain sync`.
+answers `partial`. Say so, or (local mode) run `brain sync`; in server mode, rule 10.
 
 In server mode the line starts with the run the answer read and how stale the team brain is (`--json`:
 `freshness.staleness`), then compares that run with your checkout:

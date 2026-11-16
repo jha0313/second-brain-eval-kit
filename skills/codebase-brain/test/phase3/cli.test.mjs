@@ -3,17 +3,19 @@
 // Offline: help, local mode, an unreachable and a stalled reader, ci-publish usage and env pass-through, the footer
 // and guard texts, and what git sees. Neon (BRAIN_P3_NEON=1 and NEON_PROJECT_ID): one throwaway branch (prefix
 // BRAIN_TEST_BRANCH_PREFIX, default p3b) with the golden seed (r1, GitHub data of sanitizer v0) and r2 (current
-// sanitizer, T = now) — status, the footer of search / find, --as-of, the guard hint, refresh.
+// sanitizer, T = now) — status, the footer of search / find, --as-of, the guard hint, refresh exits, the state key.
+// origin's main comes from a git wrapper (fakeGit), never from the network.
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { footer, guard } from '../../src/answer.mjs';
 import { GuardError } from '../../src/errors.mjs';
 import { runGit } from '../../src/pg/status.mjs';
+import { withWriteLock } from '../../src/gh-schema.mjs';
 import { REFRESH_MESSAGES as MSG, REFRESH_TRIGGERS } from '../../src/pg/contract.mjs';
 import { SANITIZE_VERSION } from '../../src/sanitize.mjs';
 import { tempDir, stallingPgServer, FAKE_TOKEN } from './stub.mjs';
@@ -40,6 +42,17 @@ function checkout(root, remote = 'https://github.com/o/r.git') {
   writeFileSync(join(dir, 'README.md'), '# r\n');
   git('add', '-A'); git('commit', '-q', '-m', 'init');
   if (remote) git('remote', 'add', 'origin', remote);
+  return dir;
+}
+
+// git with a fixed `origin` main: a wrapper first on PATH answers `ls-remote` from P3_MAIN (unset: fails, as an
+// unreachable origin does), hangs `remote get-url` when P3_HANG is set, and passes every other git command to the real
+// git. The checkout's origin stays a github.com URL (the reader check needs the binding's repo), and no test depends
+// on the network.
+function fakeGit(root) {
+  const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  const dir = mkdtempSync(join(root, 'bin-'));
+  writeFileSync(join(dir, 'git'), `#!/bin/sh\ncase " $* " in\n  *" ls-remote "*) [ -n "$P3_MAIN" ] || exit 2; printf '%s\\trefs/heads/main\\n' "$P3_MAIN"; exit 0 ;;\n  *" get-url "*) [ -z "$P3_HANG" ] || exec sleep 30 ;;\nesac\nexec "${real}" "$@"\n`, { mode: 0o755 });
   return dir;
 }
 
@@ -86,6 +99,15 @@ describe('offline', () => {
       assert.equal(r.stdout.trim(), MSG.noServer);
       assert.ok(r.ms < 2000 + 3000, `took ${r.ms} ms`);
     } finally { await pg.close(); }
+  });
+
+  test('a local git read that hangs (the origin) is killed inside the call budget (F8)', async () => {
+    const bin = fakeGit(root);
+    const r = await brain(['refresh'], { cwd: repo, home, env: { PATH: `${bin}:${process.env.PATH}`, P3_HANG: '1', BRAIN_REFRESH_CALL_S: '3',
+      BRAIN_READER_URL: `postgresql://brain_reader:${PW}@127.0.0.1:9/x?sslmode=disable` } });
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    assert.equal(r.stdout.trim(), MSG.noServer);
+    assert.ok(r.ms < 3000 + 2500, `took ${r.ms} ms`);
   });
 
   test('build and sync in server mode point to brain refresh, never a local write (#7)', async () => {
@@ -185,8 +207,8 @@ const b = NEON ? H.useBranch('cli') : null;
 
 describe('Neon: server mode through bin/brain', { skip: NEON ? false : 'set BRAIN_P3_NEON=1 and NEON_PROJECT_ID (one throwaway branch)' }, () => {
   const root = tempDir('brain-p3-clin-');
-  let repo, home, reader;
-  const SHA1 = `aaaaaaa1${'0'.repeat(32)}`;
+  let repo, home, reader, bin;
+  const SHA1 = `aaaaaaa1${'0'.repeat(32)}`, OTHER = `b${'1'.repeat(39)}`;
 
   before(async () => {
     const { buildStores, goldenState } = await import('../pg/golden/build-golden.mjs');
@@ -211,10 +233,14 @@ describe('Neon: server mode through bin/brain', { skip: NEON ? false : 'set BRAI
     } finally { await w.end(); }
     repo = checkout(root);
     home = mkdtempSync(join(root, 'home-'));
+    bin = fakeGit(root);
     reader = { BRAIN_READER_URL: b.readerUrl };
   });
-  const run = (args, env = {}) => brain(args, { cwd: repo, home, env: { ...reader, ...env } });
+  /** main: origin's main as ls-remote reports it (null: ls-remote fails) */
+  const run = (args, { main = SHA1, env = {} } = {}) => brain(args, { cwd: repo, home,
+    env: { ...reader, PATH: `${bin}:${process.env.PATH}`, ...(main && { P3_MAIN: main }), ...env } });
   const noSecret = (r) => assert.ok(!(r.stdout + r.stderr).includes(new URL(b.readerUrl).password), 'the reader password in output');
+  const stateDir = () => join(home, '.cache', 'brain', 'refresh');
 
   test('brain status: the store view (run, commit, GitHub state) and the four cells (#4); nothing local is read', async () => {
     const r = await run(['status']);
@@ -223,20 +249,23 @@ describe('Neon: server mode through bin/brain', { skip: NEON ? false : 'set BRAI
     assert.match(r.stdout, /^brain status {2}server · o\/r \(the team brain, read-only\)$/m);
     assert.match(r.stdout, /run +2 @aaaaaaa1 · published \d{4}-\d\d-\d\d \d\d:\d\dZ \(\d+[smh] ago\)/);
     assert.match(r.stdout, /github +data as of \d{4}-\d\d-\d\d \d\d:\d\dZ · last ok /);
-    assert.match(r.stdout, /code +unknown \(git ls-remote origin: /);            // o/r is not a repo on github.com
+    assert.match(r.stdout, /code += main \(main @aaaaaaa1\)$/m);
     assert.match(r.stdout, /memory +github as of \d+[sm] ago$/m);
     assert.match(r.stdout, /activity +idle$/m);
     assert.match(r.stdout, /last +ok \d+[smh] ago$/m);
     assert.match(r.stdout, /actions +not read \(no BRAIN_DISPATCH_TOKEN\)/);
-    assert.match(r.stdout, /freshness: brain data: run 2 @aaaaaaa1 \(published \d+[smh] ago\) · \(freshness unknown\) · github as of \d+[sm] ago · code @aaaaaaa1/);
+    assert.match(r.stdout, /freshness: brain data: run 2 @aaaaaaa1 \(published \d+[smh] ago\) · = main · github as of \d+[sm] ago · code @aaaaaaa1/);
     assert.equal(existsSync(join(home, '.cache', 'brain', 'mirror')), false, 'status pulled a mirror');
     const j = JSON.parse((await run(['status', '--json'])).stdout);
     assert.equal(j.mode, 'server');
     assert.deepEqual({ run: j.run.run, commit: j.run.commit, asOf: j.run.asOf, latest: j.run.latest }, { run: 2, commit: SHA1, asOf: false, latest: 2 });
     assert.ok(j.sync.cursor && j.sync.lastOkAt);
-    assert.deepEqual([j.staleness.code.state, j.staleness.memory.state, j.staleness.activity.state, j.staleness.last.state, j.staleness.run], ['unknown', 'fresh', 'idle', 'ok', 2]);
-    assert.deepEqual(j.checks, { db: 'ok', git: 'ls-remote', actions: 'no-token' });
+    assert.deepEqual([j.staleness.code.state, j.staleness.memory.state, j.staleness.activity.state, j.staleness.last.state, j.staleness.run], ['same', 'fresh', 'idle', 'ok', 2]);
+    assert.deepEqual(j.checks, { db: 'ok', git: 'ok', actions: 'no-token' });
     assert.equal(j.freshness.staleness.run, 2);
+    const down = await run(['status'], { main: null });
+    assert.match(down.stdout, /code +unknown \(git ls-remote origin failed\)$/m);
+    assert.match(down.stdout, /freshness: brain data: run 2 @aaaaaaa1 \(published \d+[smh] ago\) · \(freshness unknown\) · github as of/);
     const old = await run(['status', '--as-of', 'run:1']);
     assert.equal(old.status, 0, old.stdout + old.stderr);
     assert.match(old.stdout, /run +1 @[0-9a-f]{8} · published .* · as-of · latest run 2/);
@@ -248,10 +277,12 @@ describe('Neon: server mode through bin/brain', { skip: NEON ? false : 'set BRAI
       const r = await run(args);
       assert.equal(r.status, 0, r.stdout + r.stderr);
       noSecret(r);
-      assert.match(r.stdout, /freshness: brain data: run 2 @aaaaaaa1 \(published \d+[smh] ago\) · \(freshness unknown\) · github as of \d+[sm] ago · code @aaaaaaa1/, args.join(' '));
+      assert.match(r.stdout, /freshness: brain data: run 2 @aaaaaaa1 \(published \d+[smh] ago\) · = main · github as of \d+[sm] ago · code @aaaaaaa1/, args.join(' '));
       assert.doesNotMatch(r.stdout, /brain sync|or brain build/, args.join(' '));
+      const moved = await run(args, { main: OTHER });
+      assert.match(moved.stdout, /freshness: brain data: run 2 @aaaaaaa1 \(published \d+[smh] ago\) · differs from main · github as of/, args.join(' '));
       const j = JSON.parse((await run([...args, '--json'])).stdout);
-      assert.deepEqual([j.freshness.staleness.memory.state, j.freshness.staleness.run, j.freshness.brain.run], ['fresh', 2, 2], args.join(' '));
+      assert.deepEqual([j.freshness.staleness.code.state, j.freshness.staleness.memory.state, j.freshness.staleness.run, j.freshness.brain.run], ['same', 'fresh', 2, 2], args.join(' '));
     }
   });
 
@@ -265,16 +296,44 @@ describe('Neon: server mode through bin/brain', { skip: NEON ? false : 'set BRAI
     assert.doesNotMatch(v0.stdout, /brain sync|brain build/);
   });
 
-  test('brain refresh: main unknown -> exit 2 noGithub, no state left; a fresh call reads the binding id for its file', async () => {
-    const r = await run(['refresh']);
-    assert.equal(r.status, 2, r.stdout + r.stderr);
-    assert.equal(r.stdout.trim(), MSG.noGithub);
-    noSecret(r);
-    assert.equal(existsSync(join(home, '.cache', 'brain', 'refresh', '1.json')), false);
-    assert.ok(existsSync(join(home, '.cache', 'brain', 'refresh')), 'the state dir (binding source_repo_id 1)');
-    const j = await run(['refresh', '--wait', '--json'], { BRAIN_DISPATCH_TOKEN: FAKE_TOKEN });
-    assert.equal(j.status, 2, j.stdout + j.stderr);
-    assert.deepEqual(JSON.parse(j.stdout), { exit: 2, message: MSG.noGithub, runId: null });
-    assert.ok(!(j.stdout + j.stderr).includes(FAKE_TOKEN));
+  test('brain refresh: fresh (F1) exit 0 · main moved without a token exit 2 · main unknown exit 2; no state left', async () => {
+    const fresh = await run(['refresh', '--json']);
+    assert.equal(fresh.status, 0, fresh.stdout + fresh.stderr);
+    assert.deepEqual(JSON.parse(fresh.stdout), { exit: 0, message: MSG.fresh, runId: 2 });
+    const moved = await run(['refresh'], { main: OTHER });
+    assert.equal(moved.status, 2, moved.stdout + moved.stderr);
+    assert.equal(moved.stdout.trim(), MSG.noPermission);
+    const down = await run(['refresh', '--wait'], { main: null });
+    assert.equal(down.status, 2, down.stdout + down.stderr);
+    assert.equal(down.stdout.trim(), MSG.noGithub);
+    for (const r of [fresh, moved, down]) noSecret(r);
+    assert.deepEqual(readdirSync(stateDir()).filter((f) => f.endsWith('.json')), []);
+  });
+
+  test('brain refresh refusals keep its one-line form: not the reader account, another repo (exit 2)', async () => {
+    const owner = await run(['refresh'], { env: { BRAIN_READER_URL: b.ownerUrl } });
+    assert.equal(owner.status, 2, owner.stdout + owner.stderr);
+    assert.match(owner.stdout, /^refresh unavailable: BRAIN_READER_URL logs in as "neondb_owner", not brain_reader .*\n$/);
+    assert.ok(!(owner.stdout + owner.stderr).includes(new URL(b.ownerUrl).password), 'the owner password in output');
+    const elsewhere = checkout(root, 'https://github.com/o/other.git');
+    const other = await brain(['refresh', '--json'], { cwd: elsewhere, home, env: { ...reader, PATH: `${bin}:${process.env.PATH}`, P3_MAIN: SHA1 } });
+    assert.equal(other.status, 2, other.stdout + other.stderr);
+    const j = JSON.parse(other.stdout);
+    assert.deepEqual([j.exit, j.runId], [2, null]);
+    assert.match(j.message, /^refresh unavailable: the server brain is for o\/r, this checkout's origin is o\/other/);
+  });
+
+  test('the state file is keyed by the binding\'s source repo id: a held lock on it means another refresh (exit 75, its run)', async () => {
+    // another brain on this laptop: source repo id 4242 (a throwaway branch: the owner lifts the binding's refuse trigger)
+    await b.query('owner', 'ALTER TABLE brain.binding DISABLE TRIGGER refuse; UPDATE brain.binding SET source_repo_id = 4242 WHERE id = 1; ALTER TABLE brain.binding ENABLE TRIGGER refuse');
+    const path = join(stateDir(), '4242.json'), now = Date.now();
+    writeFileSync(path, JSON.stringify({ v: 1, startedAt: new Date(now - 60e3).toISOString(), deadline: new Date(now + 14 * 60e3).toISOString(),
+      baseT: null, baseHead: SHA1, runId: 777, dispatchedAt: new Date(now - 60e3).toISOString(), extraDispatches: 0 }), { mode: 0o600 });
+    const { value: r } = await withWriteLock(path, () => run(['refresh'], { main: OTHER, env: { BRAIN_DISPATCH_TOKEN: FAKE_TOKEN } }));
+    assert.equal(r.status, 75, r.stdout + r.stderr);
+    assert.match(r.stdout.trim(), /^still running \(actions run 777, 1m\)$/);
+    assert.ok(!(r.stdout + r.stderr).includes(FAKE_TOKEN));
+    assert.ok(existsSync(path), 'a busy lock leaves the other refresh\'s state alone');
+    assert.equal(existsSync(join(stateDir(), '1.json')), false);
   });
 });
