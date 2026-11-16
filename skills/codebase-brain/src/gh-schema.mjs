@@ -2,8 +2,7 @@
 // Writers: brain sync (gh-sync.mjs) and relink (link.mjs), always inside withWriteLock().
 // Readers: search / get / source open it with openGithubDb(path, { readOnly: true }).
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdirSync, chmodSync, readFileSync, unlinkSync, writeFileSync, linkSync, statSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, chmodSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { LockBusyError } from './errors.mjs';
 
@@ -115,15 +114,14 @@ export function writeSyncState(db, patch) {
   db.prepare(`UPDATE sync_state SET ${cols.map((k) => `${k} = ?`).join(', ')} WHERE id = 1`).run(...vals);
 }
 
-const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
-
 /**
  * One async write lifecycle per repo: build, sync, relink, --full swap all run inside it.
- * Lock file `<codeDbPath>.lock` holds the owner's pid. It is published atomically: the pid is written to a private
- * temp file, then link()ed to the lock path (link fails if the lock exists), so a lock is never seen empty.
- * - held by a live pid (including this process: nested writes are a bug) -> LockBusyError
- * - held by a dead pid, or unreadable content -> removed by breakStale(), staleLock: true;
- *   the caller decides what that means (sync marks the previous run interrupted)
+ * The lock is an SQLite file `<codeDbPath>.lock` held with BEGIN EXCLUSIVE in locking_mode=EXCLUSIVE: the OS releases
+ * it when the holder exits or is killed, so there is no stale lock to detect or delete (and no remover race).
+ * - held by another process, or already by this one (nested writes are a bug) -> LockBusyError
+ * - staleLock: true when the previous holder never released it cleanly (it crashed); the caller decides what that
+ *   means (sync marks the previous run interrupted)
+ * `<lock>.pid` holds the current holder's pid for messages only; correctness never depends on it.
  * @template T
  * @param {string} codeDbPath
  * @param {(info: { staleLock: boolean }) => Promise<T> | T} fn
@@ -132,50 +130,29 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { 
  */
 export async function withWriteLock(codeDbPath, fn) {
   const lock = `${codeDbPath}.lock`;
+  if (heldHere.has(lock)) throw new LockBusyError(process.pid);
   mkdirSync(dirname(lock), { recursive: true });
-  const tmp = `${lock}.${process.pid}.${randomBytes(4).toString('hex')}`;
-  writeFileSync(tmp, String(process.pid), { mode: 0o600 });
-  let staleLock = false, held = false;
+  const db = new DatabaseSync(lock);
+  let staleLock;
   try {
-    for (let attempt = 0; attempt < 5 && !held; attempt++) {
-      try { linkSync(tmp, lock); held = true; }
-      catch (e) {
-        if (e.code !== 'EEXIST') throw e;
-        const pid = readPid(lock);
-        if (pid === null) continue;                                     // released meanwhile: try again
-        if (pid && (pid === process.pid || alive(pid))) throw new LockBusyError(pid);
-        if (breakStale(lock, tmp, pid)) staleLock = true;
-      }
-    }
-  } finally { try { unlinkSync(tmp); } catch { /* gone */ } }
-  if (!held) throw new LockBusyError(0);
+    chmodSync(lock, 0o600);
+    db.exec('PRAGMA busy_timeout = 0; PRAGMA locking_mode = EXCLUSIVE;');
+    try { db.exec('BEGIN EXCLUSIVE'); }
+    catch (e) { if (e.errcode === 5 || e.errcode === 6) throw new LockBusyError(holderPid(lock)); throw e; }
+    db.exec('CREATE TABLE IF NOT EXISTS holder (id INTEGER PRIMARY KEY CHECK (id = 1), pid INTEGER, started_at TEXT, clean INTEGER)');
+    const prev = db.prepare('SELECT clean FROM holder WHERE id = 1').get();
+    staleLock = !!prev && !prev.clean;
+    db.prepare('INSERT OR REPLACE INTO holder (id, pid, started_at, clean) VALUES (1, ?, ?, 0)').run(process.pid, new Date().toISOString());
+    db.exec('COMMIT');                                           // exclusive locking mode: the lock stays held
+    writeFileSync(`${lock}.pid`, String(process.pid), { mode: 0o600 });
+  } catch (e) { db.close(); throw e; }
+  heldHere.add(lock);
   try { return { value: await fn({ staleLock }), staleLock }; }
-  finally { try { if (readPid(lock) === process.pid) unlinkSync(lock); } catch { /* already gone */ } }
-}
-
-// pid in a lock file; 0 when unreadable content; null when the file does not exist
-function readPid(path) {
-  try { return Number(readFileSync(path, 'utf8').trim()) || 0; }
-  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
-}
-
-// Only the holder of `<lock>.break` may delete a stale lock, so "is it still the dead pid?" and the unlink cannot
-// interleave with another remover. Taking a free lock never needs .break: link() fails while any lock exists.
-// A .break left by a crashed remover (it is held for microseconds) is cleared once it is 10 s old.
-function breakStale(lock, tmp, deadPid) {
-  const brk = `${lock}.break`;
-  try { linkSync(tmp, brk); }
-  catch (e) {
-    if (e.code !== 'EEXIST') throw e;
-    try {
-      const pid = readPid(brk);
-      if (pid !== null && !(pid && alive(pid)) && Date.now() - statSync(brk).mtimeMs > 10_000) unlinkSync(brk);
-    } catch { /* another remover is on it */ }
-    return false;
+  finally {
+    heldHere.delete(lock);
+    try { rmSync(`${lock}.pid`, { force: true }); db.exec('UPDATE holder SET clean = 1 WHERE id = 1'); } finally { db.close(); }
   }
-  try {
-    if (readPid(lock) !== deadPid) return false;                        // released or re-taken meanwhile
-    unlinkSync(lock);
-    return true;
-  } finally { try { unlinkSync(brk); } catch { /* gone */ } }
 }
+
+const heldHere = new Set();
+const holderPid = (lock) => { try { return Number(readFileSync(`${lock}.pid`, 'utf8')) || 0; } catch { return 0; } };

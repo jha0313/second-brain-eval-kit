@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, statSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parsePtr, formatPtr } from '../../src/ptr.mjs';
@@ -59,17 +60,37 @@ test('github.db: schema, 0600, sync_state single row, reopen read-only', () => {
   ro.close();
 });
 
-test('withWriteLock: busy for a live pid, stale lock cleared, released after throw', async () => {
+// a child process that takes the lock and waits; resolves once it holds it
+function holdLockInChild(code) {
+  const mod = new URL('../../src/gh-schema.mjs', import.meta.url).href;
+  const child = spawn(process.execPath, ['--no-warnings', '--input-type=module', '-e',
+    `import { withWriteLock } from ${JSON.stringify(mod)};
+     await withWriteLock(process.argv[1], async () => { process.stdout.write('held\\n'); await new Promise(() => setInterval(() => {}, 1000)); });`, code]);
+  return new Promise((res, rej) => {
+    child.stdout.on('data', (d) => { if (String(d).includes('held')) res(child); });
+    child.on('exit', (c) => rej(new Error(`child exited ${c}`)));
+  });
+}
+
+test('withWriteLock: another live holder is busy; a killed holder releases it (staleLock); clean release is not stale', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'lock-'));
   const code = join(dir, 'brain.db');
-  writeFileSync(`${code}.lock`, String(process.ppid));                    // a live process that is not us
-  await assert.rejects(withWriteLock(code, () => 1), LockBusyError);
-  writeFileSync(`${code}.lock`, '999999');                                // dead pid
-  const r = await withWriteLock(code, () => 42);
-  assert.deepEqual(r, { value: 42, staleLock: true });
-  assert.equal(existsSync(`${code}.lock`), false);
+  const child = await holdLockInChild(code);
+  await assert.rejects(withWriteLock(code, () => 1), (e) => e instanceof LockBusyError && e.pid === child.pid);
+  child.kill('SIGKILL');
+  await new Promise((r) => child.on('exit', r));
+  assert.deepEqual(await withWriteLock(code, () => 42), { value: 42, staleLock: true });   // the OS dropped the dead holder's lock
+  assert.deepEqual(await withWriteLock(code, () => 43), { value: 43, staleLock: false });
   await assert.rejects(withWriteLock(code, () => { throw new Error('boom'); }), /boom/);
-  assert.equal(existsSync(`${code}.lock`), false);
+  assert.deepEqual(await withWriteLock(code, () => 44), { value: 44, staleLock: false });  // released after a throw
+  assert.equal(statSync(`${code}.lock`).mode & 0o777, 0o600);
+  assert.equal(existsSync(`${code}.lock.pid`), false);
+});
+
+test('withWriteLock: a nested write in the same process is busy', async () => {
+  const code = join(mkdtempSync(join(tmpdir(), 'lock2-')), 'brain.db');
+  const inner = await withWriteLock(code, async () => withWriteLock(code, () => 1).catch((e) => e.code));
+  assert.equal(inner.value, 'lock-busy');
 });
 
 test('ext() quotes and escapes so an external string cannot close its quote', () => {
@@ -103,7 +124,7 @@ test('pathIndex exposes the Phase 0 path rules', () => {
   assert.ok(PATH_RE.flags.includes('g') && IDENT_RE.flags.includes('g'));   // use matchAll or a copy: never .exec on the shared object
 });
 
-test('build writes build_id, sanitize_version, body_line column; code.db is 0600; build holds the lock', () => {
+test('build writes build_id, sanitize_version, body_line column; code.db is 0600; build releases the lock', async () => {
   const { codeDb } = fixtureRepo();
   const db = new DatabaseSync(codeDb, { readOnly: true });
   const meta = Object.fromEntries(db.prepare('SELECT key, value FROM meta').all().map((r) => [r.key, JSON.parse(r.value)]));
@@ -112,7 +133,7 @@ test('build writes build_id, sanitize_version, body_line column; code.db is 0600
   assert.ok(db.prepare("SELECT 1 FROM pragma_table_info('chunks') WHERE name = 'body_line'").get());
   db.close();
   assert.equal(statSync(codeDb).mode & 0o777, 0o600);
-  assert.equal(existsSync(`${codeDb}.lock`), false);
+  assert.deepEqual(await withWriteLock(codeDb, () => 'free'), { value: 'free', staleLock: false });   // build released it cleanly
   const gh = makeGithubDb(codeDb, { items: [{ number: 1121 }] });
   assert.ok(existsSync(gh));
 });
@@ -129,19 +150,6 @@ test('seams: replay only when BRAIN_REPLAY_DIR is set; failpoints throw only for
   assert.throws(() => failpoint('sync:page:2', { BRAIN_FAIL_AT: 'sync:page:2' }), (e) => e.code === 'injected');
 });
 
-test('withWriteLock: own pid is busy (nested write), empty lock is stale, no temp files left', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lock2-'));
-  const code = join(dir, 'brain.db');
-  writeFileSync(`${code}.lock`, String(process.pid));
-  await assert.rejects(withWriteLock(code, () => 1), LockBusyError);
-  writeFileSync(`${code}.lock`, '');
-  assert.deepEqual(await withWriteLock(code, () => 'ok'), { value: 'ok', staleLock: true });
-  const { readdirSync } = await import('node:fs');
-  assert.deepEqual(readdirSync(dir), []);
-  const inner = await withWriteLock(code, async () => withWriteLock(code, () => 1).catch((e) => e.code));
-  assert.equal(inner.value, 'lock-busy');
-});
-
 test('a build that fails part-way leaves no database file behind', async () => {
   const { build } = await import('../../src/build.mjs');
   const { repo, codeDb } = fixtureRepo({ build: false });
@@ -149,15 +157,3 @@ test('a build that fails part-way leaves no database file behind', async () => {
   assert.equal(existsSync(codeDb), false);
 });
 
-test('withWriteLock: a stale lock behind an old crashed .break is still taken; a fresh .break means busy for now', async () => {
-  const { utimesSync } = await import('node:fs');
-  const dir = mkdtempSync(join(tmpdir(), 'lock3-'));
-  const code = join(dir, 'brain.db');
-  writeFileSync(`${code}.lock`, '999999');
-  writeFileSync(`${code}.lock.break`, '999998');
-  await assert.rejects(withWriteLock(code, () => 1), LockBusyError);       // a remover may be at work
-  const old = new Date(Date.now() - 60_000);
-  utimesSync(`${code}.lock.break`, old, old);
-  assert.deepEqual(await withWriteLock(code, () => 2), { value: 2, staleLock: true });
-  assert.equal(existsSync(`${code}.lock.break`), false);
-});

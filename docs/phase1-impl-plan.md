@@ -101,9 +101,9 @@ flowchart LR
 | 읽기 명령 | 없음 | `openContext()`가 둘 다 `readOnly`로 연다 | 없음 | — |
 
 - **journal mode.** github.db는 `DELETE` + `synchronous=FULL` + `secure_delete=ON`. WAL은 쓰지 않는다: 읽기 전용 복사본(eval)이 열리고, `--full`의 close → rename이 안전하다. code.db는 `journal_mode=OFF`(빌드는 처음부터 다시 만들므로) + `secure_delete=ON`.
-- **권한.** 두 파일 모두 만들 때 `0600`. 락 파일은 `<code.db>.lock`(`wx`, pid).
+- **권한.** 두 파일과 락 파일 모두 만들 때 `0600`.
 - **락 반환형.** `withWriteLock(path, fn)` → `Promise<{ value, staleLock }>`. 죽은 pid의 락은 지우고 `staleLock: true`.
-- **락 게시는 원자적이다.** pid를 임시 파일에 쓴 뒤 `link()`로 락 경로에 건다. 그래서 빈 락은 보이지 않는다. 같은 프로세스의 pid는 busy(중첩 쓰기는 버그)다. stale 락은 보조 락 `<lock>.break`를 잡은 프로세스만 "아직 죽은 pid인가" 확인 뒤 지운다(확인과 삭제 사이에 다른 writer가 끼어들 수 없다).
+- **락은 SQLite 배타 락이다.** `<code.db>.lock`을 `locking_mode=EXCLUSIVE` + `BEGIN EXCLUSIVE`로 잡는다(fcntl). 잡은 프로세스가 끝나거나 죽으면 OS가 푼다. 그래서 stale 락을 찾아 지우는 단계가 없고, 지우는 쪽끼리의 경쟁도 없다. 직전 보유자가 정상적으로 풀지 않았으면(`holder.clean = 0`) `staleLock: true`. 같은 프로세스의 중첩 쓰기는 busy. `<lock>.pid`는 메시지용일 뿐 정확성에 쓰지 않는다.
 - **build 실패.** `journal_mode=OFF`라 ROLLBACK을 믿을 수 없다. 실패하면 DB를 닫고 파일을 지운다(마스킹 전의 페이지가 남지 않게).
 - **자식 프로세스 stderr.** `files.mjs`의 `git()`은 stderr를 상속하지 않고 잡는다. git의 메시지는 CLI의 정리된 오류 출구로만 나간다.
 
@@ -320,14 +320,14 @@ flowchart LR
 | A7 | JSON `freshness`는 Phase 0 객체 + `github` 하위 객체 | Phase 0 체크가 `freshness.state`를 본다 |
 | A8 | `viz.mjs`를 E1에, S 테스트를 `test/security/`로, H를 I로 | 출구 소유자 없음, 빨간 테스트가 필수 관문을 막음, 직렬 단계 제거 |
 | A10 | GitHub 요청 표(경로·query 키·`since` 형식·헤더)를 `gh-client.mjs` 머리에 고정 | replay는 query가 정확히 같아야 맞는다. C·G·S·I가 같은 요청을 가정해야 한다 |
-| A11 | 락: 임시 파일 + `link()` 게시, 같은 pid는 busy, stale 락은 보조 락 `.break`를 잡은 쪽만 확인·삭제 | Codex 확인 라운드: 빈 락 틈에 두 writer가 동시에 들어갈 수 있었다 |
+| A11 | 락: pid 파일 → SQLite 배타 락(OS가 죽은 보유자의 락을 푼다), 중첩은 busy | Codex 확인 라운드 3회: pid 파일 방식은 "확인 후 삭제"가 어디엔가 남아 두 writer가 동시에 들어갈 수 있었다(빈 락 틈 → stat/unlink 틈 → 보조 락 정리 틈) |
 | A12 | build 실패 시 DB 닫고 삭제 | Codex 확인 라운드: sweep 전 실패가 마스킹 안 된 파일을 남겼다 |
 | A13 | `git()` stderr를 잡는다 | Codex 확인 라운드: git stderr가 CLI의 마스킹 출구를 우회했다 |
 | A9 | eval arm `none · dump · v2` → `none · v1 · dump · v2` | 한 칸에 한 가지만 바뀌어야 효과를 나눠 말할 수 있다 |
 
 ## 부록 B: Codex 계획 리뷰 처리
 
-**확인 라운드(2차, v2 + P0 코드 대상): no-go → A11–A13으로 수정.** 1차 blocker 3개 중 1개 해결, 2개 부분 해결(락 경쟁, build 실패 정리), major 11개 중 10개 해결, 1개 부분 해결(git stderr). 남은 3개를 P0에서 고치고 테스트 2개를 더했다(계약 테스트 11개). 레인 간 파일 겹침은 없다는 판정.
+**확인 라운드(2차, v2 + P0 코드 대상): no-go → A11–A13으로 수정.** 1차 blocker 3개 중 1개 해결, 2개 부분 해결(락 경쟁, build 실패 정리), major 11개 중 10개 해결, 1개 부분 해결(git stderr). 남은 3개를 P0에서 고치고 테스트 2개를 더했다(계약 테스트 11개). 레인 간 파일 겹침은 없다는 판정. 이어서 락만 두 번 더 확인받았고, 두 번 다 남은 경쟁이 재현됐다. 그래서 pid 파일을 버리고 SQLite 배타 락으로 바꿨다(A11).
 
 **1차:**
 
