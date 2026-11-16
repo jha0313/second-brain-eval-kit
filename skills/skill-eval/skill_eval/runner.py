@@ -27,10 +27,10 @@ from .trajectory import parse_stream
 # Rough $ per trial before any calibration. `--calibrate` replaces these with measured means.
 DEFAULT_AGENT_USD = {
     "haiku": {"find-all": 0.15, "why": 0.10, "small": 0.03, "other": 0.10},
-    "sonnet": {"find-all": 0.80, "why": 0.50, "small": 0.12, "other": 0.50},
+    "sonnet": {"find-all": 0.80, "why": 0.17, "small": 0.12, "other": 0.50},     # why: measured mean, Phase 1 dev runs
     "opus": {"find-all": 1.50, "why": 1.00, "small": 0.25, "other": 1.00},
 }
-DEFAULT_JUDGE_VOTE_USD = {"haiku": 0.02, "sonnet": 0.04, "opus": 0.07}
+DEFAULT_JUDGE_VOTE_USD = {"haiku": 0.02, "sonnet": 0.04, "opus": 0.122}   # opus: measured per vote, Phase 1 dev runs
 PROBE_USD = 0.10                 # isolation probe before the run (haiku, a few calls)
 RETRY_SHARE = 0.10               # reserve for infra retries (a trial is retried up to 2 times)
 DEFAULT_SECONDS = {"find-all": 240, "why": 150, "small": 45, "other": 120}

@@ -14,7 +14,9 @@ from .suite import load_github_index, load_key, load_sources, normalize_path
 # suite frozen (or a run graded) under an older version is never re-graded by the new rules without saying so.
 # v1 = seminar-2026-10-31. v2: one citation resolver for cites_exist, sources_hit and the judge (a unique shortened
 # path counts everywhere; "failure.ts" no longer matches job-failure.ts) and line ranges must be 1 <= start <= end <= length.
-GRADING_VERSION = "grading-v2"
+# v3: a cited path or commit that is not in the repo but that the frozen GitHub corpus names (github_evidence "paths" /
+# "commits") is GitHub-backed: neither valid nor missing; files the harness prepared (prepare_outputs) are not citations.
+GRADING_VERSION = "grading-v3"
 
 # What a failed check means. routing checks are diagnostics for skill arms only (the none arm would fail them by
 # construction), so they never change the score. integrity = the trial touched answer keys: it is thrown out.
@@ -341,7 +343,10 @@ def check_cites_exist(args, traj, repo, commit, **_):
     for pat in args.get("ignore", []):            # e.g. 'vault:[^\s)`]+' for notes that live outside the repo
         answer = re.sub(pat, " ", answer)
     tracked = tracked_files(repo, commit)
-    paths, bad, labeled = [], [], []
+    idx = github_index(args["github_evidence"]) if args.get("github_evidence") else None
+    gh_paths, gh_commits = (idx["paths"], idx["commits"]) if idx else (frozenset(), frozenset())
+    prepared = prepared_roots(args.get("prepared") or [])
+    paths, bad, labeled, backed, skipped = [], [], [], [], []
 
     def miss(text, kind, **extra):
         bad.append(text)
@@ -349,11 +354,17 @@ def check_cites_exist(args, traj, repo, commit, **_):
 
     for _, c in _path_cites(answer):
         p, lines = c["path"], c["lines"]
+        if is_prepared(p, prepared):               # e.g. .brain/index.db: the harness put it there; not a repo file
+            skipped.append(p)
+            continue
         match = resolve_path(p, tracked)
         # A bare name with no line that matches no file is code, not a citation (`res.json(...)`);
-        # a path with a "/" or a line that matches no file is missing.
+        # a path with a "/" or a line that matches no file is missing, unless the GitHub corpus names it.
         if not match:
             if "/" in p or lines:
+                if resolve_path(p, gh_paths):      # a file of an unmerged PR, a review comment's path: GitHub-backed
+                    backed.append(p)
+                    continue
                 paths.append(p)
                 miss(p, "deleted_file" if resolve_path(p, deleted_files(repo, commit)) else "no_such_file")
             continue
@@ -367,12 +378,13 @@ def check_cites_exist(args, traj, repo, commit, **_):
     for _, s, claimed in commit_tokens(answer):
         if _git(repo, "cat-file", "-e", f"{s}^{{commit}}").returncode == 0:
             shas.add(s)
+        elif gh_commit(s, gh_commits):            # a PR head or a commit only GitHub has: GitHub-backed
+            backed.append(f"commit {s}")
         elif claimed:                              # called a commit but is not one: a made-up citation
             shas.add(s)
             miss(f"commit {s}", "not_a_commit", in_repo_text=_git(repo, "grep", "-q", "-F", s, commit, "--").returncode == 0)
     gh = set()
-    if args.get("github_evidence"):              # GitHub items count only against the frozen index (suite github_evidence)
-        idx = github_index(args["github_evidence"])
+    if idx:                                      # GitHub items count only against the frozen index (suite github_evidence)
         for _, c in github_citations(answer, idx["repo"]):
             why = github_problem(c, idx["items"])
             gh.add(c["text"] if why else next(p for p in c["gh"] if p in idx["items"]))
@@ -383,9 +395,31 @@ def check_cites_exist(args, traj, repo, commit, **_):
     kinds: dict[str, int] = {}
     for x in labeled:
         kinds[x["kind"]] = kinds.get(x["kind"], 0) + 1
-    return {"ok": ok, "detail": f"{n} citation(s), {len(bad)} missing" + (f": {bad[:3]}" if bad else ""), "n_cites": n,
-            "missing": bad[:10], "missing_kinds": kinds, "missing_labeled": labeled[:10],
-            **({"n_github": len(gh)} if args.get("github_evidence") else {})}
+    return {"ok": ok, "detail": f"{n} citation(s), {len(bad)} missing" + (f": {bad[:3]}" if bad else "")
+            + (f", {len(set(backed))} GitHub-backed" if backed else "") + (f", {len(set(skipped))} prepared file(s) skipped" if skipped else ""),
+            "n_cites": n, "missing": bad[:10], "missing_kinds": kinds, "missing_labeled": labeled[:10],
+            **({"n_github": len(gh), "github_backed": sorted(set(backed))[:10]} if idx else {}),
+            **({"prepared_skipped": sorted(set(skipped))[:10]} if skipped else {})}
+
+
+def prepared_roots(outputs) -> frozenset[str]:
+    """prepare_outputs ("x/index.db") -> what a citation of them looks like: each output and its top folder ("x")."""
+    out = set()
+    for o in outputs:
+        o = normalize_path(str(o))
+        out.add(o)
+        if "/" in o:
+            out.add(o.split("/", 1)[0])
+    return frozenset(out)
+
+
+def is_prepared(p: str, roots: frozenset[str]) -> bool:
+    return bool(roots) and (p in roots or p.split("/", 1)[0] in roots)
+
+
+def gh_commit(sha: str, commits: frozenset[str]) -> bool:
+    """The cited hex (7-40) names a commit of the GitHub corpus: equal, or one is a prefix of the other."""
+    return bool(commits) and (sha in commits or any(c.startswith(sha) or sha.startswith(c) for c in commits))
 
 
 def citations(answer: str, github: bool = False, gh_repo: str | None = None) -> list[dict]:

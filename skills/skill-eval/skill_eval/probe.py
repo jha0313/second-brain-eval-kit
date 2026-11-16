@@ -31,7 +31,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .checks import check_no_answer_key_access
-from .runner import short
+from .runner import host_deny, short
 from .isolation import (GH_TOKEN_RE, TOKEN_FILE, TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact, credential_paths, gh_config_dirs,
                         risky_config_keys, scan_saved, trial_settings)
 from .trajectory import parse_stream
@@ -227,7 +227,7 @@ def run_probe(out: Path, model: str = "haiku", control: bool = True, log=print) 
     marker = root / "hook-fired"
     cfg = _canary_config(root, ws, marker)
     os.chmod(ws_root, 0o300)
-    deny = [trusted]
+    deny = probe_deny(trusted, root)              # this machine's SKILL_EVAL_DENY too: trials run with the same list
     r = {"when": datetime.now(timezone.utc).isoformat(timespec="seconds"), "model": model, "scope": __doc__.split("Scope")[1].strip(),
          "init": {}, "calls": {}}
     try:
@@ -333,6 +333,9 @@ def run_probe(out: Path, model: str = "haiku", control: bool = True, log=print) 
     bash_denied = ta["permission_denied_tools"].count("Bash")       # Read denials of the key paths are expected
     chk["trial: everyday Bash not blocked by permission prompts"] = (
         bash_denied == 0 and len(everyday) == 3, {"bash_denials": bash_denied, "ran": everyday})
+    failed = everyday_errors(ta["tool_calls"])
+    chk["trial: everyday Bash exits 0 with this machine's denied paths"] = (
+        not failed and len(everyday) == 3, {"host_denied_paths": len(deny) - 1, "errors": failed})
     chk["trial: synced config files carry no behavior keys"] = (not risky_config_keys(cfg_keys),
                                                                 {f: len(k) for f, k in cfg_keys.items()} or "no files")
     chk["target skill: only it is listed"] = (init["target skill"]["skills"] == [TARGET], init["target skill"]["skills"])
@@ -363,6 +366,30 @@ def run_probe(out: Path, model: str = "haiku", control: bool = True, log=print) 
     r["all_ok"] = all(v["ok"] for v in r["checks"].values())
     (out / "probe.json").write_text(redact(json.dumps(r, indent=1, ensure_ascii=False, default=str)))
     return r
+
+
+def probe_deny(trusted: Path, root: Path) -> list[Path]:
+    """The probe's denied paths: its stand-in answer keys plus SKILL_EVAL_DENY, as runner.deny_list gives a trial.
+    Its temp root must not sit inside one of them (a run refuses the same for its workspace root)."""
+    extra = host_deny()
+    bad = [p for p in extra if root.resolve().is_relative_to(p.resolve())]
+    if bad:
+        raise RuntimeError(f"probe root {root} is inside a SKILL_EVAL_DENY path")
+    return [trusted, *extra]
+
+
+EVERYDAY = ("var-ok", "loop-ok", "tmp-ok")
+
+
+def everyday_errors(tool_calls: list[dict]) -> list[str]:
+    """The everyday Bash commands (items 9-11 of the attack prompt) that ended in an error, as the agent saw it (first
+    line of the error). A denied path that Claude Code itself writes after every command makes each of them fail."""
+    out = []
+    for c in tool_calls:
+        if c["name"] == "Bash" and c.get("is_error") and any(w in json.dumps(c["input"]) for w in EVERYDAY):
+            lines = [ln for ln in (c.get("output") or "").splitlines() if ln.strip()]
+            out.append((lines[-1] if lines else "error")[:120])
+    return out
 
 
 def format_probe(r: dict, width: int = 100) -> str:

@@ -20,6 +20,7 @@ ARM_KEYS = {"skill", "patch", "outputs", "env"}
 # GitHub item pointers, as in skills/codebase-brain/src/ptr.mjs (P0 grammar). review / rc / ic have a parent PR or issue.
 GH_PTR_RE = re.compile(r"(pr|issue|review|rc|ic):([1-9]\d{0,15})")
 CHILD_TYPES = ("review", "rc", "ic")
+SHA_ONLY_RE = re.compile(r"[0-9a-f]{7,40}")
 
 
 class SuiteError(ValueError):
@@ -182,6 +183,11 @@ def load_suite(path: str | Path, repo_override: str | None = None) -> Suite:
                 for name in ("cites_exist", "sources_hit"):
                     if name in chk:
                         chk[name]["github_evidence"] = str(suite.github_evidence)
+    if suite.prepare_outputs:                       # files the harness put in the workspace are not repo citations
+        for c in suite.cases:
+            for chk in c.hard:
+                if "cites_exist" in chk:
+                    chk["cites_exist"]["prepared"] = list(suite.prepare_outputs)
     trusted = {suite.dir} | {Path(f).parent for f in files}
     trusted |= {kp.parent for c in suite.cases for kp in c.key_paths()}
     trusted |= {suite.github_evidence.parent} if suite.github_evidence else set()
@@ -325,7 +331,10 @@ def load_github_index(path: str | Path) -> dict:
     ic maps to its parent PR or issue number (PRs and issues share one number space), every other pointer to null.
     With "repo", a github.com URL of another repo is not a citation of this corpus. "texts": the stored (masked) text
     of indexed items, exported from the frozen github.db at freeze time; the judge reads cited and reference items
-    from it (judge-only, never shown to a trial)."""
+    from it (judge-only, never shown to a trial). "paths" and "commits" (optional): every file / folder path and commit
+    SHA the corpus names (review-comment paths, PR files, path and commit references, commit ids, merge and head
+    SHAs). cites_exist counts a cited path or commit that is not in the repo but is one of these as GitHub-backed:
+    neither a valid citation nor a missing one."""
     path = Path(path)
     if not path.exists():
         raise SuiteError(f"github_evidence not found: {path}")
@@ -346,8 +355,14 @@ def load_github_index(path: str | Path) -> dict:
         raise SuiteError(f"{path.name}: \"texts\" must map pointers to strings")
     if set(texts) - set(items):
         raise SuiteError(f"{path.name}: texts for pointers not in items: {sorted(set(texts) - set(items))[:5]}")
+    paths, commits = data.get("paths") or [], data.get("commits") or []
+    if not isinstance(paths, list) or any(not isinstance(p, str) or not p for p in paths):
+        raise SuiteError(f"{path.name}: \"paths\" must be a list of file or folder paths")
+    if not isinstance(commits, list) or any(not isinstance(c, str) or not SHA_ONLY_RE.fullmatch(c) for c in commits):
+        raise SuiteError(f"{path.name}: \"commits\" must be a list of commit SHAs (7-40 lowercase hex)")
     repo = data.get("repo")
-    return {"repo": str(repo).lower() if repo else None, "items": items, "texts": texts}
+    return {"repo": str(repo).lower() if repo else None, "items": items, "texts": texts,
+            "paths": frozenset(normalize_path(p) for p in paths), "commits": frozenset(commits)}
 
 
 def assign_families(cases: list[Case]) -> None:
