@@ -26,7 +26,7 @@ import { sqliteStore } from './store/sqlite.mjs';
 import { readerUrl, secretsOf, connectReader, ensureMirror, mirrorDir, sameRun } from './store/server.mjs';
 import { BrainError } from './errors.mjs';
 import { git, gitEnv } from './files.mjs';
-import { staleness, footerCells, footerLine, destroyReader, withDeadline } from './pg/status.mjs';
+import { staleness, startMainHead, footerCells, footerLine, destroyReader, withDeadline } from './pg/status.mjs';
 import { refresh, callBudget } from './refresh.mjs';
 import { actionsFromEnv } from './gh-actions.mjs';
 import { FOOTER_PHRASES, REFRESH_EXIT, REFRESH_LIMITS, REFRESH_MESSAGES, refreshStatePath, ageText } from './pg/contract.mjs';
@@ -140,9 +140,19 @@ function localOnly(opt, what) {
 // run (an --as-of run is old on purpose). The reader's one SELECT and `git ls-remote origin` only: Actions is read by
 // status and refresh, not by every answer. Bounded: a cell that cannot be read in time is unknown
 const FOOTER_STALENESS_MS = 8000, STATUS_STALENESS_MS = 30_000, LOCAL_GIT_MS = 5000;
-async function cellsOf(s, { actions = null, ms = FOOTER_STALENESS_MS } = {}) {
-  const st = await staleness({ reader: s.client, repoDir: checkout ?? process.cwd(), actions, deadline: Date.now() + ms });
+async function cellsOf(s, { actions = null, ms = FOOTER_STALENESS_MS, head = null } = {}) {
+  const st = await staleness({ reader: s.client, repoDir: checkout ?? process.cwd(), actions, deadline: Date.now() + ms, mainHead: head?.head });
   return { code: st.code, memory: st.memory, activity: st.activity, last: st.last, run: st.run, cells: footerCells(st), detail: st.detail };
+}
+// the footer's `git ls-remote origin` takes as long as connect + the read (Q9: ~0.75 s), so a server answer from the
+// newest run starts it with the command and awaits it only for the footer. A command that ends first (an error ends
+// with process.exit) kills it. None for --as-of: that answer has no cells
+function footerHead(opt) {
+  if (opt['as-of'] !== undefined) return null;
+  const h = startMainHead(checkout ?? process.cwd(), { ms: FOOTER_STALENESS_MS });
+  process.once('exit', h.stop);
+  h.head.finally(() => process.off('exit', h.stop));
+  return h;
 }
 
 // every read command but status: both stores, refused when written before the current sanitizer. Server mode: the
@@ -155,6 +165,7 @@ async function open(opt) {
     guard(ctx);
     return ctx;
   }
+  const head = footerHead(opt);
   const s = await serverSession(url, opt);
   try {
     let at = s.at ?? await s.store.resolveAsOf(null);
@@ -168,7 +179,7 @@ async function open(opt) {
         ctx.sync = at.view.sync;
         ctx.at = { asOf: s.at !== null, latest: at.latest };
         guard(ctx);
-        if (s.at === null) ctx.staleness = await cellsOf(s);
+        if (s.at === null) ctx.staleness = await cellsOf(s, { head });
         return ctx;
       }
       // another session replaced the mirror between its pull and our open: a newer run (taken as the newest), or
@@ -186,13 +197,14 @@ async function open(opt) {
 async function memoryRead(opt, local, server) {
   const url = serverUrl(opt);
   if (!url) { const ctx = await open(opt); return { ctx, res: local(ctx) }; }
+  const head = footerHead(opt);
   const s = await serverSession(url, opt);
   try {
     const { view, ...res } = await server(s.store, s.at?.run ?? null);
     const ctx = viewContext(view, checkout);
     ctx.at = { asOf: s.at !== null, latest: s.at?.latest ?? view.run };
     guard(ctx);                                         // before anything read is shown
-    if (s.at === null) ctx.staleness = await cellsOf(s);
+    if (s.at === null) ctx.staleness = await cellsOf(s, { head });
     return { ctx, res };
   } finally { await s.store.close(); }
 }
