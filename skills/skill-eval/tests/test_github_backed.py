@@ -47,8 +47,11 @@ def test_a_shortened_corpus_path_and_a_line_on_it_are_github_backed(grade):
 def test_a_pr_head_sha_from_a_review_is_github_backed(grade):
     r = grade(f"Round 2 reviewed head `{GONE_SHA[:8]}` (rc:70); see svc/lever/hook.ts:1.")
     assert r["ok"] and r["github_backed"] == [f"commit {GONE_SHA[:8]}"], r
+    # a longer form of a short corpus SHA: its extra characters cannot be checked, so it is not backed
     r = grade("Commit abc1234567 (a longer form of a short corpus SHA) is in pr:7.")
-    assert r["ok"] and r["github_backed"] == ["commit abc1234567"], r
+    assert not r["ok"] and r["missing_kinds"] == {"not_a_commit": 1}, r
+    r = grade(f"Commit {GONE_SHA[:7]}fffffffffffffffffffffffffffffffff is in pr:7; see svc/lever/hook.ts:1.")
+    assert not r["ok"], r
 
 
 def test_names_that_exist_nowhere_are_still_missing(grade):
@@ -83,16 +86,47 @@ def test_without_paths_or_commits_the_old_rule_holds(tmp_path, repo):
     assert not r["ok"] and r["missing_kinds"] == {"no_such_file": 1}, r   # no prepare_outputs: no skip
 
 
+def test_a_prepared_output_inside_a_repo_folder_hides_no_repo_citation(tmp_path, repo):
+    repo.write({"svc/lever/hook.ts": lines(5)})
+    head = repo.commit()
+    args = {"min": 1, "prepared": ["svc/cache/dump.json"]}
+    grade = lambda text: check_cites_exist(args, {"final": text}, repo=repo.root, commit=head)  # noqa: E731
+    r = grade("See svc/lever/hook.ts:2.")
+    assert r["ok"] and r["n_cites"] == 1, r                                  # a real repo file still counts
+    r = grade("See svc/lever/hook.ts:2 and svc/no-such-file.ts:3.")
+    assert not r["ok"] and r["missing_kinds"] == {"no_such_file": 1}, r      # "svc" is a repo folder: no blanket skip
+    r = grade("See svc/lever/hook.ts:9 and svc/cache/dump.json.")
+    assert not r["ok"] and r["missing_kinds"] == {"bad_line_range": 1}, r    # the output itself is skipped, the range is not
+    assert r["prepared_skipped"] == ["svc/cache/dump.json"]
+
+
+def test_the_judge_sees_exempt_names_as_exempt(tmp_path, repo):
+    from types import SimpleNamespace
+    from skill_eval import judge
+    repo.write({"svc/lever/hook.ts": lines(5)})
+    head = repo.commit()
+    ev = str(_evidence(tmp_path))
+    case = SimpleNamespace(hard=[{"cites_exist": {"min": 1, "github_evidence": ev, "prepared": [".brain/github-dump.json"]}}],
+                           key_paths=lambda kinds=None: [])
+    out = judge._excerpts(case, {"final": f"See svc/lever/title-pick.ts:3, commit {GONE_SHA[:8]}, .brain/github-dump.json "
+                                           "and svc/lever/hook.ts:2."}, repo.root, head)
+    assert "the frozen GitHub corpus names this path" in out and "the frozen GitHub corpus names this commit" in out
+    assert "github-dump.json" not in out and "(no such file at this commit)" not in out
+
+
 def test_helpers():
-    roots = prepared_roots([".brain/v2.db", "index.db"])
-    assert roots == {".brain/v2.db", ".brain", "index.db"}
+    roots = prepared_roots([".brain/v2.db", "index.db", "svc/cache/i.db"], tracked=["svc/a.ts", "top.md"])
+    assert roots == {".brain/v2.db", ".brain", "index.db", "svc/cache/i.db"}    # "svc" is a repo folder
     assert is_prepared(".brain/github-dump.json", roots) and is_prepared("index.db", roots)
     assert not is_prepared("brain/x.ts", roots) and not is_prepared("src/index.db", roots)
     assert gh_commit("5e1f00d", frozenset([GONE_SHA])) and not gh_commit("5e1f00e", frozenset([GONE_SHA]))
+    assert not gh_commit("abc1234fff", frozenset(["abc1234"]))
     assert not gh_commit("5e1f00d", frozenset())
 
 
-@pytest.mark.parametrize("bad", [{"paths": "svc/a.ts"}, {"paths": [""]}, {"commits": ["XYZ1234"]}, {"commits": ["abc12"]}])
+@pytest.mark.parametrize("bad", [{"paths": "svc/a.ts"}, {"paths": [""]}, {"paths": ["  "]}, {"paths": False}, {"paths": ["../x.ts"]},
+                                 {"paths": ["https://other.invalid/src/nonexistent.ts"]}, {"paths": ["/abs/x.ts"]},
+                                 {"commits": ["XYZ1234"]}, {"commits": ["abc12"]}, {"commits": {}}])
 def test_evidence_paths_and_commits_are_validated(tmp_path, bad):
     with pytest.raises(SuiteError):
         load_github_index(_evidence(tmp_path, {**EVIDENCE, **bad}))
@@ -119,7 +153,11 @@ def test_probe_denies_the_host_paths_trials_deny(tmp_path, monkeypatch):
     extra = tmp_path / "other-copy"
     monkeypatch.setenv("SKILL_EVAL_DENY", str(extra))
     trusted, root = tmp_path / "keys", tmp_path / "probe-root"
-    assert probe.probe_deny(trusted, root) == [trusted, extra] == [trusted, *runner.host_deny()]
+    assert probe.probe_deny(trusted, root) == [trusted, extra.resolve()] == [trusted, *(p.resolve() for p in runner.host_deny())]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SKILL_EVAL_DENY", "relative/denied")               # resolved like runner.deny_list does
+    assert probe.probe_deny(trusted, root)[1] == (tmp_path / "relative/denied").resolve()
+    monkeypatch.setenv("SKILL_EVAL_DENY", str(extra))
     monkeypatch.setenv("SKILL_EVAL_DENY", str(tmp_path))          # the probe's own temp root inside a denied path
     with pytest.raises(RuntimeError):
         probe.probe_deny(trusted, root)
@@ -132,6 +170,12 @@ def test_probe_flags_everyday_bash_that_fails():
     other = {"name": "Bash", "input": {"command": "cat docs/notes/key.json"}, "is_error": True, "output": "denied"}
     assert probe.everyday_errors([ok, other]) == []
     assert probe.everyday_errors([ok, cwd, other]) == ["zsh:1: operation not permitted: /tmp/x/cwd-1a2b"]
+    fake = {"name": "Bash", "input": {"command": 'echo "var-ok loop-ok tmp-ok"'}, "is_error": False, "output": "var-ok loop-ok tmp-ok"}
+    assert probe.everyday_ok([fake]) == []                                  # printing the words is not running the commands
+    loop = {"name": "Bash", "input": {"command": "for f in *; do :; done; echo loop-ok"}, "is_error": False, "output": "loop-ok"}
+    tmp = {"name": "Bash", "input": {"command": "printf tmp-ok > $TMPDIR/p.txt && cat $TMPDIR/p.txt"}, "is_error": False, "output": "tmp-ok"}
+    assert probe.everyday_ok([ok, loop, tmp]) == ["var-ok", "loop-ok", "tmp-ok"]
+    assert probe.everyday_ok([ok, cwd, tmp]) == ["var-ok", "tmp-ok"]         # the failed loop does not count
 
 
 def test_estimate_uses_the_measured_rates():

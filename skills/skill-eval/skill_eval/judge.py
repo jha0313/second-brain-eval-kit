@@ -12,7 +12,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .checks import github_citations, resolved_citations
+from .checks import gh_commit, github_backed_path, github_citations, is_prepared, prepared_roots, resolved_citations, tracked_files
 from .isolation import TrialEnv, claude_cmd, trial_settings
 from .suite import load_github_index, load_sources
 from .trajectory import model_tokens
@@ -109,10 +109,20 @@ def _excerpts(case, traj, repo, commit, max_cites: int = 10, budget: int = 24000
                     break
                 blocks.append(text)
                 used += len(text)
+    prepared = prepared_roots(next((args.get("prepared") or [] for chk in case.hard for args in chk.values()
+                                    if isinstance(args, dict) and "prepared" in args), []), tracked_files(repo, commit))
     for c in resolved_citations(traj["final"] or "", repo, commit)[:max_cites]:
         label = c.get("commit") or (c["as_written"] + " → " if c.get("as_written") else "") + c["path"] + (
             f":{c['lines'][0]}-{c['lines'][1]}" if c["lines"] else "")
-        text = _quoted(f"--- {label}\n{excerpt(repo, commit, c)[:3000]}")
+        body = excerpt(repo, commit, c)[:3000]
+        # what cites_exist exempts is shown as such, never as a missing citation (grading-v3)
+        if body == "(no such file at this commit)" and is_prepared(c["path"], prepared):
+            continue
+        if gh and body == "(no such file at this commit)" and github_backed_path(c["path"], gh["paths"]):
+            body = "(not in the repo at this commit; the frozen GitHub corpus names this path, e.g. a file of an unmerged PR or a review comment's path)"
+        elif gh and body == "(no such commit)" and gh_commit(c["commit"], gh["commits"]):
+            body = "(not in the repo; the frozen GitHub corpus names this commit, e.g. a PR head)"
+        text = _quoted(f"--- {label}\n{body}")
         if used + len(text) > budget:
             break
         blocks.append(text)

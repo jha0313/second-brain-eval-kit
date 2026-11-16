@@ -345,7 +345,7 @@ def check_cites_exist(args, traj, repo, commit, **_):
     tracked = tracked_files(repo, commit)
     idx = github_index(args["github_evidence"]) if args.get("github_evidence") else None
     gh_paths, gh_commits = (idx["paths"], idx["commits"]) if idx else (frozenset(), frozenset())
-    prepared = prepared_roots(args.get("prepared") or [])
+    prepared = prepared_roots(args.get("prepared") or [], tracked)
     paths, bad, labeled, backed, skipped = [], [], [], [], []
 
     def miss(text, kind, **extra):
@@ -354,15 +354,16 @@ def check_cites_exist(args, traj, repo, commit, **_):
 
     for _, c in _path_cites(answer):
         p, lines = c["path"], c["lines"]
-        if is_prepared(p, prepared):               # e.g. .brain/index.db: the harness put it there; not a repo file
-            skipped.append(p)
-            continue
         match = resolve_path(p, tracked)
         # A bare name with no line that matches no file is code, not a citation (`res.json(...)`);
-        # a path with a "/" or a line that matches no file is missing, unless the GitHub corpus names it.
+        # a path with a "/" or a line that matches no file is missing, unless the harness prepared it or the GitHub
+        # corpus names it. A repo file always wins: these exemptions apply only to names that are not in the repo.
         if not match:
+            if is_prepared(p, prepared):           # e.g. .brain/index.db: the harness put it there; not a repo file
+                skipped.append(p)
+                continue
             if "/" in p or lines:
-                if resolve_path(p, gh_paths):      # a file of an unmerged PR, a review comment's path: GitHub-backed
+                if github_backed_path(p, gh_paths):  # a file of an unmerged PR, a review comment's path: GitHub-backed
                     backed.append(p)
                     continue
                 paths.append(p)
@@ -402,13 +403,15 @@ def check_cites_exist(args, traj, repo, commit, **_):
             **({"prepared_skipped": sorted(set(skipped))[:10]} if skipped else {})}
 
 
-def prepared_roots(outputs) -> frozenset[str]:
-    """prepare_outputs ("x/index.db") -> what a citation of them looks like: each output and its top folder ("x")."""
+def prepared_roots(outputs, tracked=()) -> frozenset[str]:
+    """prepare_outputs ("x/index.db") -> what a citation of them looks like: each output, and its top folder ("x") only
+    when no tracked file lives under that folder (a harness folder such as .brain, never a repo folder such as src)."""
+    tops = {t.split("/", 1)[0] for t in tracked if "/" in t}
     out = set()
     for o in outputs:
         o = normalize_path(str(o))
         out.add(o)
-        if "/" in o:
+        if "/" in o and o.split("/", 1)[0] not in tops:
             out.add(o.split("/", 1)[0])
     return frozenset(out)
 
@@ -417,9 +420,15 @@ def is_prepared(p: str, roots: frozenset[str]) -> bool:
     return bool(roots) and (p in roots or p.split("/", 1)[0] in roots)
 
 
+def github_backed_path(p: str, paths: frozenset[str]) -> bool:
+    """The GitHub corpus names this path (itself, or one corpus path it is the tail of)."""
+    return bool(paths) and bool(resolve_path(p, paths))
+
+
 def gh_commit(sha: str, commits: frozenset[str]) -> bool:
-    """The cited hex (7-40) names a commit of the GitHub corpus: equal, or one is a prefix of the other."""
-    return bool(commits) and (sha in commits or any(c.startswith(sha) or sha.startswith(c) for c in commits))
+    """The cited hex (7-40) names a commit of the GitHub corpus: equal, or a prefix of a corpus SHA. A cited SHA longer
+    than the corpus's short form is not backed: its extra characters cannot be checked."""
+    return bool(commits) and (sha in commits or any(c.startswith(sha) for c in commits))
 
 
 def citations(answer: str, github: bool = False, gh_repo: str | None = None) -> list[dict]:

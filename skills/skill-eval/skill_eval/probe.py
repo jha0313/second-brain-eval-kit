@@ -333,9 +333,9 @@ def run_probe(out: Path, model: str = "haiku", control: bool = True, log=print) 
     bash_denied = ta["permission_denied_tools"].count("Bash")       # Read denials of the key paths are expected
     chk["trial: everyday Bash not blocked by permission prompts"] = (
         bash_denied == 0 and len(everyday) == 3, {"bash_denials": bash_denied, "ran": everyday})
-    failed = everyday_errors(ta["tool_calls"])
+    failed, ran_ok = everyday_errors(ta["tool_calls"]), everyday_ok(ta["tool_calls"])
     chk["trial: everyday Bash exits 0 with this machine's denied paths"] = (
-        not failed and len(everyday) == 3, {"host_denied_paths": len(deny) - 1, "errors": failed})
+        not failed and ran_ok == list(EVERYDAY), {"host_denied_paths": len(deny) - 1, "ok": ran_ok, "errors": failed})
     chk["trial: synced config files carry no behavior keys"] = (not risky_config_keys(cfg_keys),
                                                                 {f: len(k) for f, k in cfg_keys.items()} or "no files")
     chk["target skill: only it is listed"] = (init["target skill"]["skills"] == [TARGET], init["target skill"]["skills"])
@@ -371,14 +371,32 @@ def run_probe(out: Path, model: str = "haiku", control: bool = True, log=print) 
 def probe_deny(trusted: Path, root: Path) -> list[Path]:
     """The probe's denied paths: its stand-in answer keys plus SKILL_EVAL_DENY, as runner.deny_list gives a trial.
     Its temp root must not sit inside one of them (a run refuses the same for its workspace root)."""
-    extra = host_deny()
-    bad = [p for p in extra if root.resolve().is_relative_to(p.resolve())]
+    extra = [p.resolve() for p in host_deny()]              # resolved, as runner.deny_list writes them for a trial
+    bad = [p for p in extra if root.resolve().is_relative_to(p)]
     if bad:
         raise RuntimeError(f"probe root {root} is inside a SKILL_EVAL_DENY path")
     return [trusted, *extra]
 
 
 EVERYDAY = ("var-ok", "loop-ok", "tmp-ok")
+
+
+# what each everyday command must do, not just print: a variable, a loop, a write to $TMPDIR
+EVERYDAY_SHAPE = {"var-ok": re.compile(r"\$\{?[A-Za-z_]"), "loop-ok": re.compile(r"\bfor\b.*\bdo\b"), "tmp-ok": re.compile(r"TMPDIR")}
+
+
+def everyday_ok(tool_calls: list[dict]) -> list[str]:
+    """The everyday markers each printed by a successful Bash call that really does that thing: a variable, a loop, a
+    $TMPDIR write (one `echo` of all three words proves nothing; one call may run all three)."""
+    ok = []
+    for w in EVERYDAY:
+        for c in tool_calls:
+            cmd = json.dumps(c["input"])
+            if (c["name"] == "Bash" and not c.get("is_error") and w in cmd and w in (c.get("output") or "")
+                    and EVERYDAY_SHAPE[w].search(cmd)):
+                ok.append(w)
+                break
+    return ok
 
 
 def everyday_errors(tool_calls: list[dict]) -> list[str]:

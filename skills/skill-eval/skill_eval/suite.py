@@ -21,6 +21,7 @@ ARM_KEYS = {"skill", "patch", "outputs", "env"}
 GH_PTR_RE = re.compile(r"(pr|issue|review|rc|ic):([1-9]\d{0,15})")
 CHILD_TYPES = ("review", "rc", "ic")
 SHA_ONLY_RE = re.compile(r"[0-9a-f]{7,40}")
+REPO_PATH_RE = re.compile(r"[^/\s][^\n\r]*")        # relative and one line; spaces and colons are legal in repo paths
 
 
 class SuiteError(ValueError):
@@ -355,14 +356,18 @@ def load_github_index(path: str | Path) -> dict:
         raise SuiteError(f"{path.name}: \"texts\" must map pointers to strings")
     if set(texts) - set(items):
         raise SuiteError(f"{path.name}: texts for pointers not in items: {sorted(set(texts) - set(items))[:5]}")
-    paths, commits = data.get("paths") or [], data.get("commits") or []
-    if not isinstance(paths, list) or any(not isinstance(p, str) or not p for p in paths):
+    paths, commits = data.get("paths", []), data.get("commits", [])
+    if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths):
         raise SuiteError(f"{path.name}: \"paths\" must be a list of file or folder paths")
+    paths = [normalize_path(p.strip()) for p in paths]
+    bad = [p for p in paths if not REPO_PATH_RE.fullmatch(p) or ".." in p.split("/") or "://" in p]
+    if bad:
+        raise SuiteError(f"{path.name}: \"paths\" must be relative repo paths (no URL, no '..', not empty): {bad[:3]}")
     if not isinstance(commits, list) or any(not isinstance(c, str) or not SHA_ONLY_RE.fullmatch(c) for c in commits):
         raise SuiteError(f"{path.name}: \"commits\" must be a list of commit SHAs (7-40 lowercase hex)")
     repo = data.get("repo")
     return {"repo": str(repo).lower() if repo else None, "items": items, "texts": texts,
-            "paths": frozenset(normalize_path(p) for p in paths), "commits": frozenset(commits)}
+            "paths": frozenset(paths), "commits": frozenset(commits)}
 
 
 def assign_families(cases: list[Case]) -> None:
