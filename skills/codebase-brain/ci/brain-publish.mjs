@@ -79,7 +79,7 @@ async function main() {
     // R3: the base state is the mirror of run B, and it must match run[B].checksum
     let baseState = null, mirror = null;
     if (base) {
-      try { mirror = await pullMirror({ url, dir: mirrorDir, run: base.run, shapes: ['code', 'github'] }); }
+      try { mirror = await pullMirror({ url, dir: mirrorDir, run: base.run, shapes: ['code', 'github'], log: say }); }
       catch (e) { throw new StageError('mirror', `the mirror of run ${base.run} could not be pulled (${e.code ?? 'error'})`); }
       baseState = snapshot({ codeDb: mirror.codeDb, githubDb: mirror.githubDb, manifest: C.validateManifest(FULL) });
       if (baseState.run !== base.run || C.canonicalJson(C.checksum(baseState)) !== C.canonicalJson(base.checksum)) {
