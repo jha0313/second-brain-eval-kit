@@ -9,6 +9,12 @@
 // publish records the failure itself (R11). A lost COMMIT reply is resolved under the lock (R12): ok -> the run, rolled
 // back -> recorded failure, lock not acquired or no reply -> code 'outcome-unknown' (never written again). Every query
 // has a client deadline as well as the server's timeouts: a connection that stops answering cannot hang the job.
+//
+// Changes from the Q0 stub signatures (callers: ci/brain-publish.mjs now, Phase 3 S2 src/pg/ci-publish.mjs later):
+// - publish takes no meta, syncState or sanitizeVersion: they come from the delta (diff copies them from the new
+//   snapshot; commit must equal delta.meta.commit). New: repoDir (the source checkout, for git ancestry) and onStage (a
+//   test hook, awaited after each stage).
+// - beginAttempt, failAttempt and resolveAttempt keep the stub signatures.
 import pg from 'pg';
 import { execFileSync } from 'node:child_process';
 import { constants } from 'node:os';
@@ -201,9 +207,15 @@ async function openCounts(c) {
   return Object.fromEntries(CODE_TABLES.map((t) => [t, Number(r.rows[0][t])]));
 }
 
-/** git: is `older` an ancestor of (or equal to) `newer` in the source checkout? Unknown commits count as no. */
+/**
+ * git: is `older` an ancestor of (or equal to) `newer` in the source checkout? Unknown commits count as no. git gets
+ * PATH and HOME only: no child process of the publisher sees the writer URL.
+ */
 function descends(repoDir, older, newer) {
-  try { execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', older, newer], { stdio: 'ignore' }); return true; } catch { return false; }
+  try {
+    execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', older, newer], { stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+    return true;
+  } catch { return false; }
 }
 
 /**

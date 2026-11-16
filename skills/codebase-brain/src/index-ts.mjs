@@ -9,8 +9,9 @@ import { TS_EXT, fileFlags, readHead } from './files.mjs';
 const ASSET_EXT = /\.(css|scss|sass|less|svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|mp4|webm|mp3|wav|txt|md|html|ya?ml|graphql|gql|wasm)$/i;
 
 export function loadTypeScript(repo) {
-  // Prefer the compiler the repo builds with; fall back to the one shipped with the kit.
-  try {
+  // Prefer the compiler the repo builds with; fall back to the one shipped with the kit. BRAIN_TYPESCRIPT=kit (CI
+  // publish) never loads the repo's typescript: requiring it would run the source repo's code.
+  if (process.env.BRAIN_TYPESCRIPT !== 'kit') try {
     const ts = createRequire(join(repo, 'package.json'))('typescript');
     if (Number(ts.version.split('.')[0]) >= 5) return { ts, from: 'repo' };
   } catch {}
