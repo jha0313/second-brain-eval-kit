@@ -116,3 +116,15 @@ test('build writes build_id, sanitize_version, body_line column; code.db is 0600
   const gh = makeGithubDb(codeDb, { items: [{ number: 1121 }] });
   assert.ok(existsSync(gh));
 });
+
+test('seams: replay only when BRAIN_REPLAY_DIR is set; failpoints throw only for their own name', async () => {
+  const { replaySeams, failpoint } = await import('../../src/seams.mjs');
+  assert.equal(replaySeams({}), null);
+  const dir = mkdtempSync(join(tmpdir(), 'seam-'));
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ now: '2026-11-15T10:00:00Z', routes: [] }));
+  const s = replaySeams({ BRAIN_REPLAY_DIR: dir });
+  assert.equal(s.token, 'replay-token');
+  assert.equal(new Date(s.clock.now()).toISOString(), '2026-11-15T10:00:00.000Z');
+  failpoint('sync:page:1', { BRAIN_FAIL_AT: 'sync:page:2' });
+  assert.throws(() => failpoint('sync:page:2', { BRAIN_FAIL_AT: 'sync:page:2' }), (e) => e.code === 'injected');
+});
