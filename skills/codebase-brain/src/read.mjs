@@ -77,6 +77,7 @@ import { MAX_GET, LINK_STATUS, filterOf, listOf } from './store/common.mjs';
  *
  * @typedef {{
  *   ptr: string, origin: 'github'|'repo'|'vault', date: string|null, assoc: string|null,
+ *   state: string|null, draft: boolean, ended: string|null,   // github: item state, merged_at ?? closed_at; repo/vault: null, false, null
  *   from: number, to: number, total: number,   // 1-based line numbers within the stored text
  *   firstLineNo: number,                       // repo memory: file line of the first line shown (chunks.body_line + from - 1); github: from
  *   redactions: number, flags: string[],
@@ -281,14 +282,15 @@ function sourceResult(r, p, opts) {
   const from = Math.max(1, Math.floor(Number(opts.from) || 1)), max = Math.max(1, Math.floor(Number(opts.maxLines) || 200));
   const s = r.origin === 'github'
     ? { ptr: p.rev == null ? r.ptr : formatRevPtr(p), origin: 'github', date: dateOf(r.submitted_at ?? r.created_at), assoc: enumOf(r.author_assoc), text: r.body, base: 1,
-      redactions: Number(r.redactions) || 0, flags: flagsOf(r.flags), author: strOr(r.author), url: strOr(r.url) }
+      redactions: Number(r.redactions) || 0, flags: flagsOf(r.flags), author: strOr(r.author), url: strOr(r.url),
+      state: stateOf(r.state), draft: !!r.draft, ended: dateOf(r.merged_at ?? r.closed_at) }
     // body_line is NULL until lane B's index-knowledge fills it: start_line is the same line unless sections() trimmed blank lines
     : { ptr: formatRevPtr(p), origin: p.type === 'vault' ? 'vault' : 'repo', date: dateOf(r.date), assoc: null, text: r.body,
-      base: r.body_line ?? r.start_line ?? 1, ...marksOf(r.body), author: null, url: null };
+      base: r.body_line ?? r.start_line ?? 1, ...marksOf(r.body), author: null, url: null, state: null, draft: false, ended: null };
   const all = s.text ? String(s.text).split('\n') : [];
   const to = Math.min(all.length, from + max - 1);
-  return { ptr: s.ptr, origin: s.origin, date: s.date, assoc: s.assoc, from, to, total: all.length, firstLineNo: s.base + from - 1,
-    redactions: s.redactions, flags: s.flags, untrusted: { author: s.author, url: s.url, lines: all.slice(from - 1, to) } };
+  return { ptr: s.ptr, origin: s.origin, date: s.date, assoc: s.assoc, state: s.state, draft: s.draft, ended: s.ended, from, to, total: all.length,
+    firstLineNo: s.base + from - 1, redactions: s.redactions, flags: s.flags, untrusted: { author: s.author, url: s.url, lines: all.slice(from - 1, to) } };
 }
 
 /**
@@ -311,16 +313,20 @@ export async function sourceIn(store, ptr, opts = {}) {
 
 /**
  * Quote envelope (design §6.5 L3): returns the lines to print, nothing else.
- *   ── quote <ptr> · untrusted · <origin> · @<author> (<ASSOC>) · <date> · <url>
+ *   ── quote <ptr> · untrusted · <origin> · <state> · @<author> (<ASSOC>) · <date> · <url>
  *   │ <line>                       github: the stored line · repo memory: "│ <lineNo>  <line>"
  *   ── end quote <ptr> · <n> redaction(s) · flag: suspicious      (the flag part only when flagged)
+ * <state> (github items that have one): "open", "open (draft)", "approved", "closed 2026-11-16", "merged 2026-11-10".
+ * Without it a claim in a closed issue read as live work (dev trial B12).
  * Every external value in the head line goes through fmt.safe(); the body lines are already sanitized.
  * @param {SourceResult} src @returns {string[]}
  */
 export function envelope(src) {
   const u = src.untrusted;
   const who = u.author != null ? `@${safe(u.author)}${src.assoc ? ` (${safe(src.assoc)})` : ''}` : null;
-  const head = [`── quote ${safe(src.ptr)}`, 'untrusted', safe(src.origin), who, src.date ? safe(src.date).slice(0, 10) : null, u.url ? safe(u.url) : null];
+  const st = src.state
+    ? `${safe(src.state).toLowerCase().replace(/_/g, '-')}${src.draft ? ' (draft)' : ''}${src.state !== 'open' && src.ended ? ` ${safe(src.ended).slice(0, 10)}` : ''}` : null;
+  const head = [`── quote ${safe(src.ptr)}`, 'untrusted', safe(src.origin), st, who, src.date ? safe(src.date).slice(0, 10) : null, u.url ? safe(u.url) : null];
   const body = u.lines.map((l, i) => (src.origin === 'github' ? `│ ${l}` : `│ ${src.firstLineNo + i}  ${l}`));
   const end = [`── end quote ${safe(src.ptr)}`, plural(src.redactions, 'redaction'), src.flags.includes('suspicious') ? 'flag: suspicious' : null];
   return [head.filter(Boolean).join(' · '), ...body, end.filter(Boolean).join(' · ')];

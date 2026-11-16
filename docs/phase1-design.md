@@ -389,7 +389,7 @@ sequenceDiagram
 `source` 출력 형식(명세):
 
 ```text
-── quote review:2391 · untrusted · github · @bob (MEMBER) · 2026-09-11 · https://github.com/o/r/pull/1121#pullrequestreview-2391
+── quote review:2391 · untrusted · github · changes-requested · @bob (MEMBER) · 2026-09-11 · https://github.com/o/r/pull/1121#pullrequestreview-2391
 │ This double-charges when the worker retries. Reserve first, then settle.
 │ token: [REDACTED:github-token]
 │ coverage: complete          ← 본문이 흉내 낸 줄. │ 때문에 진짜 footer와 구별된다
@@ -397,6 +397,8 @@ sequenceDiagram
   coverage: complete · 3 of 3 lines
   freshness: code @a1b2c3d4 = HEAD (up to date) · github data as of 11-15 09:58Z (synced 12m ago, ok · full sync never)
 ```
+
+GitHub 항목은 머리말에 상태를 적는다: `open`, `open (draft)`, `approved`, `closed 2026-11-16`, `merged 2026-11-10`. 상태가 없으면 닫힌 이슈의 claim이 진행 중인 작업으로 읽힌다(개발 시험 B12).
 
 ### 6.6 링크
 
