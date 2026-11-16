@@ -12,6 +12,7 @@
 //   DB alone (attemptDisplay with actions 'unknown').
 import { spawn } from 'node:child_process';
 import { BrainError } from '../errors.mjs';
+import { gitEnv } from '../files.mjs';
 import {
   MEMORY_FRESH_MS, FOOTER_PHRASES, FRESHNESS_UNKNOWN, ageText, attemptDisplay, REFRESH_LIMITS,
 } from './contract.mjs';
@@ -73,14 +74,23 @@ export async function staleness({ reader, repoDir, actions = null, now = Date.no
 /**
  * The footer line (§6.5), e.g.
  * `brain data: run 42 @9f3c2e1a · 3 commits behind main · github as of 27h ago (stale) · last attempt FAILED 40m ago (sync)`.
- * `(freshness unknown)` appears once when code or memory is unknown, or when an Actions client was given and the Actions
- * API could not be read (activity and last are then the DB's view only, P13).
  * @param {import('./contract.mjs').Staleness} s @returns {string}
  */
 export function footerLine(s) {
   const P = FOOTER_PHRASES;
   const head = s.run !== null && s.run !== undefined ? `${P.prefix} run ${s.run}${s.code.runCommit ? ` @${s.code.runCommit.slice(0, 8)}` : ''}`
     : s.memory.state === 'unknown' ? P.prefix : `${P.prefix} ${P.noRun}`;
+  return [head, ...footerCells(s)].join(' · ');
+}
+
+/**
+ * The cells of the footer line after its `brain data: run N` head (an answer's footer puts its own run first).
+ * `(freshness unknown)` appears once when code or memory is unknown, or when an Actions client was given and the Actions
+ * API could not be read (activity and last are then the DB's view only, P13).
+ * @param {import('./contract.mjs').Staleness} s @returns {string[]}
+ */
+export function footerCells(s) {
+  const P = FOOTER_PHRASES;
   const parts = [];
   const add = (t) => { if (t && !(t === FRESHNESS_UNKNOWN && parts.includes(t))) parts.push(t); };
   add(s.code.state === 'behind' ? P.code.behind(s.code.behind) : P.code[s.code.state]);
@@ -92,7 +102,7 @@ export function footerLine(s) {
   if (l) add(l(ageText(s.last.agoMs ?? 0), s.last.stage ?? null));
   const gh = s.detail?.actions;
   if (gh && !gh.ok && !['no-token', 'no-binding'].includes(gh.error)) add(FRESHNESS_UNKNOWN);
-  return [head, ...parts].join(' · ');
+  return parts;
 }
 
 // ---- reads ---------------------------------------------------------------------------------------------------------
@@ -127,6 +137,7 @@ export function withDeadline(p, ms, onTimeout = () => {}) {
 /**
  * git with a child-process timeout. The child runs in its own process group (detached, so also without a controlling
  * terminal: no password prompt can hang it); on timeout the whole group gets SIGKILL, remote helpers included.
+ * git never sees a GitHub token or brain's settings (files.mjs gitEnv: no GH_*, GITHUB_*, BRAIN_* variable).
  * @returns {Promise<{ code: number|null, stdout: string, timedOut: boolean }>}
  */
 export function runGit(args, { cwd, timeoutMs, env = process.env }) {
@@ -134,7 +145,7 @@ export function runGit(args, { cwd, timeoutMs, env = process.env }) {
     if (!(timeoutMs > 0)) { resolve({ code: null, stdout: '', timedOut: true }); return; }
     let child;
     try {
-      child = spawn('git', args, { cwd, env: { ...env, GIT_TERMINAL_PROMPT: '0' }, stdio: ['ignore', 'pipe', 'ignore'], detached: true });
+      child = spawn('git', args, { cwd, env: { ...gitEnv(env), GIT_TERMINAL_PROMPT: '0' }, stdio: ['ignore', 'pipe', 'ignore'], detached: true });
     } catch { resolve({ code: null, stdout: '', timedOut: false }); return; }
     let out = '', timedOut = false, settled = false;
     const done = (code) => { if (!settled) { settled = true; clearTimeout(timer); resolve({ code, stdout: out, timedOut }); } };

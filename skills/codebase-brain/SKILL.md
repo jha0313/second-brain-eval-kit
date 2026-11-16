@@ -1,6 +1,6 @@
 ---
 name: codebase-brain
-description: Find every file that imports a module (directly or through N hops), every reference or call site of a symbol, and every file, test, page or route that may be affected by a change, across a whole TypeScript/JavaScript repo, from a compiler-built index instead of grep. Also answers "why is X built this way / what went wrong before / which PR changed it" with doc and commit citations, and, after `brain sync`, from GitHub PRs, reviews, review comments and issues ("what did reviewers say about X", "was this tried and rejected", "is anyone already working on these files"). Use it for "which files import X", "what is affected if I change X", "list every caller/use of X", "which tests cover X", "what do A and B share", and the same in Korean: "X를 import하는 파일 전부", "X를 바꾸면 어디가 영향받아?", "X를 부르는 곳 다 찾아줘", "X는 왜 이렇게 만들었어?", "전에 뭐가 깨졌어?", "이거 리뷰에서 뭐라고 했어?". Do not use it for a small task inside one file you already know ("이 파일 오타 고쳐줘"), or to find who uses a URL, SQL table or env var (grep the string).
+description: Find every file that imports a module (or N hops out), every reference or call site of a symbol, and every file, test, page or route that may be affected by a change, across a whole TypeScript/JavaScript repo, from a compiler-built index instead of grep. Also answers "why is X built this way / what went wrong before / which PR changed it" with doc and commit citations, and, after `brain sync`, from GitHub PRs, reviews, review comments and issues ("what did reviewers say about X", "was this tried and rejected", "is anyone already working on these files"), even if `gh` is offline. Use it for "which files import X", "what is affected if I change X", "list every caller/use of X", "which tests cover X", "what do A and B share", and the same in Korean: "X를 import하는 파일 전부", "X를 바꾸면 어디가 영향받아?", "X를 부르는 곳 다 찾아줘", "X는 왜 이렇게 만들었어?", "전에 뭐가 깨졌어?", "이거 리뷰에서 뭐라고 했어?". Do not use it for a small task inside one file you already know ("이 파일 오타 고쳐줘"), or to find who uses a URL, SQL table or env var (grep the string).
 ---
 
 # codebase-brain (prototype)
@@ -27,6 +27,11 @@ store and swaps it in only when it is complete. Token: `GH_TOKEN`, `GITHUB_TOKEN
 request is a GET under `api.github.com/repos/<owner>/<repo>/`. `--request-timeout S` (default 60), `--max-rate-wait S`
 (default 3600: a longer rate-limit wait fails the run instead of hanging). A failed run never moves the cursor;
 run it again.
+
+Team brain (server mode): with `BRAIN_READER_URL` set (in the environment, or in `.env.local` in this directory),
+`search`, `get` and `source` read the team's server, and the map commands read a local mirror of the same published
+run. CI is the only writer, so `build` and `sync` refuse (`--local` reads a local index instead). `brain status` shows
+the run, its commit and GitHub state, and how stale it is. `--as-of run:N` reads an earlier run.
 
 ## 1. Route by question
 
@@ -77,6 +82,11 @@ metadata, the thread and how each mention links to code (no bodies), `source` gi
    do not quote it as if it were the value.
 9. **A link is a claim to check.** `get` shows each mention as `linked`, `ambiguous`, `unlinked` or `pending`
    (with the reason). Open the linked code before you cite it, and say when a mention did not link.
+10. **A stale team brain: refresh, then answer.** If the `freshness: brain data:` line of an answer says `behind main`,
+    `differs from main`, `(stale)` or `never synced`, run `brain refresh` before you work from that answer.
+    Exit 75: run `brain refresh --wait` again. Exit 0: run the original command again and use the new answer.
+    Exit 1 or 2: tell the user that the data is stale and why (the line `refresh` printed), then answer.
+    A refresh stops by itself 15 minutes after its first call. `(freshness unknown)` alone is not a reason to refresh.
 
 ## 3. Output
 
@@ -91,7 +101,19 @@ Tables for people; add `--json` for exact lists. Every answer ends with two line
 (`truncated`: page with `--cursor N`; `partial`: the line says which part, e.g. refs not linked yet or a failed sync).
 `complete` is not "fresh": that is the `freshness:` line (`--json`: `freshness`). GitHub data is `stale` when its
 time (the cursor of the last complete sync) is more than 24 h old; a failed or interrupted last sync makes GitHub
-answers `partial`. Say so, or run `brain sync`.
+answers `partial`. Say so, or (local mode) run `brain sync`; in server mode, rule 10.
+
+In server mode the line starts with the run the answer read and how stale the team brain is (`--json`:
+`freshness.staleness`), then compares that run with your checkout:
+
+```text
+  freshness: brain data: run 42 @9f3c2e1a (published 3h ago) · 3 commits behind main · github as of 27h ago (stale) · last attempt FAILED 40m ago (sync) · code @9f3c2e1a · HEAD @4d5e6f70 · 3 commits behind
+```
+
+`= main` · `N commits behind main` · `differs from main` compare the newest run with `origin`'s `main`; `github as of
+<age> ago` turns `(stale)` after 24 h (`github never synced`: no GitHub data yet). `refresh running` and `last attempt
+FAILED` describe the publish job. `(freshness unknown)`: `origin` or the server could not be read in time. The
+`code @… · HEAD @…` part is your branch against the run, which no refresh changes. Rule 10 says what to do.
 
 ## 4. Limits (prototype)
 
