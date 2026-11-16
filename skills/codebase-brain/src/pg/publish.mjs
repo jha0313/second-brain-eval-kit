@@ -359,7 +359,7 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
     }
     if (committing) {                                              // R12: the COMMIT reply is lost (or COMMIT failed)
       kill(c);
-      const r = await resolveAttempt({ url, attemptId, onOutcome: (o) => { stage(o === 'ok' ? 'committed' : 'rolled-back').catch(() => {}); } });
+      const r = await resolveAttempt({ url, attemptId, onOutcome: (o) => stage(o === 'ok' ? 'committed' : 'rolled-back') });
       if (r.outcome === 'ok') return { run: r.run };
       if (r.outcome === 'rolled-back') {
         fail('publish-failed', 'commit', 'the COMMIT did not happen: nothing was written', { kind: 'rolled-back', recorded: await record('commit', 'rolled-back') });
@@ -402,8 +402,8 @@ export async function failAttempt({ url, attemptId, stage, error = null }) {
 /**
  * R12: after a lost COMMIT reply. New connection, the publish lock with lock_timeout 60s, then: a run row for the
  * attempt -> 'ok'; none -> 'rolled-back' (the caller then runs failAttempt). Lock not acquired, no connection or no answer
- * within the client deadline (75 s) -> 'unknown'. Never writes. onOutcome('ok'|'rolled-back') is called as soon as the
- * server has answered, before the lock is released and the connection closed.
+ * within the client deadline (75 s) -> 'unknown'. Never writes. onOutcome('ok'|'rolled-back') is awaited as soon as the
+ * server has answered, before the lock is released and the connection closed; its errors are ignored.
  * @param {{ url: string, attemptId: number, onOutcome?: (outcome: 'ok'|'rolled-back') => void }} opts
  * @returns {Promise<{ outcome: 'ok'|'rolled-back'|'unknown', run: number|null }>}
  */
@@ -416,7 +416,7 @@ export async function resolveAttempt({ url, attemptId, onOutcome = null }) {
     await c.query('SELECT pg_advisory_xact_lock($1)', [C.PUBLISH_LOCK_KEY]);
     const r = (await c.query('SELECT run_id FROM brain.run WHERE attempt_id = $1', [attemptId])).rows[0];
     const out = r ? { outcome: 'ok', run: Number(r.run_id) } : { outcome: 'rolled-back', run: null };
-    try { onOutcome?.(out.outcome); } catch { /* a hook cannot change the outcome */ }
+    try { await onOutcome?.(out.outcome); } catch { /* a hook cannot change the outcome */ }
     return out;
   } catch { return { outcome: 'unknown', run: null }; }               // 55P03 lock_not_available, a timeout, a dead socket
   finally {

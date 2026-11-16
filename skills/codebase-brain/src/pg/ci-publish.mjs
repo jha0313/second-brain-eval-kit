@@ -147,7 +147,11 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
       if (phase === 'committed') say(`ci-publish: ${run ? `run ${run}` : 'this run'} is committed, but verify did not finish: the next refresh checks the server`);
       else if (attemptId !== null) {
         const r = await Promise.race([
-          failAttempt({ url, attemptId, stage: current, error: C.ciError(current, 'signal') }).then((x) => (x.updated ? 'recorded' : 'the attempt was no longer running'), () => 'not recorded'),
+          failAttempt({ url, attemptId, stage: current, error: C.ciError(current, 'signal') }).then((x) => {
+            if (!x.updated) return 'the attempt was no longer running';
+            phase = 'writing';                                         // running until now: no COMMIT took effect
+            return 'recorded';
+          }, () => 'not recorded'),
           sleep(C.CI_SIGNAL_CLEANUP_MS).then(() => 'not recorded in time')]);
         say(`ci-publish: failure ${r}`);
       }
