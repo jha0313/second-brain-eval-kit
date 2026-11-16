@@ -247,7 +247,7 @@ export function worldActions(world, { fail = null } = {}) {
 // ---- GitHub stub HTTP server ---------------------------------------------------------------------------------------
 
 /**
- * faults: { [route]: mode } with route 'dispatch' | 'runs' | 'run' | 'jobs' | '*' and mode
+ * faults: { [route]: mode } with route 'dispatch' | 'runs' | 'runs-status' (runs?status=…) | 'run' | 'jobs' | '*' and mode
  *   'drop'        dispatch: create the run, then destroy the socket without a reply; GET: destroy without a reply
  *   'drop-before' destroy the socket and do nothing
  *   'hang'        never reply
@@ -265,7 +265,7 @@ export async function githubStub(world, { token = FAKE_TOKEN } = {}) {
       const h = req.headers.authorization;
       const auth = h === `Bearer ${token}` ? 'dispatch-token' : h === `Bearer ${OTHER_TOKEN}` ? 'other-token' : h ? 'unknown' : 'none';
       stub.log.push({ method: req.method, path: url.pathname, query: url.search, auth, body: body || null });
-      const route = routeOf(req.method, url.pathname);
+      const route = routeOf(req.method, url.pathname, url.searchParams);
       const fault = stub.faults[route] ?? stub.faults['*'];
       const send = (status, json) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(json === undefined ? '' : JSON.stringify(json)); };
       if (fault === 'hang') { stub.hung.push(res); return; }
@@ -296,21 +296,25 @@ export async function githubStub(world, { token = FAKE_TOKEN } = {}) {
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   stub.url = `http://127.0.0.1:${server.address().port}`;
-  stub.count = (route) => stub.log.filter((l) => routeOf(l.method, l.path) === route).length;
+  stub.count = (route) => stub.log.filter((l) => routeOf(l.method, l.path, new URLSearchParams(l.query)) === route).length;
   stub.close = () => new Promise((r) => { for (const h of stub.hung) h.destroy?.(); server.closeAllConnections(); server.close(r); });
   return stub;
 }
 
-function routeOf(method, path) {
+function routeOf(method, path, query) {
   if (method === 'POST') return 'dispatch';
-  if (path.endsWith('/runs')) return 'runs';
+  if (path.endsWith('/runs')) return query?.has('status') ? 'runs-status' : 'runs';
   if (path.endsWith('/jobs')) return 'jobs';
   return 'run';
 }
 
-/** A fake clock: sleep advances time and lets the world move. */
+/**
+ * A fake clock: sleep advances time and lets the world move. Real elapsed time is added too, so the time spent in HTTP,
+ * git and the reader counts against a call's budget like it would on a laptop.
+ */
 export function fakeClock(start = Date.parse('2026-11-16T09:00:00Z')) {
-  const c = { t: start, slept: 0, now: () => c.t, sleep: async (ms) => { c.t += ms; c.slept += ms; }, advance: (ms) => { c.t += ms; } };
+  const r0 = Date.now();
+  const c = { t: start, slept: 0, now: () => c.t + (Date.now() - r0), sleep: async (ms) => { c.t += ms; c.slept += ms; }, advance: (ms) => { c.t += ms; } };
   return c;
 }
 

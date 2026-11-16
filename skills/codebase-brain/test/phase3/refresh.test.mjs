@@ -22,7 +22,6 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = join(here, '..', '..', 'src');
-const noServer = MSG.noServer ?? MSG.noGithub;
 
 /**
  * A stale brain (main 1 commit ahead of the latest run unless fresh), a GitHub stub, a client, a reader and a state
@@ -72,7 +71,7 @@ describe('F1 / F4 / F7: the plain paths', () => {
     const rs = await until(x);
     assert.equal(rs.at(-1).exit, EXIT.fresh);
     assert.equal(rs.at(-1).message, MSG.refreshed(2));
-    assert.ok(rs.slice(0, -1).every((r) => r.exit === EXIT.running && /^still running \(run \d+, \d+[smh](, stage: .+)?\)$/.test(r.message)), JSON.stringify(rs));
+    assert.ok(rs.slice(0, -1).every((r) => r.exit === EXIT.running && /^still running \(actions run \d+, \d+[smh](, stage: .+)?\)$/.test(r.message)), JSON.stringify(rs));
     const posts = x.gh.log.filter((l) => l.method === 'POST');
     assert.equal(posts.length, 1);
     assert.equal(posts[0].path, '/repos/acme/brain-ops/actions/workflows/brain-publish.yml/dispatches');
@@ -97,6 +96,43 @@ describe('F1 / F4 / F7: the plain paths', () => {
     const st2 = loadState(x.statePath);
     assert.deepEqual([st2.startedAt, st2.deadline], [st.startedAt, st.deadline]);
   });
+  test('F1 needs code same AND memory fresh: an unreadable T is not fresh (exit 2)', async (t) => {
+    const x = await rig(t, { fresh: true });
+    x.world.db.sync.at(-1).t = 'not a time';
+    assert.deepEqual(await x.call(), { exit: EXIT.unavailable, message: MSG.noServer, runId: null });
+    assert.equal(x.gh.count('dispatch'), 0);
+  });
+  test('F8: the deadline counts from the call, not from after a slow first look', async (t) => {
+    const x = await rig(t);
+    const inner = x.reader.query.bind(x.reader);
+    let first = true;
+    x.reader.query = async (sql, p) => { if (first) { first = false; x.clock.advance(60_000); } return inner(sql, p); };
+    const t0 = x.clock.now();
+    await x.call();
+    const st = loadState(x.statePath);
+    assert.ok(Math.abs(Date.parse(st.startedAt) - t0) < 1000, 'startedAt = call start');
+    assert.equal(Date.parse(st.deadline) - Date.parse(st.startedAt), LIM.deadlineMs);
+  });
+  test('a publish between a look\'s DB read and its Actions read is confirmed by a second look, not reported as a failure', async (t) => {
+    const x = await rig(t, { world: { runMs: 5 * M } });
+    assert.equal((await x.call({ env: { ...process.env, BRAIN_REFRESH_CALL_S: '20' } })).exit, EXIT.running);
+    const inner = x.reader.query.bind(x.reader);
+    let jump = true;
+    // after the DB snapshot of the first look, the run's remaining events become due: it publishes before the Actions read
+    x.reader.query = async (sql, p) => {
+      const r = await inner(sql, p);
+      if (jump) {
+        jump = false;
+        const run = x.world.gh.runs.at(-1), now = x.clock.now();
+        if (run.phase === 'queued') run.startAt = now - 10 * M;
+        if (run.phase === 'starting') run.recordAt = now - 9 * M;
+        if (run.phase === 'running') run.finishAt = now - M;
+      }
+      return r;
+    };
+    const r = await x.call();
+    assert.deepEqual([r.exit, r.message], [EXIT.fresh, MSG.refreshed(2)]);
+  });
   test('a run already in flight: no dispatch, wait for it (F1)', async (t) => {
     const x = await rig(t);
     x.world.dispatch();   // someone else's
@@ -112,7 +148,7 @@ describe('F1 / F4 / F7: the plain paths', () => {
 });
 
 describe('P11: split waits and the fixed deadline', () => {
-  test('every call <= 80 s including API calls; 75 -> --wait -> 0', async (t) => {
+  test('every call <= 80 s (the fake clock also counts real HTTP / git / reader time); 75 -> --wait -> 0', async (t) => {
     const x = await rig(t, { world: { runMs: 6 * M } });
     const rs = await until(x);
     assert.ok(rs.length >= 4, `several calls: ${exits(rs)}`);
@@ -125,8 +161,8 @@ describe('P11: split waits and the fixed deadline', () => {
     const t0 = x.clock.now();
     const rs = await until(x);
     assert.deepEqual([rs.at(-1).exit, rs.at(-1).message], [EXIT.failed, MSG.deadline]);
-    assert.ok(x.clock.now() - t0 <= LIM.deadlineMs, `ended after ${x.clock.now() - t0} ms`);
-    assert.ok(x.clock.now() - t0 >= LIM.deadlineMs - 10_000);
+    assert.ok(x.clock.now() - t0 >= LIM.deadlineMs, `ended after ${x.clock.now() - t0} ms`);
+    assert.ok(x.clock.now() - t0 <= LIM.deadlineMs + 5000, 'the last look is at the deadline, not later');
     assert.equal(existsSync(x.statePath), false);
     assert.equal(x.gh.count('dispatch'), 1);
     // the next call is a new refresh: it waits for the run still in flight and does not dispatch
@@ -186,7 +222,8 @@ describe('P6 / P8 / P9: concurrency, pending replacement, main moving', () => {
     const holder = await holdLock(t, x.statePath, { runId: 777 });
     const r = await x.call();
     assert.equal(r.exit, EXIT.running);
-    assert.match(r.message, /^still running \(run 777, \d+s\)$/);
+    assert.equal(r.message, MSG.running(777, r.message.match(/, (\d+s)\)$/)[1], null));
+    assert.match(r.message, /^still running \(actions run 777, \d+s\)$/);
     assert.equal(x.gh.count('dispatch'), 0);
     holder.kill('SIGKILL');
   });
@@ -335,6 +372,13 @@ describe('P13 / P16: no GitHub, no token, other tokens', () => {
       assert.ok(x.gh.log.every((l) => l.auth === 'dispatch-token'), 'only BRAIN_DISPATCH_TOKEN is sent');
     });
   }
+  test('F9: BRAIN_DISPATCH_TOKEN gone in a later call -> exit 2, state removed', async (t) => {
+    const x = await rig(t);
+    const r1 = await x.call();
+    assert.equal(r1.exit, EXIT.running);
+    assert.deepEqual(await x.call({ actions: null }), { exit: EXIT.unavailable, message: MSG.noPermission, runId: r1.runId });
+    assert.equal(existsSync(x.statePath), false);
+  });
   test('P16: the token stops working while we wait -> exit 2, state removed', async (t) => {
     const x = await rig(t);
     assert.equal((await x.call()).exit, EXIT.running);
@@ -393,7 +437,7 @@ describe('P25: stalled work ends inside the budget, leaving no process or socket
     await settle();
     assert.equal(sockets(), 0, process.getActiveResourcesInfo().join(','));
   });
-  test('GitHub stops answering while we wait: exit 75 inside the budget', async (t) => {
+  test('GitHub stops answering while we wait: the call ends inside the budget with exit 2 (could not read it at all)', async (t) => {
     const x = await rig(t, { clock: { now: Date.now }, world: { queueMs: 1e9 } });
     const r1 = await x.call({ env: budget });
     assert.equal(r1.exit, EXIT.running);
@@ -401,9 +445,21 @@ describe('P25: stalled work ends inside the budget, leaving no process or socket
     const t0 = Date.now();
     const r2 = await x.call({ env: budget });
     assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0}`);
-    assert.equal(r2.exit, EXIT.running);
+    assert.deepEqual([r2.exit, r2.message], [EXIT.unavailable, MSG.noGithub]);
+    assert.equal(existsSync(x.statePath), false);
     await settle();
     assert.equal(sockets(), 0);
+  });
+  test('one Actions list fails at once while the other hangs: the hanging one is cancelled, nothing stays open', async (t) => {
+    const x = await rig(t, { clock: { now: Date.now } });
+    x.gh.faults.runs = 'hang';
+    x.gh.faults['runs-status'] = 403;
+    const t0 = Date.now();
+    const r = await x.call({ env: { ...process.env, BRAIN_REFRESH_CALL_S: '20' } });
+    assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0}`);
+    assert.deepEqual([r.exit, r.message], [EXIT.unavailable, MSG.noPermission]);
+    await settle();
+    assert.equal(sockets(), 0, process.getActiveResourcesInfo().join(','));
   });
   test('the reader hangs: new -> exit 2 (server not reachable), continuing -> 75; the socket is destroyed', async (t) => {
     const x = await rig(t, { clock: { now: Date.now }, world: { queueMs: 1e9 } });
@@ -411,7 +467,7 @@ describe('P25: stalled work ends inside the budget, leaving no process or socket
     let t0 = Date.now();
     const r1 = await x.call({ env: budget });
     assert.ok(Date.now() - t0 < 3000);
-    assert.deepEqual([r1.exit, r1.message], [EXIT.unavailable, noServer]);
+    assert.deepEqual([r1.exit, r1.message], [EXIT.unavailable, MSG.noServer]);
     assert.ok(x.reader.destroyed >= 1 && x.reader.ended >= 1);
     x.reader.mode = 'ok';
     assert.equal((await x.call({ env: budget })).exit, EXIT.running);
@@ -449,17 +505,21 @@ describe('P25: stalled work ends inside the budget, leaving no process or socket
     assert.equal(srv.sockets.size, 0, 'the server saw the connection close');
     assert.equal(sockets(), 0);
   });
-  test('BRAIN_P3_SLOW: the real 80 s budget against a hanging GitHub and reader', { skip: process.env.BRAIN_P3_SLOW === '1' ? false : 'set BRAIN_P3_SLOW=1', timeout: 200_000 }, async (t) => {
-    const x = await rig(t, { clock: { now: Date.now }, world: { queueMs: 1e9 } });
-    assert.equal((await x.call({ env: budget })).exit, EXIT.running);
-    x.gh.faults['*'] = 'hang';
-    x.reader.mode = 'hang';
-    const t0 = Date.now();
-    const r = await x.call({ env: process.env, pollMs: 10_000 });
-    const took = Date.now() - t0;
-    assert.equal(r.exit, EXIT.running);
-    assert.ok(took <= 90_000 && took >= 70_000, `took ${took}`);
-  });
+  for (const [name, hang, want] of [['the reader and GitHub', ['db', 'gh'], EXIT.running], ['GitHub only (Actions GETs, 20 s cap)', ['gh'], EXIT.unavailable]]) {
+    test(`BRAIN_P3_SLOW: the real 80 s budget, continuing refresh, ${name} hanging`, { skip: process.env.BRAIN_P3_SLOW === '1' ? false : 'set BRAIN_P3_SLOW=1', timeout: 200_000 }, async (t) => {
+      const x = await rig(t, { clock: { now: Date.now }, world: { queueMs: 1e9 } });
+      assert.equal((await x.call({ env: budget })).exit, EXIT.running);
+      if (hang.includes('gh')) x.gh.faults['*'] = 'hang';
+      if (hang.includes('db')) x.reader.mode = 'hang';
+      const t0 = Date.now();
+      const r = await x.call({ env: process.env, pollMs: 10_000 });
+      const took = Date.now() - t0;
+      assert.equal(r.exit, want);
+      assert.ok(took <= 90_000 && took >= 60_000, `took ${took}`);
+      await settle();
+      assert.equal(sockets(), 0);
+    });
+  }
 });
 
 // ---- Neon (only with BRAIN_P3_READER_URL): F8 against a real server under brain_reader ------------------------------

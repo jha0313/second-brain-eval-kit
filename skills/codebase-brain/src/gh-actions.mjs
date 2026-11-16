@@ -9,8 +9,9 @@
 //   {ops} and {file} come from brain.binding (ops_repo, workflow; a path keeps its file name).
 // - The token is BRAIN_DISPATCH_TOKEN and nothing else: never `gh auth token`, GH_TOKEN or GITHUB_TOKEN (F9, P16).
 //   This file starts no child process.
-// - Every call gets AbortSignal.timeout(min(left, 20 s)) (F8). No retries here: refresh polls again within its budget,
-//   and a dispatch whose reply is lost is never re-sent by the client (F5).
+// - Every call gets AbortSignal.timeout(min(left, 20 s)) (F8), plus the caller's `signal` when given (a sibling request
+//   failed: stop this one too). No retries here: refresh polls again within its budget, and a dispatch whose reply is
+//   lost is never re-sent by the client (F5).
 // - One socket per request (agent: false), closed with the response, so nothing stays open after a call (P25).
 // - Errors are GhError with a fixed message: endpoint label, HTTP status or failure kind. No URL, header or token.
 //   kinds: auth (401) · forbidden (403) · not-found (404) · rejected (422) · rate-limit · server (5xx) ·
@@ -30,11 +31,12 @@ const FILE_RE = /^[A-Za-z0-9._-]+\.ya?ml$/;
  * @typedef {{ id: number, runAttempt: number, status: string, conclusion: string|null, createdAt: string,
  *   runStartedAt: string|null }} ActionsRun
  * @typedef {{
- *   dispatch(b: Binding, o: { left: number }): Promise<{ runId: number|null }>,
- *   runs(b: Binding, o: { status?: string, perPage?: number, left: number }): Promise<ActionsRun[]>,
- *   run(b: Binding, id: number, o: { left: number }): Promise<ActionsRun>,
- *   jobs(b: Binding, id: number, attempt: number, o: { left: number }): Promise<{ status: string, steps: { name: string, status: string }[] }[]>
+ *   dispatch(b: Binding, o: CallOpts): Promise<{ runId: number|null }>,
+ *   runs(b: Binding, o: CallOpts & { status?: string, perPage?: number }): Promise<ActionsRun[]>,
+ *   run(b: Binding, id: number, o: CallOpts): Promise<ActionsRun>,
+ *   jobs(b: Binding, id: number, attempt: number, o: CallOpts): Promise<{ status: string, steps: { name: string, status: string }[] }[]>
  * }} ActionsClient
+ * @typedef {{ left: number, signal?: AbortSignal }} CallOpts  left: ms this call may take at most (capped at 20 s)
  */
 
 /** The client for BRAIN_DISPATCH_TOKEN, or null when it is not set. Reads no other variable. */
@@ -56,17 +58,19 @@ export function createActionsClient({ token, api = API }) {
   const headers = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'codebase-brain',
     Authorization: `Bearer ${token}` };
 
-  async function call(label, method, path, { left, body = null }) {
+  async function call(label, method, path, { left, signal: outer = null, body = null }) {
     const ms = Math.min(left, REFRESH_LIMITS.httpMaxMs);
     if (!(ms > 0)) throw new GhError('timeout', `${label}: out of time`);
-    const signal = AbortSignal.timeout(ms);
+    if (outer?.aborted) throw new GhError('network', `${label}: cancelled`);
+    const timeout = AbortSignal.timeout(ms);
+    const signal = outer ? AbortSignal.any([timeout, outer]) : timeout;
     let res;
     try {
       res = await request(new URL(base.pathname.replace(/\/$/, '') + path, base), {
         method, signal, body: body === null ? null : JSON.stringify(body),
         headers: body === null ? headers : { ...headers, 'Content-Type': 'application/json' } });
     } catch {
-      throw signal.aborted ? new GhError('timeout', `${label}: timed out`) : new GhError('network', `${label}: no reply`);
+      throw timeout.aborted ? new GhError('timeout', `${label}: timed out`) : new GhError('network', `${label}: ${outer?.aborted ? 'cancelled' : 'no reply'}`);
     }
     const { status } = res;
     if (status === 401) throw new GhError('auth', `${label}: HTTP 401`, { status });
@@ -83,22 +87,22 @@ export function createActionsClient({ token, api = API }) {
   }
 
   return {
-    async dispatch(b, { left }) {
-      const body = await call('dispatch', 'POST', `${workflowPath(b)}/dispatches`, { left, body: { ref: 'main', return_run_details: true } });
+    async dispatch(b, { left, signal }) {
+      const body = await call('dispatch', 'POST', `${workflowPath(b)}/dispatches`, { left, signal, body: { ref: 'main', return_run_details: true } });
       const id = body?.workflow_run_id;
       return { runId: Number.isSafeInteger(id) && id > 0 ? id : null };
     },
-    async runs(b, { status, perPage = 20, left }) {
+    async runs(b, { status, perPage = 20, left, signal }) {
       const q = new URLSearchParams({ per_page: String(perPage), ...(status ? { status } : {}) });
-      const body = await call('runs', 'GET', `${workflowPath(b)}/runs?${q}`, { left });
+      const body = await call('runs', 'GET', `${workflowPath(b)}/runs?${q}`, { left, signal });
       if (!Array.isArray(body?.workflow_runs)) throw new GhError('protocol', 'runs: unexpected body');
       return body.workflow_runs.map(shapeRun);
     },
-    async run(b, id, { left }) {
-      return shapeRun(await call('run', 'GET', `${repoPath(b)}/actions/runs/${runNumber(id)}`, { left }));
+    async run(b, id, { left, signal }) {
+      return shapeRun(await call('run', 'GET', `${repoPath(b)}/actions/runs/${runNumber(id)}`, { left, signal }));
     },
-    async jobs(b, id, attempt, { left }) {
-      const body = await call('jobs', 'GET', `${repoPath(b)}/actions/runs/${runNumber(id)}/attempts/${runNumber(attempt)}/jobs?per_page=10`, { left });
+    async jobs(b, id, attempt, { left, signal }) {
+      const body = await call('jobs', 'GET', `${repoPath(b)}/actions/runs/${runNumber(id)}/attempts/${runNumber(attempt)}/jobs?per_page=10`, { left, signal });
       if (!Array.isArray(body?.jobs)) throw new GhError('protocol', 'jobs: unexpected body');
       return body.jobs.map((j) => ({ status: String(j.status), steps: Array.isArray(j.steps) ? j.steps.map((s) => ({ name: String(s.name), status: String(s.status) })) : [] }));
     },

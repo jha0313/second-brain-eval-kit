@@ -80,7 +80,7 @@ export async function staleness({ reader, repoDir, actions = null, now = Date.no
 export function footerLine(s) {
   const P = FOOTER_PHRASES;
   const head = s.run !== null && s.run !== undefined ? `${P.prefix} run ${s.run}${s.code.runCommit ? ` @${s.code.runCommit.slice(0, 8)}` : ''}`
-    : s.memory.state === 'unknown' ? P.prefix : `${P.prefix} ${P.noRun ?? 'no published run'}`;
+    : s.memory.state === 'unknown' ? P.prefix : `${P.prefix} ${P.noRun}`;
   const parts = [];
   const add = (t) => { if (t && !(t === FRESHNESS_UNKNOWN && parts.includes(t))) parts.push(t); };
   add(s.code.state === 'behind' ? P.code.behind(s.code.behind) : P.code[s.code.state]);
@@ -159,10 +159,15 @@ async function lsRemoteMain(repoDir, left, env) {
 
 async function readActions(actions, binding, attempts, left) {
   try {
-    const [recent, inProgress] = await Promise.all([
-      actions.runs(binding, { perPage: RECENT_RUNS, left: left() }),
-      actions.runs(binding, { status: 'in_progress', perPage: 10, left: left() }),
-    ]);
+    // both GETs settle before we return: when one fails, the other is cancelled, so no socket outlives this call
+    const ac = new AbortController();
+    let first = null;   // the real failure, not the cancellation it caused
+    const both = [actions.runs(binding, { perPage: RECENT_RUNS, left: left(), signal: ac.signal }),
+      actions.runs(binding, { status: 'in_progress', perPage: 10, left: left(), signal: ac.signal })]
+      .map((p) => p.catch((e) => { first ??= e; ac.abort(); throw e; }));
+    const settled = await Promise.allSettled(both);
+    if (first) throw first;
+    const [recent, inProgress] = settled.map((x) => x.value);
     const runs = [...recent];
     for (const r of inProgress) if (!runs.some((x) => x.id === r.id)) runs.push(r);
     // a running DB attempt whose run is older than the recent list: look it up (bounded)

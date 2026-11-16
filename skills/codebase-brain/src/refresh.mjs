@@ -25,7 +25,7 @@ import {
 const POLL_MS = 10_000;
 const LOOK_RESERVE_MS = 5_000;   // time kept for the last look of a call
 const NO_PERMISSION = new Set(['auth', 'forbidden', 'not-found']);
-const noServer = MSG.noServer ?? MSG.noGithub;   // contract request pending: REFRESH_MESSAGES.noServer
+const NOT_TRIED = new Set(['no-token', 'no-binding']);   // status.mjs: Actions not read at all
 const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -36,12 +36,12 @@ const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  *   it changes nothing here. env: BRAIN_REFRESH_CALL_S (may only shorten the 80 s call) and the env of git.
  *   sleep / pollMs: test seams.
  * @returns {Promise<{ exit: 0|1|2|75, message: string, runId: number|null }>}
- *   runId: the brain run on exit 0, otherwise the Actions run being waited for (null when unknown)
+ *   runId: the brain run on exit 0, otherwise the Actions run being waited for (null when unknown), as in the messages
  */
 export async function refresh({ wait: _wait = false, now = Date.now, statePath, reader, actions, repoDir, env = process.env,
   sleep = realSleep, pollMs = POLL_MS }) {
-  const callEnd = now() + callBudget(env);
-  const o = { now, statePath, reader, actions, repoDir, env, sleep, pollMs, callEnd };
+  const callStart = now();
+  const o = { now, statePath, reader, actions, repoDir, env, sleep, pollMs, callStart, callEnd: callStart + callBudget(env) };
   mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
   try {
     return (await withWriteLock(statePath, () => locked(o))).value;
@@ -61,15 +61,20 @@ function callBudget(env) {
 async function locked(o) {
   let st = loadState(o.statePath);
   if (st && o.now() >= Date.parse(st.deadline)) return finish(o, EXIT.failed, MSG.deadline, null);
-  const end = () => Math.min(o.callEnd, st ? Date.parse(st.deadline) : Infinity);
+  // a look may end up to LOOK_RESERVE_MS past the deadline, so the last look of a refresh happens at the deadline itself
+  const end = () => Math.min(o.callEnd, st ? Date.parse(st.deadline) + LOOK_RESERVE_MS : Infinity);
   let s = await look(o, st, end());
-  let dispatchedNow = false;
+  let dispatchedNow = false, confirming = false;
+  const gh = { tried: false, ok: false };   // Actions reads in this call (not tried when the DB read failed first)
+  const seen = (x) => { gh.ok ||= x.detail.actions.ok; gh.tried ||= x.detail.actions.ok || !NOT_TRIED.has(x.detail.actions.error); };
+  seen(s);
 
   if (!st) {
     // a new refresh (F1, F3, F9)
-    if (!s.detail.db.ok) return finish(o, EXIT.unavailable, noServer, null);
+    if (!s.detail.db.ok) return finish(o, EXIT.unavailable, MSG.noServer, null);
     if (s.code.state === 'unknown') return finish(o, EXIT.unavailable, MSG.noGithub, null);
-    if (!needsRefresh(s)) return finish(o, EXIT.fresh, MSG.fresh, s.run);
+    if (s.code.state === 'same' && s.memory.state === 'fresh') return finish(o, EXIT.fresh, MSG.fresh, s.run);
+    if (!needsRefresh(s)) return finish(o, EXIT.unavailable, MSG.noServer, null);   // code same, T unreadable
     if (!o.actions) return finish(o, EXIT.unavailable, MSG.noPermission, null);
     if (!s.detail.binding) return finish(o, EXIT.failed, MSG.failed('the brain server has no binding yet'), null);
     if (!s.detail.actions.ok) return finish(o, EXIT.unavailable, NO_PERMISSION.has(s.detail.actions.error) ? MSG.noPermission : MSG.noGithub, null);
@@ -78,8 +83,7 @@ async function locked(o) {
       const cd = cooldown(s);
       if (cd) return finish(o, EXIT.failed, MSG.cooldown(ageText(cd.agoMs), cd.stage), null);
     }
-    const t0 = o.now();
-    st = { v: REFRESH_STATE_VERSION, startedAt: iso(t0), deadline: iso(t0 + LIM.deadlineMs), baseT: s.detail.githubT,
+    st = { v: REFRESH_STATE_VERSION, startedAt: iso(o.callStart), deadline: iso(o.callStart + LIM.deadlineMs), baseT: s.detail.githubT,
       baseHead: s.code.mainHead, runId: inFlight ? s.activity.runId : null, dispatchedAt: null, extraDispatches: 0 };
     saveState(o.statePath, st);
     if (!inFlight) {
@@ -87,6 +91,8 @@ async function locked(o) {
       if (r) return r;
       dispatchedNow = true;
     }
+  } else if (!o.actions) {
+    return finish(o, EXIT.unavailable, MSG.noPermission, st.runId);   // BRAIN_DISPATCH_TOKEN gone (F9)
   }
 
   for (;;) {
@@ -97,36 +103,48 @@ async function locked(o) {
       st.runId = s.activity.runId;
       saveState(o.statePath, st);
     }
+    const past = o.now() >= Date.parse(st.deadline);
     if (s.detail.db.ok && s.code.state !== 'unknown' && !inFlightNow(s, st)) {
-      // nothing will change by itself: a failure, main moved, or a lost dispatch
-      const advanced = tAdvanced(s, st);
-      if (advanced && s.memory.state === 'fresh') {
-        // (2) and (3) hold, (1) does not: main moved after the run's checkout (F7, P9)
-        if (st.extraDispatches >= LIM.extraDispatchMax) return finish(o, EXIT.failed, MSG.mainMoved, st.runId);
-        st.extraDispatches += 1;
-        const r = await dispatch(o, s, st);
-        if (r) return r;
-        dispatchedNow = true;
-      } else if (st.runId !== null) {
-        const f = failureSince(s, st);
-        if (f) return finish(o, EXIT.failed, MSG.failed(f), st.runId);
-        return finish(o, EXIT.failed, MSG.failed('the run ended without publishing'), st.runId);
-      } else if (st.dispatchedAt !== null && !dispatchedNow && st.extraDispatches < LIM.extraDispatchMax) {
-        // F5: the earlier reply was lost and no run is in flight: send once more (never in the call that lost it)
-        st.extraDispatches += 1;
-        const r = await dispatch(o, s, st);
-        if (r) return r;
-        dispatchedNow = true;
+      // nothing will change by itself. A run can finish between a look's DB read and its Actions read, so act only on
+      // a second look (its DB read comes after the first look's Actions read); with no time left for it, the next call does
+      if (!confirming) {
+        if (end() - o.now() > LOOK_RESERVE_MS) {
+          confirming = true;
+          s = await look(o, st, end());
+          seen(s);
+          continue;
+        }
+      } else {
+        confirming = false;
+        if (tAdvanced(s, st) && s.memory.state === 'fresh') {
+          // (2) and (3) hold, (1) does not: main moved after the run's checkout (F7, P9)
+          if (past || st.extraDispatches >= LIM.extraDispatchMax) return finish(o, EXIT.failed, MSG.mainMoved, st.runId);
+          st.extraDispatches += 1;
+          const r = await dispatch(o, s, st);
+          if (r) return r;
+          dispatchedNow = true;
+        } else if (st.runId !== null) {
+          return finish(o, EXIT.failed, MSG.failed(failureSince(s, st) ?? 'the run ended without publishing'), st.runId);
+        } else if (!past && st.dispatchedAt !== null && !dispatchedNow && st.extraDispatches < LIM.extraDispatchMax) {
+          // F5: the earlier reply was lost and no run is in flight: send once more (never in the call that lost it)
+          st.extraDispatches += 1;
+          const r = await dispatch(o, s, st);
+          if (r) return r;
+          dispatchedNow = true;
+        }
       }
+    } else {
+      confirming = false;
     }
-    if (o.now() >= Date.parse(st.deadline) - LOOK_RESERVE_MS) {
-      return finish(o, EXIT.failed, tAdvanced(s, st) && s.code.state !== 'same' ? MSG.mainMoved : MSG.deadline, st.runId);
-    }
+    if (past) return finish(o, EXIT.failed, tAdvanced(s, st) && s.code.state !== 'same' ? MSG.mainMoved : MSG.deadline, st.runId);
     const left = end() - o.now();
     if (left <= LOOK_RESERVE_MS) break;
     await o.sleep(Math.min(o.pollMs, left - LOOK_RESERVE_MS));
     s = await look(o, st, end());
+    seen(s);
   }
+  // the Actions API failed on every read of this call: not "still running" but "cannot tell" (F9, P13)
+  if (gh.tried && !gh.ok) return finish(o, EXIT.unavailable, MSG.noGithub, st.runId);
   return { exit: EXIT.running, message: MSG.running(st.runId, ageText(o.now() - Date.parse(st.startedAt)), s.activity.stage ?? null), runId: st.runId };
 }
 
