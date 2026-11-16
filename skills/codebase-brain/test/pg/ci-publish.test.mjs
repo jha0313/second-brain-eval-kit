@@ -41,7 +41,8 @@ test('usage errors exit 2 before anything starts: a flag without its value, a mi
   const env = { PATH: process.env.PATH, HOME: process.env.HOME };
   for (const [argv, out] of [[['--source', '.', '--mirror', 'm', '--mode'], /ci-publish: usage: ERR_PARSE_ARGS_INVALID_OPTION_VALUE/],
     [['--source', '.', '--mirror', 'm', '--bogus'], /ci-publish: usage: ERR_PARSE_ARGS_UNKNOWN_OPTION/],
-    [['--source', '.', '--mirror', 'm'], /ci-publish: usage: missing or bad BRAIN_WRITER_URL/]]) {
+    [['--source', '.', '--mirror', 'm'], /ci-publish: usage: missing or bad BRAIN_WRITER_URL/],
+    [['--source', '.', '--mirror', 'm', '--mode', 'bootstrap'], /BRAIN_PUBLISH_WORKFLOW \(bootstrap mode\)/]]) {
     const r = spawnSync(process.execPath, [DRIVER, ...argv], { env, encoding: 'utf8' });
     assert.equal(r.status, 2, `${argv.join(' ')}: ${r.stdout}${r.stderr}`);
     assert.match(r.stdout, out);
@@ -73,22 +74,24 @@ exec '${realGit}' "$@"
   chmodSync(join(spy, 'bin', 'git'), 0o755);
 
   const cache = join(mkdtempSync(join(tmpdir(), 'brain-q7-cache-')), 'mirror');   // the Actions cache: kept between runs
-  const drive = (extra = {}, { work: workDir } = {}) => {
+  const drive = (extra = {}, { work: workDir, args = [] } = {}) => {
     run += 1;
     const env = { PATH: `${spy}/bin:${process.env.PATH}`, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR ?? '/tmp', NO_COLOR: '1',
       BRAIN_WRITER_URL: branch.writerUrl, BRAIN_SOURCE_REPO: `${OWNER}/${REPO}`, BRAIN_SOURCE_TOKEN: ['test', 'source', 'token'].join('-'),
       GITHUB_TOKEN: ['test', 'actions', 'token'].join('-'), GHA_RUN_ID: String(run), GHA_RUN_ATTEMPT: '1', GITHUB_REPOSITORY: 'o/brain-ops',
       GITHUB_WORKFLOW_REF: 'o/brain-ops/.github/workflows/brain-publish.yml@refs/heads/main', BRAIN_REPLAY_DIR: replay, BRAIN_TEST_REPO_ID: '4242', ...extra };
     const work = mkdtempSync(join(tmpdir(), 'brain-q7-'));
-    const r = spawnSync(process.execPath, ['--no-warnings', `--import=${STUB}`, DRIVER, '--source', fx.repo, '--mirror', cache, '--work', workDir ?? join(work, 'w')],
+    const r = spawnSync(process.execPath, ['--no-warnings', `--import=${STUB}`, DRIVER, '--source', fx.repo, '--mirror', cache, '--work', workDir ?? join(work, 'w'), ...args],
       { env, encoding: 'utf8', timeout: 240_000 });
     const out = `${r.stdout}${r.stderr}`;
     assert.ok(!out.includes(branch.writerUrl) && !out.includes(new URL(branch.writerUrl).password), 'the writer URL is never printed');
     return { status: r.status, out };
   };
 
-  // 1. sync fails (a failpoint in the child): the attempt ends failed with the stage, nothing else is written
-  const early = drive({ BRAIN_FAIL_AT: 'sync:after-repo' });
+  // 1. sync fails (a failpoint in the child): the attempt ends failed with the stage, nothing else is written. This
+  // first run is brain-bootstrap.yml's (design §6.1): it binds the publish workflow (checked below), not itself.
+  const early = drive({ BRAIN_FAIL_AT: 'sync:after-repo', GITHUB_WORKFLOW_REF: 'o/brain-ops/.github/workflows/brain-bootstrap.yml@refs/heads/main',
+    BRAIN_PUBLISH_WORKFLOW: '.github/workflows/brain-publish.yml' }, { args: ['--full', '--mode', 'bootstrap'] });
   assert.equal(early.status, 1, early.out);
   assert.match(early.out, /FAILED sync:exit/);
   assert.deepEqual(await rows('SELECT status, stage, error FROM brain.attempt'), [{ status: 'failed', stage: 'sync', error: 'sync:exit' }]);

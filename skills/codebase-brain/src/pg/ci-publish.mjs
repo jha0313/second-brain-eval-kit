@@ -4,7 +4,8 @@
 // env: BRAIN_WRITER_URL (only this process reads it), BRAIN_SOURCE_REPO (owner/name, fixed in the workflow file: R1),
 //   BRAIN_SOURCE_TOKEN (source read token: the repo id here, and sync as GH_TOKEN), GITHUB_TOKEN (A5: this run's
 //   created_at, nothing else), GHA_RUN_ID / GHA_RUN_ATTEMPT (else GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT), GITHUB_REPOSITORY,
-//   GITHUB_WORKFLOW_REF.
+//   GITHUB_WORKFLOW_REF, BRAIN_PUBLISH_WORKFLOW (the workflow a first run binds, the one refresh dispatches; default: the
+//   running workflow; required in bootstrap mode, whose own workflow must never be bound).
 // Stages (contract CI_STAGES). Each prints `brain-stage <stage> <start|ok|fail> <ISO time>` (test/pg/slo.mjs reads them):
 //   prepare   the source commit, the binding's repo id, this run's created_at      no attempt yet: nothing is recorded
 //   record    beginAttempt (R1, R2). A5: shouldSkip -> the attempt ends 'skipped', exit 0
@@ -123,6 +124,7 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
   if (!Number.isSafeInteger(runId) || runId <= 0) missing.push('GHA_RUN_ID');
   if (!Number.isSafeInteger(runAttempt) || runAttempt <= 0) missing.push('GHA_RUN_ATTEMPT');
   if (mode !== 'normal' && mode !== 'bootstrap') missing.push('--mode normal|bootstrap');
+  if (mode === 'bootstrap' && !env.BRAIN_PUBLISH_WORKFLOW) missing.push('BRAIN_PUBLISH_WORKFLOW (bootstrap mode)');
   let fault = null;
   try { fault = C.parseFault(env); } catch { missing.push('BRAIN_FAULT (a contract FAULT_POINTS name)'); }
   if (missing.length) { say(`ci-publish: usage: missing or bad ${missing.join(', ')}`); return C.CI_EXIT.usage; }
@@ -213,7 +215,7 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
       let sourceSha;
       try { sourceSha = await git(['-C', src, 'rev-parse', 'HEAD']); } catch { throw new StageFail('prepare', 'internal', 'the source checkout has no HEAD'); }
       // owner/repo/.github/workflows/brain-publish.yml@refs/heads/main -> .github/workflows/brain-publish.yml
-      const workflow = env.GITHUB_WORKFLOW_REF.slice(env.GITHUB_REPOSITORY.length + 1).replace(/@.*$/, '');
+      const workflow = env.BRAIN_PUBLISH_WORKFLOW || env.GITHUB_WORKFLOW_REF.slice(env.GITHUB_REPOSITORY.length + 1).replace(/@.*$/, '');
       const toolVersion = `codebase-brain@${JSON.parse(readFileSync(join(KIT, 'package.json'), 'utf8')).version}`;
       const repoId = (await getJson(`/repos/${env.BRAIN_SOURCE_REPO}`, token, limits.requestMs)).id;   // R1: the numeric id
       // A5 needs this run's created_at (GitHub's clock). Unknown -> no skip: the run publishes as usual.

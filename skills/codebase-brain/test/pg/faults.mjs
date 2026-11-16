@@ -496,7 +496,7 @@ export const CI_A5 = {
     a5('P22-created-at-unknown', { skip: false, env: { BRAIN_TEST_CREATED_AT: '' } }),
     a5('P22b-run-attempt-2', { skip: false, env: { GHA_RUN_ATTEMPT: '2' } }),
     { ...a5('P22c-tool-version', { skip: false }), arrange: setTool('other'), after: setTool(null) },
-    a5('P22d-bootstrap', { skip: false, args: ['--mode', 'bootstrap'] }),
+    a5('P22d-bootstrap', { skip: false, args: ['--mode', 'bootstrap'], env: { BRAIN_PUBLISH_WORKFLOW: '.github/workflows/brain-publish.yml' } }),
     a5('P22-full', { skip: false, args: ['--full'] }),
   ],
 };

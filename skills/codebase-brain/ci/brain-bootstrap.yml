@@ -96,7 +96,10 @@ jobs:
           BRAIN_SOURCE_TOKEN: ${{ secrets.BRAIN_SOURCE_TOKEN }}
           GHA_RUN_ID: ${{ github.run_id }}
           GHA_RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: '"$BRAIN_DIR/bin/brain" ci-publish --source src-repo --mirror .brain-mirror --full --mode bootstrap'
+          # a first run binds the database to a workflow, the one refresh dispatches: brain-publish, never this one
+          BRAIN_PUBLISH_WORKFLOW: .github/workflows/brain-publish.yml
+        # exec: GitHub sends the cancel signals to the step's own process; ci-publish must be that process (bin/brain execs node)
+        run: 'exec "$BRAIN_DIR/bin/brain" ci-publish --source src-repo --mirror .brain-mirror --full --mode bootstrap'
 
       - name: save the mirror
         if: success()
