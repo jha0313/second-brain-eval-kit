@@ -217,6 +217,23 @@ test('build --if-stale rebuilds an index made by an older sanitizer, then keeps 
   assert.equal(build().skipped, true);
 });
 
+test('build --if-stale keeps an index copied into another clone at the same commit; another repo rebuilds', () => {
+  const clone = mkdtempSync(join(tmpdir(), 'brain-e1-clone-'));
+  execFileSync('git', ['clone', '-q', F.repo, clone]);
+  const db = copyIndex();
+  const build = (cwd) => JSON.parse(runBrain(['build', '.', '--if-stale', '--json'], { cwd, env: { BRAIN_DB: db } }).stdout);
+  const r = build(clone);
+  assert.equal(r.skipped, true);
+  assert.equal(r.freshness.state, 'fresh');
+  writeFileSync(join(clone, 'src/lib/credits.ts'), '// edited in the clone\n', { flag: 'a' });
+  assert.equal(build(clone).skipped, false);                 // stale in this clone: rebuilt here
+  const other = fixtureRepo({ extraFiles: { 'docs/other.md': '# another repo\n' }, build: false }).repo;
+  const db2 = copyIndex();
+  const r2 = JSON.parse(runBrain(['build', '.', '--if-stale', '--json'], { cwd: other, env: { BRAIN_DB: db2 } }).stdout);
+  assert.equal(r2.skipped, false);                           // the index commit is not in this repo: never kept
+  rmSync(clone, { recursive: true, force: true });
+});
+
 test('a write while another process holds the lock exits 3 (busy)', async () => {
   const db = copyIndex();
   const holder = await holdLockInChild(db);                  // a live process that is not the brain process

@@ -233,32 +233,43 @@ function automaton(tokens) {
   return { next, out: ends.map((e) => (e.length ? e : null)) };
 }
 
-/** Stream the blobs through `git cat-file --batch`; each(blob, bytes) returns true to stop. @returns {Promise<null|number|string>} */
-function catBlobs(repoDir, blobs, each) {
+/**
+ * Stream the blobs through `git cat-file --batch`, never holding a whole blob: scan.start(blob) at each blob,
+ * scan.feed(bytes) for each piece of it, scan.end() after it; feed or end returns true to stop. A git that stalls is
+ * killed after limitMs, so the caller (inside the write lock) never waits forever.
+ * @returns {Promise<null|'timeout'|number|string>} null: all read, or stopped by scan; else why git stopped early
+ */
+function catBlobs(repoDir, blobs, scan, limitMs) {
   return new Promise((resolve) => {
     const child = spawn('git', ['-C', repoDir, 'cat-file', '--batch'], { env: gitEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
-    let chunks = [], have = 0, need = -1, i = 0, stopped = false;
-    const all = () => (chunks.length === 1 ? chunks[0] : (chunks = [Buffer.concat(chunks, have)])[0]);
+    let head = [], left = -1, i = 0, why;                                        // left: body bytes + the trailing LF still to come; -1: in a header
+    const stop = (reason = null) => { if (why !== undefined) return; why = reason; clearTimeout(timer); child.kill('SIGKILL'); };
+    const timer = setTimeout(() => stop('timeout'), Math.max(0, limitMs));
     child.stdout.on('data', (chunk) => {
-      if (stopped) return;
-      chunks.push(chunk); have += chunk.length;
-      for (;;) {
-        if (need < 0) {                                                           // "<sha> blob <size>\n" or "<sha> missing\n"
-          const buf = all(), nl = buf.indexOf(10);
-          if (nl < 0) return;
-          const head = buf.toString('latin1', 0, nl).split(' ');
-          chunks = [buf.subarray(nl + 1)]; have -= nl + 1;
-          if (head[1] === 'blob') need = Number(head[2]); else { i++; continue; }
+      for (let k = 0; why === undefined && k < chunk.length;) {
+        if (left < 0) {                                                          // "<sha> blob <size>\n" or "<sha> missing\n"
+          const nl = chunk.indexOf(10, k);
+          if (nl < 0) { head.push(chunk.subarray(k)); return; }
+          head.push(chunk.subarray(k, nl)); k = nl + 1;
+          const h = Buffer.concat(head).toString('latin1').split(' '); head = [];
+          if (h[1] !== 'blob') { i++; continue; }
+          left = Number(h[2]) + 1;
+          scan.start(blobs[i]);
         }
-        if (have < need + 1) return;
-        const buf = all(), content = buf.subarray(0, need);
-        chunks = [buf.subarray(need + 1)]; have -= need + 1; need = -1;
-        if (each(blobs[i++], content)) { stopped = true; child.kill(); return; }
+        const n = Math.min(left - 1, chunk.length - k);
+        if (n > 0) {
+          if (scan.feed(chunk.subarray(k, k + n))) return stop();
+          k += n; left -= n;
+        }
+        if (left === 1 && k < chunk.length) {                                    // the LF after the body: the blob is done
+          k++; left = -1; i++;
+          if (scan.end()) return stop();
+        }
       }
     });
     child.stdin.on('error', () => {});                                            // closed early when stopped
-    child.on('error', () => resolve('error'));
-    child.on('close', (code, signal) => resolve(stopped || code === 0 ? null : code ?? signal ?? 'error'));
+    child.on('error', () => { clearTimeout(timer); resolve('error'); });
+    child.on('close', (code, signal) => { clearTimeout(timer); resolve(why !== undefined ? why : code === 0 ? null : code ?? signal ?? 'error'); });
     child.stdin.end(blobs.map((b) => b.sha).join('\n') + '\n');
   });
 }
@@ -266,7 +277,7 @@ function catBlobs(repoDir, blobs, each) {
 /**
  * @returns {Promise<{ files: Map<string, Map<string, string>>, open: Set<string>, over: boolean, failed: number|string|null }>}
  *   files: token -> path -> first line; open: tokens not decided as too-many (found in more than MAX_RESOLVED files);
- *   over: the budget (text bytes read, ms) stopped the search; failed: git's exit code or signal on an error
+ *   over: the budget (bytes read, ms; a stalled git counts) stopped the search; failed: git's exit code or signal on an error
  */
 async function findTokens(repoDir, commit, tokens, budget) {
   const files = new Map(tokens.map((t) => [t, new Map()]));
@@ -278,27 +289,44 @@ async function findTokens(repoDir, commit, tokens, budget) {
   }).filter((b) => b.type === 'blob' && b.mode !== '120000');                     // no symlinks, no submodules
   const started = Date.now();
   let bytes = 0, over = false;
-  const failed = await catBlobs(repoDir, blobs, ({ path }, buf) => {
-    bytes += buf.length;
-    if (!buf.subarray(0, 8000).includes(0)) {                                     // -I: binary blobs are skipped
-      for (let k = 0, s = 0, line = 1; k < buf.length; k++) {
+  const spent = () => bytes > budget.bytes || Date.now() - started > budget.ms;
+  // one blob at a time; its hits wait in `seen` until its end, because a NUL in its first 8,000 bytes (-I: binary,
+  // skipped) can come after a hit
+  let path, s, line, pos, binary, seen;
+  const scan = {
+    start(b) { path = b.path; s = 0; line = 1; pos = 0; binary = false; seen = new Map(); },
+    feed(buf) {
+      bytes += buf.length;
+      if (spent()) { over = true; return true; }
+      if (binary) return false;
+      if (pos < 8000 && buf.subarray(0, 8000 - pos).includes(0)) { binary = true; return false; }
+      pos += buf.length;
+      for (let k = 0; k < buf.length; k++) {
         const b = buf[k];
         if (b === 10) line++;
         s = next[(s << 8) | b];
         const hit = out[s];
         if (hit === null) continue;
-        for (const t of hit) {
+        for (const t of hit) if (!seen.has(t)) seen.set(t, line);
+      }
+      return false;
+    },
+    end() {
+      if (!binary) {
+        for (const [t, n] of seen) {
           const tok = tokens[t];
           if (!open.has(tok)) continue;
           const f = files.get(tok);
-          if (!f.has(path)) { f.set(path, String(line)); if (f.size > MAX_RESOLVED) open.delete(tok); }
+          if (!f.has(path)) { f.set(path, String(n)); if (f.size > MAX_RESOLVED) open.delete(tok); }
         }
       }
-    }
-    if (!open.size) return true;                                                  // every token is too-many already
-    if (bytes > budget.bytes || Date.now() - started > budget.ms) { over = true; return true; }
-    return false;
-  });
+      if (!open.size) return true;                                                // every token is too-many already
+      if (spent()) { over = true; return true; }
+      return false;
+    },
+  };
+  const failed = await catBlobs(repoDir, blobs, scan, budget.ms - (Date.now() - started));
+  if (failed === 'timeout') over = true;
   return { files, open, over, failed: over ? null : failed };
 }
 

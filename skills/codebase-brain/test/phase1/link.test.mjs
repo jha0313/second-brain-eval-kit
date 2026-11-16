@@ -239,6 +239,48 @@ test('relink: 2,000 tokens, a name and a route with thousands of hits, all decid
   assert.deepEqual(verdict(r['name BinaryOnlyToken text']), ['unlinked', 'no-match', []]);    // binary blobs are skipped (-I)
 });
 
+// a `git` on PATH in front of the real one: FAKE_GIT=stall makes `cat-file --batch` hang; FAKE_GIT=trickle sends its
+// output a few bytes per write, so blob headers, bodies and tokens are cut at many chunk edges
+function withFakeGit(mode, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'brain-fakegit-'));
+  const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  writeFileSync(join(dir, 'git'), `#!/bin/sh
+if [ "$3" = cat-file ] && [ "$4" = --batch ]; then
+  case "$FAKE_GIT" in
+    stall) exec sleep 30 ;;
+    trickle) "${real}" "$@" | perl -e 'binmode STDIN; binmode STDOUT; while (read(STDIN, my $b, 3)) { syswrite(STDOUT, $b) }'; exit $? ;;
+  esac
+fi
+exec "${real}" "$@"
+`, { mode: 0o755 });
+  const saved = { PATH: process.env.PATH, FAKE_GIT: process.env.FAKE_GIT };
+  process.env.PATH = `${dir}:${saved.PATH}`; process.env.FAKE_GIT = mode;
+  const restore = () => { process.env.PATH = saved.PATH; if (saved.FAKE_GIT === undefined) delete process.env.FAKE_GIT; else process.env.FAKE_GIT = saved.FAKE_GIT; };
+  return fn().finally(restore);
+}
+
+test('relink: blobs read in pieces give the same answers (headers, bodies and tokens cut at chunk edges)', async () => {
+  const bulk = Array.from({ length: 2000 }, (_, i) => `bulk-token-${String(i).padStart(4, '0')}`);
+  freshGh([...bulk.map((target) => ({ kind: 'name', target })), { kind: 'name', target: 'BinaryOnlyToken' }]);
+  await withFakeGit('trickle', () => run());
+  const r = rows();
+  for (const [i, t] of bulk.entries()) {
+    assert.deepEqual(verdict(r[`name ${t} text`]), i % 2 ? ['unlinked', 'no-match', []] : ['linked', null, [`notes/bulk.txt:${i / 2 + 1}`]], t);
+  }
+  assert.deepEqual(verdict(r['name BinaryOnlyToken text']), ['unlinked', 'no-match', []]);
+});
+
+test('relink: a git cat-file that stalls is killed at the time budget; its refs stay pending/budget', async () => {
+  freshGh([{ kind: 'name', target: 'jobs.reserve' }, { kind: 'file', target: 'src/lib/credits.ts' }]);
+  const t0 = Date.now();
+  const res = await withFakeGit('stall', () => run({ budget: { bytes: 2e9, ms: 1500 } }));
+  assert.ok(Date.now() - t0 < 8000, `relink took ${Date.now() - t0} ms`);
+  const r = rows();
+  assert.deepEqual(verdict(r['name jobs.reserve text']), ['pending', 'budget', []]);       // never "no-match" from a hung git
+  assert.deepEqual(verdict(r['file src/lib/credits.ts text']), ['linked', null, ['src/lib/credits.ts']]);
+  assert.equal(res.pending, 1);
+});
+
 test('relink: targets shaped like options or shell never reach a command line', async () => {
   const marker = join(mkdtempSync(join(tmpdir(), 'brain-link-')), 'pwned');
   freshGh([
