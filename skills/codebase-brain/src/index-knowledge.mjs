@@ -90,15 +90,16 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
 
   // 2. Commit history reachable from the indexed commit: message + PR numbers + touched files
   const SEP = '\x1e';
-  // -z: paths come raw. Without it git quotes a non-ASCII or '"' path ("src/\352\262\260.ts"), and it matched no file node.
-  const out = git(repo, ['log', `-n${maxCommits}`, '--no-merges', '--name-only', '-z', `--format=${SEP}%H%x1f%cI%x1f%s%x1f%b%x1f`, 'HEAD']);
+  // core.quotePath=false: a non-ASCII path (Korean too) comes raw; by default git quotes it ("src/\352\262\260.ts") and it
+  // matched no file node. Control characters, '"' and '\' stay quoted, so a path can never break the record framing.
+  const out = git(repo, ['-c', 'core.quotePath=false', 'log', `-n${maxCommits}`, '--no-merges', '--name-only', `--format=${SEP}%H%x1f%cI%x1f%s%x1f%b%x1f`, 'HEAD']);
   for (const rec of out.split(SEP).slice(1)) {
     const [sha, date, rawSubject, rawBody, files = ''] = rec.split('\x1f');
     const msg = sanitize(`${rawSubject}\n${rawBody}`).text;          // the whole message; git's subject is one line
     const cut = msg.indexOf('\n');
     const subject = msg.slice(0, cut), body = msg.slice(cut + 1);
     const cleanBody = body.split('\n').filter((l) => !/^(Co-authored-by|Signed-off-by|Claude-Session|Reviewed-by):/i.test(l.trim()) && !/^https?:\/\/claude\.ai\//.test(l.trim())).join('\n').trim();
-    const touched = files.split('\0').map((f) => f.replace(/^\n/, '')).filter(Boolean);   // "\0\n" ends the message, "\0" each path
+    const touched = files.split('\n').map((f) => f.trim()).filter(Boolean);
     // a bulk commit (initial import, mass rename, the root of a shallow clone) says nothing about one file
     const bulk = touched.length > BULK_FILES;
     const id = addChunk({ source: 'commit', title: subject, body: bulk ? cleanBody : `${cleanBody}\n\nfiles: ${sanitize(touched.join(' ')).text}`, sha, date: date.slice(0, 10) });
