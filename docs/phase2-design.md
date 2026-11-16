@@ -575,7 +575,7 @@ $ brain search "크레딧 예약" --as-of 2026-10-01
 | # | 시나리오 | 통과 조건 |
 |---|---|---|
 | V1 | writer로 revision 표 `UPDATE body` · `DELETE`, `run` `UPDATE` | 모두 거부. `valid_to` 닫기는 한 번만, 두 번째는 거부 |
-| V2 | owner URL만 든 `.env.local`에서 서버 모드 명령을 부름: reader 확인에 걸려 거부. 직접 SQL. reader: `INSERT` · `UPDATE` · `DELETE` · `CREATE TABLE` · `CREATE TEMP TABLE`, `SET default_transaction_read_only = off` 뒤 같은 것. writer: DDL · `TRUNCATE` · `DELETE` · `CREATE TEMP TABLE` | 전부 거부 |
+| V2 | owner URL만 든 `.env.local`에서 서버 모드 명령을 부름: reader 확인에 걸려 거부. 직접 SQL. reader: `INSERT` · `UPDATE` · `DELETE` · `CREATE TABLE` · `CREATE TEMP TABLE`, `SET default_transaction_read_only = off` 뒤 같은 것. writer: DDL · `TRUNCATE` · `DELETE` · `CREATE TEMP TABLE` | 전부 거부. 다만 reader의 `lo_from_bytea`(large object 저장)와 `ALTER ROLE` 자기 자신(`SET` 기본값 · `PASSWORD`)은 Postgres가 막지 못한다. 이 둘은 거부를 기대하지 않고, 되는지와 brain 표가 그대로인지만 기록한다(§10) |
 | V3 | 같은 스냅숏을 두 번 publish. 같은 Actions attempt로 두 번 시작 | 두 번째 run은 새 revision · 사실 0개. 같은 attempt는 유일 제약이 막는다 |
 | V4 | 문서 하나 수정 → publish | 그 문서만 새 revision. 옛 포인터 `@r1`의 `source`가 옛 글 그대로 |
 | V5 | 파일 삭제 · 심볼 삭제 → publish | 최신에서 사라짐, `--as-of` 이전 run에서는 보임 |
@@ -702,6 +702,7 @@ flowchart LR
 ## 10. 한계
 
 - reader 비밀이 새면 brain 내용(마스킹된 글과 지도)을 누구든 읽을 수 있다. IP 제한은 Neon Scale 플랜에만 있다. 비밀 교체로 대응한다.
+- reader URL을 가진 사람은 Postgres 기본 권한으로 두 가지를 할 수 있다(Q0에서 Neon으로 확인). (1) `ALTER ROLE` 자기 자신: `default_transaction_read_only`를 끄거나 비밀번호를 바꿀 수 있다. 끄더라도 brain 표에는 쓰기 권한이 없어 쓰지 못한다. 비밀번호를 바꾸면 팀 전체 읽기가 막힌다(owner가 비밀 교체로 복구). (2) large object(`lo_from_bytea`): `pg_catalog`의 `lo_*` 권한은 `neondb_owner`가 거둘 수 없다. 저장 용량을 쓰는 것뿐 brain 표는 바뀌지 않는다. 사람마다 reader role을 주면(§9-2) 누가 했는지 보이고 그 사람만 끊을 수 있다.
 - 운영 repo에 쓰기 권한이 있는 사람은 workflow를 고쳐 writer 비밀을 꺼낼 수 있다. 이 설계가 막는 것은 에이전트와 노트북, 서비스 repo 쪽의 쓰기다.
 - 마스킹이 놓친 비밀은 revision에 영원히 남는다. 지우려면 owner의 비상 migration(R15)이 필요하다. "덮어쓰지 않음"의 예외는 이것 하나다.
 - 첫 지도 명령은 mirror를 전부 받느라 느린 망에서 몇 초 걸린다. 그 뒤는 delta만 받는다.
@@ -769,3 +770,19 @@ flowchart LR
 | [major] 빌드 창 밖 커밋 청크는 `--full`로도 다시 정리되지 않는다 | 반영. CI가 mirror에서 읽어 다시 정리(R15) |
 | [major] `@r<n>` 포인터와 `answer.mjs` 변경의 주인이 없다 | 반영. `src/ptr.mjs`는 Q5, `src/answer.mjs` · `src/render.mjs`는 Q6(레인 C) |
 | [blocker, Phase 3와 공통] CI가 소스 repo의 `typescript`를 부른다 | 반영. Q7이 `src/index-ts.mjs`에 `BRAIN_TYPESCRIPT=kit` |
+
+**구현 중 계약 확정 (Q0 결과, lead 확인).** Q0이 설계 문장 사이의 빈칸을 아래처럼 정했고 lead가 받아들였다. 계약은 `src/pg/contract.mjs`와 `sql/001_init.sql`이 기준이다.
+
+| 항목 | 정한 것 |
+|---|---|
+| link · ref_link 사실 키의 `rev_no`(R5) | 오프라인에서 셀 수 없어(mirror는 보이는 행만 가짐) 사실 키에는 항목 내용 해시를 쓴다. `rev_no`는 서버가 publish 때 매기고 DB guard가 `이전 + 1`을 강제한다. 포인터와 `chunkKey`는 `rev_no`를 그대로 쓴다 |
+| `items.updated_at` | 왕복을 위해 `item_rev.source_updated_at`(text)에 두고 해시에 넣는다 |
+| `refs.resolved_build` | 빌드마다 바뀌므로 사실이 아니라 장부(`sync_state.state.refs`)에 둔다. `ref_link`에 `reason` · `resolved_raw` 열, 상태에 `pending` |
+| GitHub 항목 본문 검색 | `item_rev`에 title · body를 두고, 검색용 파생 청크(ord 0)를 하나 더 만든다. 본문이 두 번 저장된다 |
+| `node.path` | 손실 없는 `nodes.path`를 위해 추가 |
+| vault 청크 | snapshot이 거부한다(서버에 올리지 않음) |
+| Phase 0 중복 edge | snapshot이 합친다. §7.2 비교는 의미 단위 |
+| `binding` | writer가 비어 있을 때 한 번만 넣는다 |
+| 추가 guard | 새 행은 같은 트랜잭션이 넣은 run에 속해야 함(GUC + `run.xmin` + 최신 run), `rev_no = 이전 + 1`, attempt는 `running`으로만 넣음, `ok`는 그 attempt의 run을 넣은 트랜잭션에서만, `TRUNCATE` 거부. run id에는 빈 번호가 있다 |
+| run guard | 공유 · 세션 advisory lock으로 우회되지 않게 guard가 직접 `pg_advisory_xact_lock(2026111601)`을 잡는다 |
+| 알려진 한계 | reader의 large object와 `ALTER ROLE` 자기 자신은 막을 수 없다(§10, V2) |
