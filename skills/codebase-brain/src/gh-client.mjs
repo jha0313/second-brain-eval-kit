@@ -3,7 +3,8 @@
 // Contract (design §6.2 R1, R3–R5, §6.3):
 // - all methods are async; they return only data from successful responses, or throw GhError (errors.mjs)
 // - retries live here: network errors and 5xx retry 3 times with exponential backoff (1s, 2s, 4s via clock.sleep);
-//   primary rate limit (x-ratelimit-remaining: 0) waits until x-ratelimit-reset, at most 1 hour, logging the wait;
+//   primary rate limit (x-ratelimit-remaining: 0) waits until x-ratelimit-reset, at most 1 hour per sleep, logging the wait;
+//   a wait longer than maxRateWaitMs (default 1 hour, --max-rate-wait) fails at once instead;
 //   secondary rate limit (403/429 with retry-after or "secondary rate limit" message) waits retry-after seconds,
 //   else 60s doubling, 3 times; then GhError('rate-limit')
 // - 401 -> GhError('auth'), 403 (not rate limit) -> 'forbidden', 404 -> 'not-found', anything unparsable -> 'protocol'
@@ -118,7 +119,7 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
     const after = res.headers.get('retry-after');
     if (after != null && Number(after) >= 0) return Number(after) * 1000;
     const untilReset = Number(res.headers.get('x-ratelimit-reset')) * 1000 - clock.now();
-    if (res.headers.get('x-ratelimit-remaining') === '0' && untilReset > 0) return Math.min(untilReset, HOUR);
+    if (res.headers.get('x-ratelimit-remaining') === '0' && untilReset > 0) return untilReset;   // capped at 1 h when waited
     return MINUTE * 2 ** i;
   };
 
@@ -161,7 +162,8 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
             { status: res.status, retryAfter });
         }
         counters.rateLimitWaits++;
-        await wait(ms, `github ${label}: rate limited (HTTP ${res.status}), waiting ${Math.ceil(ms / 1000)}s (${limits}/${RETRIES})`);
+        const nap = Math.min(ms, HOUR);                    // a reset further away: wait 1 h, then ask again
+        await wait(nap, `github ${label}: rate limited (HTTP ${res.status}), waiting ${Math.ceil(nap / 1000)}s (${limits}/${RETRIES})`);
         continue;
       }
       const [kind, hint] = HTTP_KIND[res.status] ?? ['protocol', 'unexpected status'];

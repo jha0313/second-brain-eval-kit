@@ -281,6 +281,9 @@ test('sweepSecrets: a key is rebuilt from its swept path and name, so a symbol u
   db.close();
   const bytes = readFileSync(path);
   for (const c of [v, dv]) assert.equal(occurrences(bytes, c), 0, 'canary in code.db bytes');
+  for (const r of rows) assert.deepEqual(detectSecrets(r.key), [], `the Phase 2 upload check accepts ${r.key}`);   // Codex lane I review
+  assert.deepEqual(detectSecrets(`src/token=${v}.ts#Name`), ['assignment']);                // the raw key is still caught
+  assert.deepEqual(detectSecrets('[REDACTED:assignment] then ' + 'gh' + 'p_' + R('Zz9Y', 9)), ['github-token']);   // a shaped secret after a marker too
 });
 
 test('build: a .ts file under an assignment-shaped name gives symbol keys <swept path>#Name that the Phase 2 snapshot accepts', () => {

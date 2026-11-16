@@ -161,7 +161,14 @@ export function sanitize(text) {
  * mask(), so the answer depends only on the text and SANITIZE_VERSION (bump it whenever a rule changes).
  * @param {unknown} s @returns {string[]} kinds from SECRET_KINDS, empty when clean
  */
-export function detectSecrets(s) { return [...new Set(mask(normalize(String(s ?? ''))).kinds)]; }
+export function detectSecrets(s) {
+  // each stretch between redaction markers on its own: a marker ends any match, so text the masker already wrote
+  // (a swept node key "src/token=[REDACTED:assignment:7f34]#Name") is not read as a new assignment value
+  const found = new Set();
+  for (const part of normalize(String(s ?? '')).split(MARKER)) for (const k of mask(part).kinds) found.add(k);
+  return SECRET_KINDS.filter((k) => found.has(k));
+}
+const MARKER = /\[REDACTED:[a-z-]+(?::[0-9a-f]{4})?\]/;
 
 /** One-line external value (login, branch, title, file path from GitHub): sanitize, then fold newlines to spaces. */
 export function sanitizeLine(s) { return sanitize(s).text.replace(/\n/g, ' '); }

@@ -6,6 +6,7 @@ so the judge checks "does this line say that?" instead of trusting the answer.""
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -82,6 +83,14 @@ def _github_index(case) -> dict | None:
     return load_github_index(path) if path else None
 
 
+_TAGS = re.compile(r"<(/?)(agent_answer|tool_calls|cited_excerpts|reference_sources|reference_answer|task_given_to_agent|rubric)\b", re.I)
+
+
+def _quoted(text: str) -> str:
+    """Quoted data (GitHub text, repo excerpts, the agent's answer and calls) cannot open or close this prompt's blocks."""
+    return _TAGS.sub(lambda m: f"‹{m.group(1)}{m.group(2)}", text)
+
+
 def _gh_text(gh: dict | None, ptr: str) -> str:
     text = (gh or {}).get("texts", {}).get(ptr)
     return text[:3000] if text else "(GitHub item; its text is not in the frozen index)"
@@ -95,7 +104,7 @@ def _excerpts(case, traj, repo, commit, max_cites: int = 10, budget: int = 24000
     if gh:                                         # GitHub items the answer cites, read from the frozen corpus
         for _, c in github_citations(traj["final"] or "", gh["repo"])[:max_cites]:
             for ptr in [p for p in c["gh"] if p in gh["items"]][:2]:
-                text = f"--- {ptr} (as cited: {c['text'][:80]})\n{_gh_text(gh, ptr)}"
+                text = _quoted(f"--- {ptr} (as cited: {c['text'][:80]})\n{_gh_text(gh, ptr)}")
                 if used + len(text) > budget:
                     break
                 blocks.append(text)
@@ -103,7 +112,7 @@ def _excerpts(case, traj, repo, commit, max_cites: int = 10, budget: int = 24000
     for c in resolved_citations(traj["final"] or "", repo, commit)[:max_cites]:
         label = c.get("commit") or (c["as_written"] + " → " if c.get("as_written") else "") + c["path"] + (
             f":{c['lines'][0]}-{c['lines'][1]}" if c["lines"] else "")
-        text = f"--- {label}\n{excerpt(repo, commit, c)[:3000]}"
+        text = _quoted(f"--- {label}\n{excerpt(repo, commit, c)[:3000]}")
         if used + len(text) > budget:
             break
         blocks.append(text)
@@ -114,10 +123,10 @@ def _excerpts(case, traj, repo, commit, max_cites: int = 10, budget: int = 24000
     for kp in case.key_paths(("sources_hit",)):
         for src in load_sources(kp):
             if "ptr" in src:                       # a GitHub item: its frozen text, when the index carries texts
-                ref.append(f"--- {src['ptr']}\n{_gh_text(gh, src['ptr'])}")
+                ref.append(_quoted(f"--- {src['ptr']}\n{_gh_text(gh, src['ptr'])}"))
                 continue
             cite = {"commit": src["commit"]} if "commit" in src else {"path": src["path"], "lines": tuple(src["lines"]) if src.get("lines") else None}
-            ref.append(f"--- {src.get('commit') or src['path']}\n{excerpt(repo, commit, cite, before=0, after=12)[:2500]}")
+            ref.append(_quoted(f"--- {src.get('commit') or src['path']}\n{excerpt(repo, commit, cite, before=0, after=12)[:2500]}"))
     if ref:
         out += "\n<reference_sources judge_only=\"true\" note=\"where the true answer is recorded; the agent did not see this\">\n" + "\n".join(ref) + "\n</reference_sources>\n"
     return out
@@ -131,8 +140,8 @@ def build_prompt(case, traj: dict, max_calls: int = 40, repo: Path | None = None
              + (" -> ERROR" if c["is_error"] else "") for i, c in enumerate(shown)]
     expected = f"\n<reference_answer judge_only=\"true\">\n{case.expected}\n</reference_answer>\n" if case.expected else ""
     return PROMPT.format(ids=", ".join(r["id"] for r in case.rubric), task=case.prompt, rubric=rubric,
-                         expected=expected, excerpts=_excerpts(case, traj, repo, commit), n_calls=len(calls), calls="\n".join(lines),
-                         answer=(traj["final"] or "(no final answer)")[:20000])
+                         expected=expected, excerpts=_excerpts(case, traj, repo, commit), n_calls=len(calls), calls=_quoted("\n".join(lines)),
+                         answer=_quoted((traj["final"] or "(no final answer)")[:20000]))
 
 
 def one_vote(prompt: str, model: str, ids: list[str], timeout_s: int = 300) -> dict:

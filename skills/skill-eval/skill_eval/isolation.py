@@ -40,8 +40,21 @@ NO_GIT_CREDENTIALS = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "
                       "GCM_INTERACTIVE": "never"}
 TOKEN_FILE = Path(os.environ.get("SKILL_EVAL_TOKEN_FILE", Path.home() / ".config" / "skill-eval" / "oauth-token"))
 INSTRUCTION_FILES = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".claude")
-# Host credential stores a trial must never read (files and folders; deny rules cover both forms)
-CREDENTIAL_PATHS = tuple(Path.home() / p for p in (".config/gh", ".git-credentials", ".config/git/credentials", ".netrc", ".ssh"))
+# Host credential stores a trial must never read (files and folders; deny rules cover both forms), including the gh and
+# git config folders that the host's GH_CONFIG_DIR / XDG_CONFIG_HOME move elsewhere
+
+
+def gh_config_dirs(env=os.environ) -> tuple[Path, ...]:
+    dirs = [Path.home() / ".config/gh", *([Path(env["XDG_CONFIG_HOME"]) / "gh"] if env.get("XDG_CONFIG_HOME") else []),
+            *([Path(env["GH_CONFIG_DIR"])] if env.get("GH_CONFIG_DIR") else [])]
+    return tuple(dict.fromkeys(dirs))
+
+
+def credential_paths(env=os.environ) -> tuple[Path, ...]:
+    git = [Path.home() / ".config/git/credentials", *([Path(env["XDG_CONFIG_HOME"]) / "git/credentials"] if env.get("XDG_CONFIG_HOME") else [])]
+    return tuple(dict.fromkeys([*gh_config_dirs(env), Path.home() / ".git-credentials", *git, Path.home() / ".netrc", Path.home() / ".ssh"]))
+
+
 # GitHub token shapes. A trial or probe that printed one anyway must not leave it in a saved file.
 GH_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})")
 # Keys that would change what a trial can see or do if an auto-synced file in the empty config dir carried them
@@ -61,7 +74,7 @@ def token() -> str | None:
 
 def trial_settings(arm_skill: str | None, deny_dirs: list[Path], extra_off: list[str] = ()) -> dict:
     off = {s: "off" for s in [*BUNDLED_SKILLS, *extra_off] if s != arm_skill}
-    paths = [*map(str, deny_dirs), str(Path.home() / ".claude"), str(TOKEN_FILE.parent), *map(str, CREDENTIAL_PATHS)]
+    paths = [*map(str, deny_dirs), str(Path.home() / ".claude"), str(TOKEN_FILE.parent), *map(str, credential_paths())]
     # "//abs/path" is an absolute path rule; "/**" covers a folder's contents, the bare form a single file
     deny = [f"{tool}(/{p}{tail})" for p in paths for tool in ("Read", "Edit") for tail in ("", "/**")]
     return {

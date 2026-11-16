@@ -15,7 +15,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb, getMeta, inTransaction } from './db.mjs';
-import { git } from './files.mjs';
+import { git, gitEnv } from './files.mjs';
 import { githubDbPath, openGithubDb } from './gh-schema.mjs';
 import { pathIndex, PATH_RE, IDENT_RE, MAX_NAME_OWNERS } from './index-knowledge.mjs';
 import { isRedacted, sanitizeIdent } from './sanitize.mjs';
@@ -197,7 +197,7 @@ function resolvers({ code, gh, tracked }) {
 // one `git cat-file --batch-check` for every SHA: sha -> 'commit' | 'ambiguous' | 'missing' | ..., null when git failed
 function commitTypes(repoDir, shas) {
   return new Promise((resolve) => {
-    const child = execFile('git', ['-C', repoDir, 'cat-file', '--batch-check'], { encoding: 'utf8', maxBuffer: Infinity }, (err, stdout) => {
+    const child = execFile('git', ['-C', repoDir, 'cat-file', '--batch-check'], { encoding: 'utf8', maxBuffer: Infinity, env: gitEnv() }, (err, stdout) => {
       if (err) return resolve(null);
       const lines = stdout.split('\n');
       resolve(new Map(shas.map((s, i) => [s, lines[i]?.split(' ')[1]])));
@@ -237,7 +237,7 @@ async function grepTokens(repoDir, commit, tokens, budget) {
       }
     };
     const failed = await new Promise((resolve) => {
-      const child = execFile('git', args, { encoding: 'utf8', maxBuffer: Infinity }, (err) => {
+      const child = execFile('git', args, { encoding: 'utf8', maxBuffer: Infinity, env: gitEnv() }, (err) => {
         clearTimeout(timer);
         if (!err || over || done) return resolve(null);
         resolve(err.code === 1 ? null : err.code ?? err.signal ?? 'error');      // exit 1: nothing matched

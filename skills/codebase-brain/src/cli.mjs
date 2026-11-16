@@ -22,7 +22,7 @@ import { replaySeams } from './seams.mjs';
 import { SANITIZE_VERSION, sanitizeLine, redactValues } from './sanitize.mjs';
 import { parsePtr } from './ptr.mjs';
 import { BrainError } from './errors.mjs';
-import { git } from './files.mjs';
+import { git, gitEnv } from './files.mjs';
 
 const HELP = `brain — codebase map + memory (prototype)
 
@@ -83,7 +83,7 @@ const say = (s) => console.error(scrub(s));
 let checkout;
 function here(opt) {
   if (opt.repo) return resolve(opt.repo);
-  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return undefined; }
+  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv() }).trim(); } catch { return undefined; }
 }
 
 function dbPathFor(opt) {

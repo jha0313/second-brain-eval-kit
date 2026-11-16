@@ -88,10 +88,11 @@ test('Phase 0 JSON keeps its fields; freshness gains `github`, coverage is added
   assert.ok(answers.why.citations.length > 0 && 'ms' in answers.why);
   // with a github.db next to the index, its sync state is in every answer
   const db = copyIndex();
-  makeGithubDb(db, { syncState: { sanitize_version: SANITIZE_VERSION, last_ok_at: new Date().toISOString() } });
+  const asOf = new Date(Math.floor(Date.now() / 1000) * 1000 - 3_600_000).toISOString().replace('.000Z', 'Z');   // 1 h old: not stale
+  makeGithubDb(db, { syncState: { sanitize_version: SANITIZE_VERSION, cursor: asOf, last_ok_at: new Date().toISOString() } });
   const r = JSON.parse(F.brain(['refs', 'src/lib/credits.ts#reserve', '--json'], { BRAIN_DB: db }).stdout);
-  assert.deepEqual([r.freshness.github.state, r.freshness.github.asOf], ['ok', '2026-11-15T09:58:00Z']);
-  assert.match(F.brain(['find', 'reserve'], { BRAIN_DB: db }).stdout, /· github data as of 2026-11-15 09:58Z \(synced \d+m ago, ok · full sync never\)\n$/);
+  assert.deepEqual([r.freshness.github.state, r.freshness.github.asOf], ['ok', asOf]);
+  assert.match(F.brain(['find', 'reserve'], { BRAIN_DB: db }).stdout, new RegExp(`· github data as of ${asOf.slice(0, 10)} ${asOf.slice(11, 16)}Z \\(synced \\d+m ago, ok · full sync never\\)\\n$`));
 });
 
 test('viz: stdout is the file path only, its footer goes to stderr, the HTML marks people\'s text untrusted', () => {

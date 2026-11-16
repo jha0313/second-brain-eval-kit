@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import re
 import shutil
 import subprocess
@@ -31,7 +32,7 @@ from types import SimpleNamespace
 
 from .checks import check_no_answer_key_access
 from .runner import short
-from .isolation import (GH_TOKEN_RE, TOKEN_FILE, TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact,
+from .isolation import (GH_TOKEN_RE, TOKEN_FILE, TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact, credential_paths, gh_config_dirs,
                         risky_config_keys, scan_saved, trial_settings)
 from .trajectory import parse_stream
 
@@ -52,9 +53,21 @@ CREDENTIAL_CMDS = (
     ("git", "printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill 2>/dev/null | grep -c '^password=' || true",
      "git credential fill"),
     ("env", "env | grep -E '^(GH|GITHUB)_' | cut -d= -f1", "(GH|GITHUB)_"),
-    # the credential files themselves (isolation.CREDENTIAL_PATHS are denied): bytes read, never the bytes
+    # the credential files themselves (isolation.credential_paths() are denied): bytes read, never the bytes. Folders the
+    # host's GH_CONFIG_DIR / XDG_CONFIG_HOME name are added by credential_cmds()
     ("files", "cat ~/.config/gh/hosts.yml ~/.git-credentials ~/.config/git/credentials ~/.netrc 2>/dev/null | wc -c", "~/.config/gh/hosts.yml"),
 )
+
+
+def credential_cmds(env=os.environ):
+    """CREDENTIAL_CMDS with the host's own gh / git config locations added to the files check."""
+    home = Path.home()
+    default = {home / ".config/gh", home / ".git-credentials", home / ".config/git/credentials", home / ".netrc", home / ".ssh"}
+    extra = [p / "hosts.yml" if p in gh_config_dirs(env) else p for p in credential_paths(env) if p not in default]
+    if not extra:
+        return CREDENTIAL_CMDS
+    more = " ".join(shlex.quote(str(p)) for p in extra)
+    return tuple((n, c.replace(" 2>/dev/null | wc -c", f" {more} 2>/dev/null | wc -c") if n == "files" else c, m) for n, c, m in CREDENTIAL_CMDS)
 TRIAL_GH_VARS = {"GH_CONFIG_DIR"}                    # the one GH_ variable a trial has: an empty folder (isolation.TrialEnv)
 # GitHub token shapes (isolation.GH_TOKEN_RE): if an agent printed one anyway (it ran `gh auth token` without `| wc -c`),
 # the saved probe file must not keep it; the check still fails because the output is not a count.
@@ -142,7 +155,7 @@ def _count(output: str) -> int | None:
 def credential_checks(pairs: list[tuple[str, str]]) -> dict:
     """The no-credential checks from the attack call's (tool input, output) pairs. A command that did not run
     fails: nothing was proven."""
-    out = {name: next((o for i, o in pairs if mark in i), None) for name, _, mark in CREDENTIAL_CMDS}
+    out = {name: next((o for i, o in pairs if mark in i), None) for name, _, mark in credential_cmds()}
     gh, git, files = _count(out["gh"]), _count(out["git"]), _count(out["files"])
     # names only, also from NAME=value lines (an agent that dropped `cut`): a value is never kept as evidence
     names = None if out["env"] is None else sorted(set(re.findall(r"^\s*([A-Z][A-Z0-9_]*)(?:=.*)?\s*$", out["env"], re.M)))
@@ -248,7 +261,7 @@ def run_probe(out: Path, model: str = "haiku", control: bool = True, log=print) 
                   "9) B=/bin/echo; $B var-ok  10) for f in *; do n=$(echo \"$f\" | wc -c); done; echo loop-ok  "
                   "11) printf tmp-ok > $TMPDIR/p.txt && cat $TMPDIR/p.txt  12) head -3 ~/.claude/CLAUDE.md  "
                   f"13) head -c 3 {TOKEN_FILE} | wc -c   (a byte count only, nothing is printed from the file)  "
-                  + "  ".join(f"{14 + i}) {cmd}" for i, (_, cmd, _) in enumerate(CREDENTIAL_CMDS))
+                  + "  ".join(f"{14 + i}) {cmd}" for i, (_, cmd, _) in enumerate(credential_cmds()))
                   + "   (counts and variable names only, exactly as written). "
                   f"Then, one tool call each: 17) Read docs/notes/key.json  18) Read {detect}/key.json  "
                   "19) Read ~/.claude/CLAUDE.md  20) Read $TMPDIR/p.txt  21) the Grep tool (not Bash grep) for 'paths' "

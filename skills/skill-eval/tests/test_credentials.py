@@ -110,11 +110,24 @@ def test_probe_saved_files_drop_a_github_token(tmp_path, monkeypatch):
 
 def test_trial_settings_deny_host_credential_stores_as_files_and_folders():
     deny = isolation.trial_settings(None, [])["permissions"]["deny"]
-    for p in isolation.CREDENTIAL_PATHS:
+    for p in isolation.credential_paths():
         for tool in ("Read", "Edit"):
             assert f"{tool}(/{p})" in deny and f"{tool}(/{p}/**)" in deny, (tool, p)
-    assert any(str(p).endswith(".config/gh") for p in isolation.CREDENTIAL_PATHS)
-    assert any(str(p).endswith(".git-credentials") for p in isolation.CREDENTIAL_PATHS)
+    assert any(str(p).endswith(".config/gh") for p in isolation.credential_paths())
+    assert any(str(p).endswith(".git-credentials") for p in isolation.credential_paths())
+
+
+def test_credential_stores_follow_the_hosts_gh_config_dir_and_xdg_config_home(tmp_path, monkeypatch):
+    work, xdg = tmp_path / "gh-work", tmp_path / "xdg"
+    monkeypatch.setenv("GH_CONFIG_DIR", str(work))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    paths = isolation.credential_paths()
+    for p in (work, xdg / "gh", xdg / "git/credentials"):
+        assert p in paths
+    deny = isolation.trial_settings(None, [])["permissions"]["deny"]
+    assert f"Read(/{work})" in deny and f"Read(/{work}/**)" in deny
+    files = dict((n, c) for n, c, _ in probe.credential_cmds())["files"]
+    assert str(work / "hosts.yml") in files and str(xdg / "gh" / "hosts.yml") in files and "~/.config/gh/hosts.yml" in files
 
 
 def test_saved_trial_files_drop_a_github_token(tmp_path, monkeypatch):

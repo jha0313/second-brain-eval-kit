@@ -4,9 +4,13 @@
 // token and no secret from an error body or header in stdout, stderr or the store bytes.
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   NOW, BASE, PULLS_Q, FAILPOINTS, STREAMS, ACTIVE_TOKEN, canaries, secret, rnd, addTokenCanaries, githubSecretCorpus, replayRoutes, override, writeReplay, ok, pr,
-  setupRepo, sync, parseJson, brief, resetGithub, storeLeaks, outputLeaks, replayRequests, OWNER, REPO, REPO_ID,
+  setupRepo, cli, sync, parseJson, brief, resetGithub, storeLeaks, outputLeaks, leaksIn, replayRequests, OWNER, REPO, REPO_ID,
 } from './lib.mjs';
 
 const reg = addTokenCanaries(canaries());
@@ -99,4 +103,40 @@ test('token: a Link rel="next" to another host is never followed (the token woul
   assert.ok(!onlyRepoRequests(dir).some((r) => r.url.includes('evil.example')), 'the foreign Link URL was requested');
   assert.deepEqual(storeLeaks(marker, fx.codeDb), [], 'the page behind the foreign link was fetched and stored');
   assert.deepEqual([...outputLeaks(reg, [run]), ...storeLeaks(reg, fx.codeDb)], []);
+});
+
+test('token: a secret in the query of an in-scope Link is masked in the replay request log (Codex lane I review)', () => {
+  const r2 = addTokenCanaries(canaries());
+  const leak = secret(r2, 'link-query', 'github-token');
+  const routes = replayRoutes(gh);
+  const first = routes.find((x) => x.path === `${BASE}/pulls` && !x.query.page);
+  first.responses = [{ ...first.responses[0], headers: { ...first.responses[0].headers, link: `<https://api.github.com${BASE}/pulls?page=2&token=${leak}>; rel="next"` } }];
+  const dir = writeReplay(routes);
+  resetGithub(fx);
+  const r = sync(fx, dir);
+  assert.equal(r.status, 1, brief(r2, r));                                 // the page-2 URL has no route: 404
+  assert.ok(replayRequests(dir).some((q) => q.url.includes('token=') && q.unmatched), 'the Link was followed');
+  assert.deepEqual(leaksIn(r2, readFileSync(join(dir, 'requests.log'), 'utf8')), []);
+  assert.deepEqual([...outputLeaks(r2, [r]), ...storeLeaks(r2, fx.codeDb)], []);
+});
+
+test('token: git, which build, sync and relink run, gets no GH_*, GITHUB_* or BRAIN_* variable (Phase 2 lane B)', () => {
+  // a git first on PATH that logs the NAMES of such variables it received, then runs the real git
+  const dir = mkdtempSync(join(tmpdir(), 'brain-s-gitenv-'));
+  const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  writeFileSync(join(dir, 'git'), `#!/bin/sh\necho call >> '${dir}/calls'\nenv | grep -E '^(GH|GITHUB|BRAIN)_' | cut -d= -f1 >> '${dir}/names'\nexec '${realGit}' "$@"\n`);
+  chmodSync(join(dir, 'git'), 0o755);
+  const env = { PATH: `${dir}:${process.env.PATH}` };
+  const f = setupRepo();
+  resetGithub(f);
+  const b = cli(f, ['build', '.', '--db', f.codeDb], env);
+  assert.equal(b.status, 0, brief(reg, b));
+  const r = sync(f, writeReplay(replayRoutes(gh)), ['--json'], env);
+  assert.equal(parseJson(r)?.status, 'ok', brief(reg, r));
+  assert.ok(parseJson(r).relink?.linked > 0, 'relink ran (its cat-file and grep calls are git too)');
+  const calls = readFileSync(join(dir, 'calls'), 'utf8').split('\n').filter(Boolean).length;
+  assert.ok(calls >= 3, `git was called through the wrapper (${calls} calls)`);
+  let names = '';
+  try { names = readFileSync(join(dir, 'names'), 'utf8'); } catch {}
+  assert.deepEqual(names.split('\n').filter(Boolean), [], 'variables git received');
 });
