@@ -1,6 +1,6 @@
 // ci-publish (Phase 3 S2, design §6.1–6.4, A1–A6): the publish job of brain-publish.yml and brain-bootstrap.yml.
 //   brain ci-publish --source <checkout> --mirror <dir> [--work <dir>] [--full] [--mode normal|bootstrap]
-//   (until S5 registers the command: node src/pg/ci-publish.mjs ...)
+//   (cli.mjs registers it as `brain ci-publish`; `node src/pg/ci-publish.mjs ...` runs the same code)
 // env: BRAIN_WRITER_URL (only this process reads it), BRAIN_SOURCE_REPO (owner/name, fixed in the workflow file: R1),
 //   BRAIN_SOURCE_TOKEN (source read token: the repo id here, and sync as GH_TOKEN), GITHUB_TOKEN (A5: this run's
 //   created_at, nothing else), GHA_RUN_ID / GHA_RUN_ATTEMPT (else GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT), GITHUB_REPOSITORY,

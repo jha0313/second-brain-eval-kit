@@ -26,7 +26,7 @@ cd /path/to/repo && brain build . --if-stale                             # 대�
 | 명령 | 하는 일 |
 |---|---|
 | `brain build <repo> [--if-stale]` | 인덱스 만들기. `--if-stale`: 같은 repo·같은 빌드 옵션의 인덱스가 아직 맞으면 건너뜀. `--vault`를 주면 늘 다시 빌드(vault는 git 밖이라 바뀌었는지 모름) |
-| `brain status` | 인덱스 커밋·나이, HEAD 이후 바뀐 파일, 미해결 import, 이름 연결에서 뺀 이름 수 |
+| `brain status` | 인덱스 커밋·나이, HEAD 이후 바뀐 파일, 미해결 import, 이름 연결에서 뺀 이름 수. server mode에서는 run·커밋·GitHub 상태와 낡음 네 칸(code · memory · activity · last) |
 | `brain find <이름>` | 심볼·파일 → ID(`path#Name`) |
 | `brain refs <ID>` | 사용 위치 전부 (`--kind call,renders,type…`, `--filter page,route,test,server-action`, `--files`) |
 | `brain callers <ID>` | 호출·렌더 위치를 감싼 함수별로 |
@@ -38,6 +38,8 @@ cd /path/to/repo && brain build . --if-stale                             # 대�
 | `brain search "<질문>"` | PR·이슈·리뷰·댓글·문서·changes·커밋을 한 목록으로(BM25 + trigram + 이름→코드 링크, RRF). 댓글은 부모 PR·이슈로 묶음. `--kind`·`--state open,merged,closed-unmerged,closed`·`--path`·`--author`·`--since` |
 | `brain get <ptr>…` | 포인터(`pr:12`·`issue:7`·`review:9`·`rc:88`·`ic:5`·`commit:<sha>`·`doc:…`)마다 메타·스레드·코드 링크 상태(본문 없음, 최대 5개) |
 | `brain source <ptr>` | 저장된 원문을 `quote … untrusted` 봉투에 담아 (`--from N`·`--lines N`, 기본 200줄) |
+| `brain refresh [--wait]` | server mode: 팀 brain이 낡았으면 운영 repo의 `brain-publish`를 dispatch하고 한 호출에 80초까지 기다림. exit 0 fresh · 75 아직 도는 중 · 1 실패 · 2 불가 (아래 "팀 brain 읽기와 refresh") |
+| `brain ci-publish` | CI 전용: `brain-publish.yml` · `brain-bootstrap.yml`의 publish 단계 (`--source DIR --mirror DIR [--full] [--mode normal\|bootstrap]`) |
 
 모든 명령에 `--json`이 있습니다. 라우팅 규칙(언제 무엇을 부르고, 언제 부르지 않나)은 [SKILL.md](SKILL.md)에 있습니다.
 
@@ -91,14 +93,23 @@ brain why "how is IOBuf meant to be used?"     # 문서 1건뿐: 지식 공백
 
 소스 repo(서비스)에는 파일도 비밀도 넣지 않습니다. 쓰기 비밀은 별도의 비공개 **운영 repo**에만 둡니다.
 
-1. 운영 repo를 비공개로 만듭니다. 이 kit를 고정한 커밋에서 `skills/codebase-brain/`에 복사하고, `ci/brain-publish.yml`을 `.github/workflows/brain-publish.yml`로 복사합니다. 파일 안의 `BRAIN_SOURCE_REPO`를 소스 repo(`owner/name`)로 바꿉니다. 소스 repo는 입력으로 받지 않습니다(R1).
+1. 운영 repo를 비공개로 만듭니다. 이 kit를 고정한 커밋에서 `skills/codebase-brain/`에 복사하고, workflow 두 개를 복사합니다: `ci/brain-publish.yml` → `.github/workflows/brain-publish.yml`(매일 · dispatch), `ci/brain-bootstrap.yml` → `.github/workflows/brain-bootstrap.yml`(전체 publish, 게이트). 두 파일 안의 `BRAIN_SOURCE_REPO`를 소스 repo(`owner/name`)로 바꿉니다. 소스 repo는 입력으로 받지 않습니다(R1). workflow에는 입력이 없습니다. dispatch 권한으로는 publish 내용을 바꿀 수 없습니다.
 2. 쓰기 권한은 관리자만 갖게 합니다. 운영 repo에 push할 수 있는 사람은 workflow를 고쳐 비밀을 꺼낼 수 있기 때문입니다. Actions 설정에서 fork pull request에 secret을 보내는 옵션을 끕니다. workflow에는 `pull_request` trigger가 없습니다.
 3. owner가 migration을 돌려 schema와 `brain_writer` · `brain_reader` role을 만듭니다(비밀번호는 migration이 파일에서 읽어 정합니다).
 4. 운영 repo의 Actions secret 두 개를 만듭니다.
    - `BRAIN_WRITER_URL`: `brain_writer`의 연결 문자열. direct endpoint(호스트에 `-pooler`가 없는 것)를 씁니다. 이 값은 이곳에만 둡니다.
    - `BRAIN_SOURCE_TOKEN`: 소스 repo만 읽는 fine-grained token(Contents · Pull requests · Issues: read). checkout과 GitHub 수집에 같이 씁니다. `GITHUB_TOKEN`은 다른 비공개 repo를 읽지 못합니다.
-5. Actions 탭에서 `brain-publish`를 `main`에서 수동으로 돌립니다. 첫 실행은 `full`을 켭니다. GitHub를 처음부터 전부 받으므로(PR 1,300개 repo에서 약 2,700 호출, rate limit에 따라 수십 분) `full`일 때만 job 상한이 330분이고, 평소에는 30분입니다. 첫 실행이 데이터베이스를 소스 repo의 숫자 id에 묶습니다(`brain.binding`). 그 뒤 다른 repo를 가리키는 실행은 아무것도 쓰지 않습니다(V22).
-6. sanitize 규칙이 바뀐 kit로 올린 뒤에도 한 번 `full`을 켜고 돌립니다(GitHub를 전부 다시 받아 새 규칙으로 정리, R15). 켜지 않으면 publish가 거부됩니다.
+5. 첫 publish는 `brain-bootstrap`으로 합니다. 관리자가 게이트를 열고, `main`에서 dispatch하고, gate 단계가 지나면 닫습니다. 게이트는 repo 변수 `BRAIN_BOOTSTRAP_UNTIL`(UTC)이 지금보다 늦고 2시간 이내일 때만 열립니다. 변수를 쓰려면 Variables 쓰기 권한이 필요하고, 에이전트의 dispatch token에는 그 권한이 없습니다.
+   ```bash
+   gh variable set BRAIN_BOOTSTRAP_UNTIL --repo <운영 repo> --body 2026-01-01T13:00:00Z   # 지금부터 2시간 이내의 UTC 시각
+   gh workflow run brain-bootstrap.yml --repo <운영 repo> --ref main
+   gh variable delete BRAIN_BOOTSTRAP_UNTIL --repo <운영 repo>                        # gate 단계가 지난 뒤
+   ```
+   bootstrap은 GitHub를 처음부터 전부 받습니다(PR 1,300개 repo에서 약 2,700 호출, rate limit에 따라 수십 분). job 상한은 360분(publish 단계 350분)이고, 평소 `brain-publish`는 20분입니다. 첫 실행이 데이터베이스를 소스 repo의 숫자 id와 `brain-publish.yml`(refresh가 dispatch하는 workflow)에 묶습니다(`brain.binding`). 그 뒤 다른 repo를 가리키는 실행은 아무것도 쓰지 않습니다(V22). 그다음부터는 `brain-publish`가 매일(19:17 UTC) 돌고, 에이전트의 `brain refresh`가 필요할 때 dispatch합니다. 같은 concurrency group이라 writer는 한 번에 하나만 돕니다.
+6. 소스 repo의 `main`을 force-push했거나(마지막 run이 더는 조상이 아님, R9), sanitize 규칙이 바뀐 kit로 올렸으면(R15) 5번처럼 bootstrap을 한 번 더 돌립니다. 돌리지 않으면 `brain-publish`가 거부됩니다.
+7. 에이전트(개발자 노트북)에는 두 값만 줍니다. 쓰기 비밀은 주지 않습니다.
+   - `BRAIN_READER_URL`: `brain_reader`의 연결 문자열. 환경 변수나 kit의 `.env.local`에 둡니다(`DATABASE_URL`은 읽지 않음).
+   - `BRAIN_DISPATCH_TOKEN`: 운영 repo 하나만, Actions: read and write만 가진 fine-grained token(Contents · Secrets · Variables 없음). `brain-publish`를 시작하고 run 상태를 읽을 수 있을 뿐, publish 내용을 바꾸거나 bootstrap 게이트를 열 수 없습니다. 없으면 `brain refresh`는 exit 2로 끝나고, 다른 토큰(`gh auth token` 등)으로 대신하지 않습니다.
 
 publish 단계는 attempt 기록 → mirror 확인(R3) → `brain build` · `brain sync` → delta와 업로드 전 비밀 검사(R16) → 한 트랜잭션입니다. build와 sync는 자식 프로세스에서 돕니다. 자식에게는 `BRAIN_WRITER_URL`을 주지 않습니다. 소스 읽기 token은 sync만 `GH_TOKEN`으로 받습니다. 자식은 `BRAIN_TYPESCRIPT=kit`으로 kit의 TypeScript만 씁니다. 소스 repo에 들어 있는 `typescript`를 부르면 그 repo의 코드가 쓰기 비밀 옆에서 실행되기 때문입니다. 종료 코드(contract `CI_EXIT`): 0 성공(A5로 건너뛴 run 포함), 1 실패(attempt에 단계와 `단계:종류`가 남음, 데이터는 그대로), 2 사용법 오류(시작 전, attempt 없음), 3 확인 실패(데이터는 커밋됨, attempt는 ok), 4 COMMIT 결과를 모름(다시 돌리기 전에 확인).
 
@@ -124,6 +135,18 @@ jobs:
 - `BRAIN_WRITER_URL`은 repo secret이 아니라 **environment secret**으로 둡니다. environment(예: `brain`)의 deployment branch를 `main` 하나로 제한하고 job에 `environment: brain`을 붙입니다. repo secret으로 두면 아무 브랜치에 push한 workflow가 읽을 수 있습니다.
 - 비공개 repo의 environment는 GitHub Pro · Team · Enterprise에서만 쓸 수 있습니다. environment의 required reviewers는 비공개 repo에서 Enterprise에만 있습니다. Free 플랜의 비공개 repo라면 운영 repo 방식을 쓰세요.
 - `main`에 branch protection(리뷰 필수, force-push 금지)을 겁니다. `BRAIN_TYPESCRIPT=kit`은 이 방식에서도 그대로 필요합니다.
+
+## 팀 brain 읽기와 refresh (Phase 3)
+
+server mode의 모든 답 footer는 답이 읽은 run과 그 brain이 `origin`의 `main`보다 얼마나 낡았는지를 보여 줍니다. 설계: [docs/phase3-design.md](../../docs/phase3-design.md) §6.5–6.6.
+
+```text
+  freshness: brain data: run 42 @9f3c2e1a (published 3h ago) · 3 commits behind main · github as of 27h ago (stale) · last attempt FAILED 40m ago (sync) · code @9f3c2e1a · HEAD @4d5e6f70 · 3 commits behind
+```
+
+- 네 칸: code(`= main` · `N commits behind main` · `differs from main`, `git ls-remote origin`과 로컬 git 객체), memory(`github as of <나이> ago`, 24시간이 넘으면 `(stale)`, 없으면 `github never synced`; 나이는 DB 시계), activity(`refresh queued` · `refresh running`), last(마지막 실행이 실패 · 중단이면 표시). 읽지 못한 칸은 `(freshness unknown)`입니다. 답마다 reader의 SELECT 하나와 `ls-remote` 한 번(8초 상한)을 더 씁니다. Actions API는 `brain status`와 `brain refresh`만 읽습니다.
+- `brain refresh`: 이미 fresh(`= main`, 24시간 이내)면 바로 exit 0입니다. 낡았으면 진행 중인 run을 기다리거나 `brain-publish`를 dispatch하고, 서버 상태가 완료 조건(최신 run 커밋 = 확인하는 순간의 `main`, GitHub 시각이 시작 때보다 뒤, 24시간 이내)을 채울 때 exit 0입니다. 어느 Actions run이 publish했는지는 따지지 않습니다. 한 호출은 80초 안에 끝나고(아직이면 exit 75, `brain refresh --wait`로 이어 감), 처음 호출부터 15분이 지나면 exit 1로 멈춥니다. 같은 `main`으로 15분 안에 실패한 run이 있으면 다시 dispatch하지 않습니다(cooldown, exit 1). 이어 받기 상태는 `~/.cache/brain/refresh/<source repo id>.json`(0600, 잠금)에 둡니다. refresh는 brain DB에 쓰지 않습니다.
+- SKILL.md 규칙 10: footer에 `behind main` · `differs from main` · `(stale)` · `never synced`가 있으면 refresh 뒤에 답하고, exit 1 · 2면 낡은 데이터라고 사용자에게 밝힙니다.
 
 ## 한계
 

@@ -31,16 +31,17 @@ const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 /**
  * @param {{ wait?: boolean, now?: () => number, statePath: string, reader: { query(sql: string, params?: unknown[]): Promise<{ rows: any[] }> },
  *   actions: import('./gh-actions.mjs').ActionsClient | null, repoDir: string, env?: Record<string, string|undefined>,
- *   sleep?: (ms: number) => Promise<void>, pollMs?: number }} opts
+ *   sleep?: (ms: number) => Promise<void>, pollMs?: number, start?: number }} opts
  *   wait: --wait. F11 continues an existing state file with or without it and starts a new refresh without a file, so
  *   it changes nothing here. env: BRAIN_REFRESH_CALL_S (may only shorten the 80 s call) and the env of git.
+ *   start: when the call began, in now() ms (default now()): the CLI connects to the reader first, inside the budget.
  *   sleep / pollMs: test seams.
  * @returns {Promise<{ exit: 0|1|2|75, message: string, runId: number|null }>}
  *   runId: the brain run on exit 0, otherwise the Actions run being waited for (null when unknown), as in the messages
  */
 export async function refresh({ wait: _wait = false, now = Date.now, statePath, reader, actions, repoDir, env = process.env,
-  sleep = realSleep, pollMs = POLL_MS }) {
-  const callStart = now();
+  sleep = realSleep, pollMs = POLL_MS, start }) {
+  const callStart = start ?? now();
   const o = { now, statePath, reader, actions, repoDir, env, sleep, pollMs, callStart, callEnd: callStart + callBudget(env) };
   mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
   try {
@@ -53,7 +54,8 @@ export async function refresh({ wait: _wait = false, now = Date.now, statePath, 
   }
 }
 
-function callBudget(env) {
+/** The call budget (F8): 80 s, or less with BRAIN_REFRESH_CALL_S. */
+export function callBudget(env) {
   const s = Number(env.BRAIN_REFRESH_CALL_S);
   return Number.isFinite(s) && s > 0 ? Math.min(LIM.callMs, s * 1000) : LIM.callMs;
 }

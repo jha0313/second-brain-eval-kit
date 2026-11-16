@@ -26,11 +26,16 @@ import { sqliteStore } from './store/sqlite.mjs';
 import { readerUrl, secretsOf, connectReader, ensureMirror, mirrorDir, sameRun } from './store/server.mjs';
 import { BrainError } from './errors.mjs';
 import { git, gitEnv } from './files.mjs';
+import { staleness, footerCells, footerLine, destroyReader, withDeadline } from './pg/status.mjs';
+import { refresh, callBudget } from './refresh.mjs';
+import { actionsFromEnv } from './gh-actions.mjs';
+import { FOOTER_PHRASES, REFRESH_EXIT, REFRESH_LIMITS, REFRESH_MESSAGES, refreshStatePath, ageText } from './pg/contract.mjs';
 
 const HELP = `brain — codebase map + memory (prototype)
 
   brain build <repo> [--db F] [--vault DIR] [--include-root DIR] [--no-knowledge] [--if-stale]
   brain status                         index commit, age, files changed since, coverage
+                                       (server mode: the run, its commit and GitHub state, and how stale it is)
   brain find <name|path>               symbols and files → IDs (path#Name)
   brain refs <target>                  every use site (file targets: every importer)
   brain callers <target>               call / new / render sites, grouped by enclosing symbol
@@ -53,6 +58,14 @@ const HELP = `brain — codebase map + memory (prototype)
           search · get · source read the server; the map commands read a local mirror of the same run
           --as-of run:N | commit:SHA | YYYY-MM-DD[+hh:mm]   an earlier run · get lists revisions, source <ptr>@r<n> reads one
           --local: the local index instead · build and sync write only in local mode (CI writes the team brain)
+          every answer's footer: brain data: run N · = main | N commits behind main | differs from main ·
+          github as of <age> ago [(stale)] | github never synced · refresh running · last attempt FAILED …
+  brain refresh [--wait]               a footer says behind main, differs from main, (stale) or never synced: start the
+                                       ops repo's brain-publish (BRAIN_DISPATCH_TOKEN) and wait at most 80 s per call
+          exit 0 fresh (run the brain command again) · 75 still running (call brain refresh --wait) ·
+          1 failed, cooldown or deadline (15 min from the first call) · 2 unavailable (token, permission, GitHub, server)
+  brain ci-publish --source DIR --mirror DIR [--work DIR] [--full] [--mode normal|bootstrap]
+                                       CI only: the publish job of brain-publish.yml / brain-bootstrap.yml (BRAIN_WRITER_URL)
 
   common: --db F (or BRAIN_DB) · --repo DIR · --json · --limit N · --cursor N
           --filter test,page,route,server-action,client,script,generated · --exclude test
@@ -62,7 +75,7 @@ const HELP = `brain — codebase map + memory (prototype)
 const HOME = homedir();
 const tilde = (p) => (p && HOME && (p === HOME || p.startsWith(HOME + '/')) ? '~' + p.slice(HOME.length) : p);
 
-const BOOL = new Set(['json', 'files', 'no-types', 'no-mocks', 'no-knowledge', 'if-stale', 'list', 'open', 'imports', 'help', 'full', 'local']);
+const BOOL = new Set(['json', 'files', 'no-types', 'no-mocks', 'no-knowledge', 'if-stale', 'list', 'open', 'imports', 'help', 'full', 'local', 'wait']);
 
 function parse(argv) {
   const pos = [], opt = { 'include-root': [] };
@@ -88,7 +101,7 @@ const outJson = (o) => write(JSON.stringify(o, (k, v) => (typeof v === 'string' 
 // out() / outJson() write; in server mode a password shorter than MIN_SECRET is refused: it cannot be cut without
 // cutting words)
 let activeToken = null, readerSecrets = [];
-const secrets = () => [activeToken, process.env.GH_TOKEN, process.env.GITHUB_TOKEN].filter(Boolean);
+const secrets = () => [activeToken, process.env.GH_TOKEN, process.env.GITHUB_TOKEN, process.env.BRAIN_DISPATCH_TOKEN].filter(Boolean);
 const MIN_SECRET = 8;
 const cutReader = (s) => readerSecrets.reduce((t, x) => t.split(x).join('[REDACTED:reader-url]'), s);
 const scrub = (s) => safe(sanitizeLine(redactValues(cutReader(String(s ?? '')), secrets())));
@@ -96,9 +109,10 @@ const say = (s) => console.error(scrub(s));
 
 // the checkout we are in: --repo, else the git repo around cwd
 let checkout;
-function here(opt) {
+// timeout: refresh's call budget (git is killed at it)
+function here(opt, timeout) {
   if (opt.repo) return resolve(opt.repo);
-  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv() }).trim(); } catch { return undefined; }
+  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv(), ...(timeout && { timeout }) }).trim(); } catch { return undefined; }
 }
 
 function dbPathFor(opt) {
@@ -115,11 +129,20 @@ const originOf = (dir) => { try { return origin(dir); } catch { return null; } }
 async function serverSession(url, opt) {
   const { client, binding } = await connectReader(url, { origin: originOf(checkout ?? process.cwd()) });
   const store = pgStore(client);
-  try { return { store, binding, at: opt['as-of'] !== undefined ? await store.resolveAsOf(text(opt['as-of'], 'as-of')) : null }; }
+  try { return { store, client, binding, at: opt['as-of'] !== undefined ? await store.resolveAsOf(text(opt['as-of'], 'as-of')) : null }; }
   catch (e) { await store.close(); throw e; }
 }
 function localOnly(opt, what) {
-  if (serverUrl(opt)) throw new BrainError('server-mode', `brain ${what} writes a local index; in server mode (BRAIN_READER_URL is set) only CI writes the team brain — add --local to ${what} a local index`);
+  if (serverUrl(opt)) throw new BrainError('server-mode', `brain ${what} writes a local index; in server mode (BRAIN_READER_URL is set) only CI writes the team brain — brain refresh updates it, or add --local to ${what} a local index`);
+}
+
+// Phase 3 §6.5: the four staleness cells of the newest run, for the footer of every server answer that reads the newest
+// run (an --as-of run is old on purpose). The reader's one SELECT and `git ls-remote origin` only: Actions is read by
+// status and refresh, not by every answer. Bounded: a cell that cannot be read in time is unknown
+const FOOTER_STALENESS_MS = 8000, STATUS_STALENESS_MS = 30_000, LOCAL_GIT_MS = 5000;
+async function cellsOf(s, { actions = null, ms = FOOTER_STALENESS_MS } = {}) {
+  const st = await staleness({ reader: s.client, repoDir: checkout ?? process.cwd(), actions, deadline: Date.now() + ms });
+  return { code: st.code, memory: st.memory, activity: st.activity, last: st.last, run: st.run, cells: footerCells(st), detail: st.detail };
 }
 
 // every read command but status: both stores, refused when written before the current sanitizer. Server mode: the
@@ -145,6 +168,7 @@ async function open(opt) {
         ctx.sync = at.view.sync;
         ctx.at = { asOf: s.at !== null, latest: at.latest };
         guard(ctx);
+        if (s.at === null) ctx.staleness = await cellsOf(s);
         return ctx;
       }
       // another session replaced the mirror between its pull and our open: a newer run (taken as the newest), or
@@ -168,26 +192,29 @@ async function memoryRead(opt, local, server) {
     const ctx = viewContext(view, checkout);
     ctx.at = { asOf: s.at !== null, latest: s.at?.latest ?? view.run };
     guard(ctx);                                         // before anything read is shown
+    if (s.at === null) ctx.staleness = await cellsOf(s);
     return { ctx, res };
   } finally { await s.store.close(); }
 }
 
 // one freshness per answer: the footer prints it; --json carries the Phase 0 fields plus `github`
 const freshFor = (ctx, phase0) => answerFreshness(ctx, { phase0 });
+const cellsJson = (st) => ({ code: st.code, memory: st.memory, activity: st.activity, last: st.last, run: st.run });
 const jsonFresh = (fr) => ({ state: fr.code.state, commit: fr.code.commit, head: fr.code.head, changed: fr.code.changed, files: fr.code.files, github: fr.github,
-  ...(fr.brain && { brain: fr.brain }) });
+  ...(fr.brain && { brain: fr.brain }), ...(fr.staleness && { staleness: cellsJson(fr.staleness) }) });
 // a Phase 0 coverage object (query.mjs coverageFor) as footer coverage
 const covOf = (ctx, cov) => coverage(ctx, { truncated: cov.state === 'truncated', unresolvedLocal: cov.unresolvedLocal });
 
-function staleNote(code, write) {
+// server: the index is the team brain's run, which brain build does not change (the footer says how old the run is)
+function staleNote(code, write, server = false) {
   if (code.state !== 'stale' || !code.head) return;
   const names = code.files.slice(0, 5).map(ident).join(', ') + (code.changed > 5 ? `, +${code.changed - 5} more` : '');   // the files to grep, no extra call
-  write(c.yellow(`  stale: HEAD @${code.head.slice(0, 8)}, ${plural(code.changed, 'file')} changed since the index${names ? ` (${names})` : ''} — grep those, or brain build`));
+  write(c.yellow(`  stale: HEAD @${code.head.slice(0, 8)}, ${plural(code.changed, 'file')} changed since the index${names ? ` (${names})` : ''} — grep those${server ? '' : ', or brain build'}`));
 }
 
 // the end of every text answer, empty ones too: the stale line (when the checkout moved on), then coverage + freshness
 function finish(fr, cov, write = out) {
-  staleNote(fr.code, write);
+  staleNote(fr.code, write, !!fr.brain);
   for (const l of footer({ coverage: cov, freshness: fr })) write(c.dim(l));
 }
 
@@ -284,6 +311,58 @@ function afterSync(codeDbPath) {
   return { code: null, gh, meta: {}, sync: gh ? readSyncState(gh) : null, checkout, codeDbPath, close() { try { gh?.close(); } catch {} } };
 }
 
+// brain status in server mode (Phase 2 §6.4, Phase 3 §6.5): the store's view of the run (the newest, or --as-of) — its
+// commit and GitHub state — and the four staleness cells of the newest run, with Actions when BRAIN_DISPATCH_TOKEN is
+// set. Nothing local is read and no mirror is pulled.
+async function serverStatus(url, opt) {
+  const s = await serverSession(url, opt);
+  try {
+    let at = s.at;
+    if (!at) {
+      try { at = await s.store.resolveAsOf(null); }
+      catch (e) { if (e.code !== 'not-found') throw e; }    // no published run yet
+    }
+    const st = await cellsOf(s, { actions: actionsFromEnv(process.env), ms: STATUS_STALENESS_MS });
+    const P = FOOTER_PHRASES, d = st.detail, v = at?.view ?? null, sy = v?.sync ?? null;
+    const ctx = v ? viewContext(v, checkout) : null;
+    if (ctx) { ctx.at = { asOf: s.at !== null, latest: at.latest }; if (s.at === null) ctx.staleness = st; }
+    const fr = ctx && freshFor(ctx), cov = ctx && coverage(ctx, {});
+    const actionsNote = d.actions.ok ? 'read' : d.actions.error === 'no-token' ? 'not read (no BRAIN_DISPATCH_TOKEN): activity and last are the server\'s record only'
+      : d.actions.error === 'no-binding' ? 'not read (the server brain has no binding)' : `not read (${safe(d.actions.error)}): activity and last are the server's record only`;
+    if (opt.json) {
+      ctx?.close();
+      return outJson({ mode: 'server', repo: s.binding.repo, run: v && { run: v.run, commit: v.runCommit, publishedAt: v.publishedAt, asOf: s.at !== null, latest: at.latest },
+        sync: sy && { cursor: sy.cursor ?? null, lastOkAt: sy.last_ok_at ?? null, lastFullAt: sy.last_full_at ?? null },
+        staleness: cellsJson(st), checks: { db: d.db.ok ? 'ok' : d.db.error, git: d.git.ok ? 'ok' : d.git.error, actions: d.actions.ok ? 'ok' : d.actions.error },
+        ...(ctx && { coverage: cov, freshness: jsonFresh(fr) }) });
+    }
+    const ago = (ms) => `${ageText(ms ?? 0)} ago`;
+    const when = (iso) => (iso ? `${safe(iso.slice(0, 16).replace('T', ' '))}Z` : 'never');
+    const gitWhy = { 'ls-remote': 'failed', timeout: 'timed out', 'no-main': 'has no main' };
+    const code = st.code.state === 'behind' ? P.code.behind(st.code.behind) : st.code.state === 'unknown'
+      ? `unknown (${d.db.ok ? `git ls-remote origin ${gitWhy[d.git.error] ?? safe(d.git.error)}` : 'server not read'})` : P.code[st.code.state];
+    const memory = st.memory.state === 'fresh' || st.memory.state === 'old' ? P.memory[st.memory.state](ageText(st.memory.ageMs ?? 0))
+      : st.memory.state === 'unknown' ? `unknown${d.db.ok ? ' (the GitHub time is not a date)' : ' (server not read)'}` : P.memory.never;
+    const activity = st.activity.state === 'idle' ? 'idle' : `${st.activity.state === 'queued' ? P.activity.queued : P.activity.running(st.activity.stage)}`
+      + `${st.activity.runId ? ` · actions run ${st.activity.runId}` : ''}${st.activity.sinceMs != null ? ` · ${ago(st.activity.sinceMs)}` : ''}`;
+    const last = !st.last ? 'none' : `${st.last.state}${st.last.stage ? ` (${safe(st.last.stage)})` : ''} ${ago(st.last.agoMs)}`;
+    out(`${c.bold('brain status')}  server · ${safe(s.binding.repo)} (the team brain, read-only)`);
+    out(table(['', ''], [
+      ['run', v ? `${v.run} @${String(v.runCommit).slice(0, 8)} · published ${v.publishedAt ? `${when(v.publishedAt)} (${ago(Date.now() - Date.parse(v.publishedAt))})` : '?'}`
+        + (s.at !== null ? ` · as-of · latest run ${at.latest}` : '') : `${P.noRun} — ask an admin to run the bootstrap (brain-bootstrap.yml)`],
+      ['github', sy ? `data as of ${when(sy.cursor)} · last ok ${when(sy.last_ok_at)} · full ${when(sy.last_full_at)}` : 'never synced'],
+      ['code', `${code}${st.code.mainHead ? ` (main @${st.code.mainHead.slice(0, 8)})` : ''}`],
+      ['memory', memory],
+      ['activity', activity],
+      ['last', last],
+      ['actions', actionsNote],
+    ]));
+    if (!ctx) return out(c.dim(`  freshness: ${footerLine(st)}`));
+    for (const l of footer({ coverage: cov, freshness: fr })) out(c.dim(l));
+    ctx.close();
+  } finally { await s.store.close(); }
+}
+
 const cmds = {
   async build({ pos, opt }) {
     localOnly(opt, 'build');
@@ -328,7 +407,9 @@ const cmds = {
     report({ skipped: false, ...r });
   },
 
-  status({ opt }) {
+  async status({ opt }) {
+    const url = serverUrl(opt);
+    if (url) return serverStatus(url, opt);
     const ctx = openContext({ codeDbPath: dbPathFor(opt), checkout }), db = ctx.code;
     const f = freshness(db, checkout), m = f.meta, s = m.stats;
     const fr = freshFor(ctx, f), cov = coverage(ctx, { unresolvedLocal: m.coverage?.unresolvedLocal });
@@ -511,6 +592,49 @@ const cmds = {
     finish(freshFor(ctx), covOf(ctx, coverageFor(db, { truncated: false })), say);
   },
 
+  // ---------- Phase 3: the team brain's refresh, and the CI publish job ----------
+
+  // §6.6: one line on stdout (--json: { exit, message, runId }), exit REFRESH_EXIT. Server mode only.
+  async refresh({ opt }) {
+    const start = Date.now(), end = start + callBudget(process.env);
+    const left = (cap) => Math.max(1, Math.min(cap, end - Date.now()));
+    const done = (r) => { if (opt.json) outJson(r); else out(r.message); process.exit(r.exit); };
+    const failed = (msg) => done({ exit: REFRESH_EXIT.failed, message: REFRESH_MESSAGES.failed(msg), runId: null });
+    const unavailable = (message) => done({ exit: REFRESH_EXIT.unavailable, message, runId: null });
+    const url = serverUrl(opt);
+    if (!url) return unavailable('refresh unavailable: local mode (no BRAIN_READER_URL) — brain build and brain sync update a local index');
+    // F8: all of it inside the call budget. The local git reads (the checkout, its origin) are killed at their timeout;
+    // connect + the reader check run under the client-side timer (a connection that stalls past it ends with this
+    // process). Every outcome keeps refresh's one-line form: a refusal (not-reader, wrong-repo) is exit 2
+    checkout = here(opt, left(LOCAL_GIT_MS));
+    let origin = null;
+    try { origin = parseRemote(git(checkout ?? process.cwd(), ['remote', 'get-url', 'origin'], { timeout: left(LOCAL_GIT_MS) })); } catch { /* no origin */ }
+    let conn;
+    try {
+      conn = await withDeadline(connectReader(url, { origin }), left(REFRESH_LIMITS.httpMaxMs));
+    } catch (e) {
+      const msg = scrub(e?.message ?? e);
+      if (['server', 'timeout'].includes(e?.code)) return unavailable(REFRESH_MESSAGES.noServer);
+      if (['not-reader', 'wrong-repo'].includes(e?.code)) return unavailable(`refresh unavailable: ${msg}`);
+      return failed(e?.code === 'no-brain' ? `${msg} — ask an admin to run the bootstrap (brain-bootstrap.yml)` : msg);
+    }
+    let r;
+    try {
+      r = await refresh({ wait: !!opt.wait, start, statePath: refreshStatePath(homedir(), conn.binding.id), reader: conn.client,
+        actions: actionsFromEnv(process.env), repoDir: checkout ?? process.cwd(), env: process.env });
+    } catch (e) { r = { exit: REFRESH_EXIT.failed, message: REFRESH_MESSAGES.failed(scrub(e?.message ?? e)), runId: null }; }
+    finally { destroyReader(conn.client); }
+    done(r);
+  },
+
+  // S2: the publish job (ci/brain-publish.yml, ci/brain-bootstrap.yml). Its env passes through whole (BRAIN_WRITER_URL,
+  // BRAIN_PUBLISH_WORKFLOW, …): ci-publish itself decides what its children see. Exit: contract CI_EXIT
+  async 'ci-publish'({ opt }) {
+    const { ciPublish } = await import('./pg/ci-publish.mjs');
+    process.exit(await ciPublish({ source: opt.source, mirror: opt.mirror, work: opt.work ?? null, full: !!opt.full,
+      mode: 'mode' in opt ? opt.mode ?? '' : 'normal', env: process.env }));
+  },
+
   // ---------- Phase 1: GitHub memory ----------
 
   async sync({ opt }) {
@@ -577,19 +701,24 @@ process.stdout.on('error', (e) => { if (e.code === 'EPIPE') process.exit(0); thr
 const { pos, opt } = parse(process.argv.slice(2));
 const cmd = pos.shift();
 if (!cmd || opt.help || !cmds[cmd]) { out(HELP); process.exit(cmd && !opt.help ? 1 : 0); }
-if (cmd !== 'build') checkout = here(opt);
+// ci-publish runs in the ops repo's CI: it reads no checkout around cwd and never the reader URL. refresh reads the
+// checkout itself, inside its call budget
+if (!['build', 'ci-publish', 'refresh'].includes(cmd)) checkout = here(opt);
 try {
-  const reader = secretsOf(readerUrl() ?? '');            // before anything can echo input; also as a JSON string holds them
-  if (!opt.local && reader.some((x) => x.length < MIN_SECRET)) {
-    throw new BrainError('not-reader', `the password in BRAIN_READER_URL is shorter than ${MIN_SECRET} characters, too short to keep out of output: use the reader password migrate set`);
+  if (cmd !== 'ci-publish') {
+    const reader = secretsOf(readerUrl() ?? '');            // before anything can echo input; also as a JSON string holds them
+    if (!opt.local && reader.some((x) => x.length < MIN_SECRET)) {
+      throw new BrainError('not-reader', `the password in BRAIN_READER_URL is shorter than ${MIN_SECRET} characters, too short to keep out of output: use the reader password migrate set`);
+    }
+    readerSecrets = [...new Set(reader.filter((x) => x.length >= MIN_SECRET).flatMap((x) => [x, JSON.stringify(x).slice(1, -1)]))].sort((a, b) => b.length - a.length);
   }
-  readerSecrets = [...new Set(reader.filter((x) => x.length >= MIN_SECRET).flatMap((x) => [x, JSON.stringify(x).slice(1, -1)]))].sort((a, b) => b.length - a.length);
   await cmds[cmd]({ pos, opt });
 }
 catch (e) {
   // an error is not an answer: its code and a masked one-line message, no stack, no token; fail open
   const code = typeof e?.code === 'string' && e.code ? e.code : 'error';
-  const msg = scrub(e?.message ?? e);
+  // a server with no brain yet: only the admin's first publish makes one (never a local build or sync)
+  const msg = scrub(e?.message ?? e) + (code === 'no-brain' ? ' — ask an admin to run the bootstrap (brain-bootstrap.yml)' : '');
   if (opt.json) outJson({ error: msg, code });
   else out(`${c.red('brain error')} (${safe(code)}): ${msg}\n  fail open: continue with grep / your normal tools`);
   process.exit(code === 'lock-busy' ? 3 : ['not-reader', 'wrong-repo'].includes(code) ? 2 : 1);   // 2: a server brain refused (§6.2)
