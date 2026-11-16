@@ -53,15 +53,18 @@ jobs:
         with:
           persist-credentials: false
 
-      # fetch-depth 0: the commit memory needs the history
+      # The whole history of main and no other ref: the commit memory needs that history. fetch-depth 0 would fetch
+      # every branch and tag of the source repo and print their names in this job's log. 2147483647 is git's infinite
+      # depth (a complete, not shallow, history of the one ref). refs/heads/main, not main: checkout fetches an
+      # unqualified name as the patterns main* (branches and tags)
       - name: check out the source repo main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 2
         with:
           repository: ${{ env.BRAIN_SOURCE_REPO }}
-          ref: main
+          ref: refs/heads/main
           path: src-repo
-          fetch-depth: 0
+          fetch-depth: 2147483647
           token: ${{ secrets.BRAIN_SOURCE_TOKEN }}
           persist-credentials: false
 

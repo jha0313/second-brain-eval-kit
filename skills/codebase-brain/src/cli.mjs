@@ -26,7 +26,7 @@ import { sqliteStore } from './store/sqlite.mjs';
 import { readerUrl, secretsOf, connectReader, ensureMirror, mirrorDir, sameRun } from './store/server.mjs';
 import { BrainError } from './errors.mjs';
 import { git, gitEnv } from './files.mjs';
-import { staleness, startMainHead, footerCells, footerLine, destroyReader, withDeadline } from './pg/status.mjs';
+import { staleness, startMainHead, footerCells, footerLine, destroyReader, withDeadline, bootstrapHint } from './pg/status.mjs';
 import { refresh, callBudget } from './refresh.mjs';
 import { actionsFromEnv } from './gh-actions.mjs';
 import { FOOTER_PHRASES, REFRESH_EXIT, REFRESH_LIMITS, REFRESH_MESSAGES, refreshStatePath, ageText } from './pg/contract.mjs';
@@ -359,6 +359,7 @@ async function serverStatus(url, opt) {
     const activity = st.activity.state === 'idle' ? 'idle' : `${st.activity.state === 'queued' ? P.activity.queued : P.activity.running(st.activity.stage)}`
       + `${st.activity.runId ? ` · actions run ${st.activity.runId}` : ''}${st.activity.sinceMs != null ? ` · ${ago(st.activity.sinceMs)}` : ''}`;
     const last = !st.last ? 'none' : `${st.last.state}${st.last.stage ? ` (${safe(st.last.stage)})` : ''} ${ago(st.last.agoMs)}`;
+    const hint = bootstrapHint(d.executions);   // P10: the last attempt failed on a rewritten main
     out(`${c.bold('brain status')}  server · ${safe(s.binding.repo)} (the team brain, read-only)`);
     out(table(['', ''], [
       ['run', v ? `${v.run} @${String(v.runCommit).slice(0, 8)} · published ${v.publishedAt ? `${when(v.publishedAt)} (${ago(Date.now() - Date.parse(v.publishedAt))})` : '?'}`
@@ -368,6 +369,7 @@ async function serverStatus(url, opt) {
       ['memory', memory],
       ['activity', activity],
       ['last', last],
+      ...(hint ? [['next', hint]] : []),
       ['actions', actionsNote],
     ]));
     if (!ctx) return out(c.dim(`  freshness: ${footerLine(st)}`));

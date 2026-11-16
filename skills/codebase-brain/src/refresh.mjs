@@ -10,7 +10,8 @@
 //   now() (P14).
 // - State file (F11, contract RefreshState v 1, mode 0600) written by rename under withWriteLock(<file>); created when
 //   this call dispatches or decides to wait for a run in flight, continued while it exists and the deadline has not
-//   passed (with or without --wait), deleted on exit 0 / 1 / 2. A held lock: no dispatch, exit 75.
+//   passed (with or without --wait), deleted on exit 0 / 1 / 2. A held lock: no dispatch; --wait tries the lock again
+//   within the call budget (then carries on as the holder), otherwise or after that exit 75.
 // - extraDispatches (max 1) covers both the one re-send after a lost dispatch reply (F5, only in a later call) and the
 //   one re-dispatch after main moved (F7): at most two dispatches per refresh.
 import { readFileSync, writeFileSync, renameSync, rmSync, mkdirSync } from 'node:fs';
@@ -20,9 +21,11 @@ import { LockBusyError } from './errors.mjs';
 import { staleness } from './pg/status.mjs';
 import {
   REFRESH_EXIT as EXIT, REFRESH_LIMITS as LIM, REFRESH_MESSAGES as MSG, REFRESH_STATE_VERSION, needsRefresh, ageText,
+  NOT_DESCENDANT_ERROR, BOOTSTRAP_HINT,
 } from './pg/contract.mjs';
 
 const POLL_MS = 10_000;
+const LOCK_POLL_MS = 1_000;      // --wait on a lock held by another refresh on this machine: how often to try it again
 const LOOK_RESERVE_MS = 5_000;   // time kept for the last look of a call
 const NO_PERMISSION = new Set(['auth', 'forbidden', 'not-found']);
 const NOT_TRIED = new Set(['no-token', 'no-binding']);   // status.mjs: Actions not read at all
@@ -31,26 +34,33 @@ const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 /**
  * @param {{ wait?: boolean, now?: () => number, statePath: string, reader: { query(sql: string, params?: unknown[]): Promise<{ rows: any[] }> },
  *   actions: import('./gh-actions.mjs').ActionsClient | null, repoDir: string, env?: Record<string, string|undefined>,
- *   sleep?: (ms: number) => Promise<void>, pollMs?: number, start?: number }} opts
- *   wait: --wait. F11 continues an existing state file with or without it and starts a new refresh without a file, so
- *   it changes nothing here. env: BRAIN_REFRESH_CALL_S (may only shorten the 80 s call) and the env of git.
+ *   sleep?: (ms: number) => Promise<void>, pollMs?: number, lockPollMs?: number, start?: number }} opts
+ *   wait: --wait. F11 continues an existing state file with or without it and starts a new refresh without a file.
+ *   What --wait changes: a lock held by another refresh on this machine is tried again until the call budget (less
+ *   the last look's reserve) ends, instead of an exit 75 at once (S7: a second agent called again every second).
+ *   env: BRAIN_REFRESH_CALL_S (may only shorten the 80 s call) and the env of git.
  *   start: when the call began, in now() ms (default now()): the CLI connects to the reader first, inside the budget.
- *   sleep / pollMs: test seams.
+ *   sleep / pollMs / lockPollMs: test seams.
  * @returns {Promise<{ exit: 0|1|2|75, message: string, runId: number|null }>}
  *   runId: the brain run on exit 0, otherwise the Actions run being waited for (null when unknown), as in the messages
  */
-export async function refresh({ wait: _wait = false, now = Date.now, statePath, reader, actions, repoDir, env = process.env,
-  sleep = realSleep, pollMs = POLL_MS, start }) {
+export async function refresh({ wait = false, now = Date.now, statePath, reader, actions, repoDir, env = process.env,
+  sleep = realSleep, pollMs = POLL_MS, lockPollMs = LOCK_POLL_MS, start }) {
   const callStart = start ?? now();
   const o = { now, statePath, reader, actions, repoDir, env, sleep, pollMs, callStart, callEnd: callStart + callBudget(env) };
   mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
-  try {
-    return (await withWriteLock(statePath, () => locked(o))).value;
-  } catch (e) {
-    if (!(e instanceof LockBusyError)) throw e;
-    // another refresh on this machine holds the lock: read its state only, never dispatch (F2, F11)
-    const st = loadState(statePath, { remove: false });
-    return { exit: EXIT.running, message: MSG.running(st?.runId ?? null, ageText(st ? now() - Date.parse(st.startedAt) : 0), null), runId: st?.runId ?? null };
+  for (;;) {
+    try {
+      return (await withWriteLock(statePath, () => locked(o))).value;   // locked() takes no other lock
+    } catch (e) {
+      if (!(e instanceof LockBusyError)) throw e;
+      // another refresh on this machine holds the lock: never dispatch (F2, F11). --wait: try again while the call
+      // budget lasts, keeping the last look's reserve; then read its state only and exit 75
+      const left = o.callEnd - now() - LOOK_RESERVE_MS;
+      if (wait && left > 0) { await sleep(Math.min(lockPollMs, left)); continue; }
+      const st = loadState(statePath, { remove: false });
+      return { exit: EXIT.running, message: MSG.running(st?.runId ?? null, ageText(st ? now() - Date.parse(st.startedAt) : 0), null), runId: st?.runId ?? null };
+    }
   }
 }
 
@@ -83,7 +93,7 @@ async function locked(o) {
     const inFlight = s.activity.state !== 'idle';
     if (!inFlight) {
       const cd = cooldown(s);
-      if (cd) return finish(o, EXIT.failed, MSG.cooldown(ageText(cd.agoMs), cd.stage), null);
+      if (cd) return finish(o, EXIT.failed, MSG.cooldown(ageText(cd.agoMs), cd.stage, cd.hint), null);
     }
     st = { v: REFRESH_STATE_VERSION, startedAt: iso(o.callStart), deadline: iso(o.callStart + LIM.deadlineMs), baseT: s.detail.githubT,
       baseHead: s.code.mainHead, runId: inFlight ? s.activity.runId : null, dispatchedAt: null, extraDispatches: 0 };
@@ -184,7 +194,7 @@ function inFlightNow(s, st) {
 function failureSince(s, st) {
   const e = s.detail.executions.find((x) => x.ghaRunId >= st.runId && ['failed', 'failed before start', 'abandoned', 'abandoned?', 'outcome unknown'].includes(x.shown));
   if (!e) return null;
-  if (e.shown === 'failed') return `run failed${e.stage ? ` in ${e.stage}` : ''}`;
+  if (e.shown === 'failed') return `run failed${e.stage ? ` in ${e.stage}` : ''}${e.error === NOT_DESCENDANT_ERROR ? `; ${BOOTSTRAP_HINT}` : ''}`;
   if (e.shown === 'failed before start') return 'run failed before start';
   if (e.shown === 'outcome unknown') return 'run outcome unknown';
   return 'run abandoned';
@@ -198,9 +208,9 @@ function cooldown(s) {
   const now = s.detail.nowMs;
   for (const e of s.detail.executions) {
     if (now - e.startedMs >= LIM.cooldownMs) continue;
-    if (e.shown === 'failed before start') return { agoMs: now - e.startedMs, stage: 'prepare' };
+    if (e.shown === 'failed before start') return { agoMs: now - e.startedMs, stage: 'prepare', hint: null };
     if ((e.shown === 'failed' || e.shown === 'abandoned' || e.shown === 'abandoned?') && e.sourceSha === s.code.mainHead) {
-      return { agoMs: now - e.startedMs, stage: e.shown === 'failed' ? e.stage : null };
+      return { agoMs: now - e.startedMs, stage: e.shown === 'failed' ? e.stage : null, hint: e.error === NOT_DESCENDANT_ERROR ? BOOTSTRAP_HINT : null };
     }
   }
   return null;

@@ -14,7 +14,7 @@ import { spawn } from 'node:child_process';
 import { BrainError } from '../errors.mjs';
 import { gitEnv } from '../files.mjs';
 import {
-  MEMORY_FRESH_MS, FOOTER_PHRASES, FRESHNESS_UNKNOWN, ageText, attemptDisplay, REFRESH_LIMITS,
+  MEMORY_FRESH_MS, FOOTER_PHRASES, FRESHNESS_UNKNOWN, ageText, attemptDisplay, REFRESH_LIMITS, NOT_DESCENDANT_ERROR, BOOTSTRAP_HINT,
 } from './contract.mjs';
 
 /** One statement, one snapshot: DB now, the latest run, its GitHub T, the binding and the recent attempts. */
@@ -24,7 +24,7 @@ export const STATUS_SQL = `SELECT floor(extract(epoch FROM now()) * 1000)::float
   (SELECT json_build_object('sourceRepoId', b.source_repo_id, 'opsRepo', b.ops_repo, 'workflow', b.workflow)
      FROM brain.binding b WHERE b.id = 1) AS binding,
   (SELECT coalesce(json_agg(a ORDER BY a."startedMs" DESC), '[]'::json) FROM (
-     SELECT gha_run_id AS "ghaRunId", gha_attempt AS "ghaAttempt", source_sha AS "sourceSha", status, stage,
+     SELECT gha_run_id AS "ghaRunId", gha_attempt AS "ghaAttempt", source_sha AS "sourceSha", status, stage, error,
        floor(extract(epoch FROM started_at) * 1000)::float8 AS "startedMs"
      FROM brain.attempt ORDER BY started_at DESC, attempt_id DESC LIMIT 20) a) AS attempts`;
 
@@ -40,8 +40,9 @@ const LOOKUPS_MAX = 3;   // single-run GETs for running DB attempts that are not
  * @typedef {{ nowMs: number|null, githubT: string|null, binding: { sourceRepoId: number, opsRepo: string, workflow: string }|null,
  *   executions: Execution[], actions: { ok: boolean, error: string|null, runs: object[] }, db: { ok: boolean, error: string|null },
  *   git: { ok: boolean, error: string|null } }} Detail
- * @typedef {{ ghaRunId: number, ghaAttempt: number, shown: string, stage: string|null, sourceSha: string|null,
- *   startedMs: number }} Execution  one Actions attempt, DB and Actions merged (§6.5 table)
+ * @typedef {{ ghaRunId: number, ghaAttempt: number, shown: string, stage: string|null, error: string|null,
+ *   sourceSha: string|null, startedMs: number }} Execution  one Actions attempt, DB and Actions merged (§6.5 table);
+ *   error: attempt.error (`<stage>:<kind>`, R16), null without a DB attempt
  */
 export async function staleness({ reader, repoDir, actions = null, now = Date.now, deadline, env = process.env, mainHead = null }) {
   const end = deadline ?? now() + REFRESH_LIMITS.callMs;
@@ -265,7 +266,7 @@ function mergeExecutions(db, gh) {
   for (const a of db.attempts) {
     const run = gh.ok ? findRun(gh.runs, a) : null;
     const shown = attemptDisplay({ db: a.status, actions: gh.ok ? actionsState(run, a.ghaAttempt) : 'unknown', startedAtMs: a.startedMs, nowMs: db.nowMs });
-    out.push({ ghaRunId: a.ghaRunId, ghaAttempt: a.ghaAttempt, shown, stage: a.stage ?? null, sourceSha: a.sourceSha, startedMs: a.startedMs });
+    out.push({ ghaRunId: a.ghaRunId, ghaAttempt: a.ghaAttempt, shown, stage: a.stage ?? null, error: a.error ?? null, sourceSha: a.sourceSha, startedMs: a.startedMs });
   }
   for (const r of gh.runs) {
     if (db.attempts.some((a) => a.ghaRunId === r.id && a.ghaAttempt === r.runAttempt)) continue;
@@ -276,7 +277,7 @@ function mergeExecutions(db, gh) {
     // replaced while pending: another run was created after this attempt was queued (a re-run is queued at its
     // run_started_at, not at the run's old created_at)
     if (st === 'cancelled' && gh.runs.some((x) => x.id !== r.id && Date.parse(x.createdAt) > startedMs)) continue;
-    out.push({ ghaRunId: r.id, ghaAttempt: r.runAttempt, shown: attemptDisplay({ db: null, actions: st }), stage: null, sourceSha: null, startedMs });
+    out.push({ ghaRunId: r.id, ghaAttempt: r.runAttempt, shown: attemptDisplay({ db: null, actions: st }), stage: null, error: null, sourceSha: null, startedMs });
   }
   return out.sort((x, y) => y.startedMs - x.startedMs || y.ghaRunId - x.ghaRunId);
 }
@@ -300,6 +301,11 @@ async function activityCell(executions, db, gh, actions, left) {
 const stepLabel = (name) => (typeof name === 'string' ? name.replace(/[^\w .:/-]/g, '').trim().slice(0, 40) || null : null);
 
 const END = new Set(['ok', 'skipped', 'failed', 'failed before start', 'abandoned', 'abandoned?', 'outcome unknown']);
+/** P10: BOOTSTRAP_HINT when the last ended attempt (the `last` cell's) failed as not-descendant, else null. */
+export function bootstrapHint(executions) {
+  return executions.find((x) => END.has(x.shown))?.error === NOT_DESCENDANT_ERROR ? BOOTSTRAP_HINT : null;
+}
+
 function lastCell(executions, db) {
   const e = executions.find((x) => END.has(x.shown));
   if (!e) return null;

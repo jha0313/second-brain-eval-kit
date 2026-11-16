@@ -609,7 +609,7 @@ export const REFRESH_MESSAGES = Object.freeze({
   refreshed: (runId) => `refreshed (run ${runId})`,
   // running shows the ACTIONS run id (no brain run exists yet); refreshed shows the BRAIN run id, as in the footer
   running: (actionsRunId, elapsed, stage) => `still running (actions run ${actionsRunId ?? '?'}, ${elapsed}${stage ? `, stage: ${stage}` : ''})`,
-  cooldown: (ago, stage) => `refresh FAILED (cooldown: last attempt failed ${ago} ago${stage ? ` in ${stage}` : ''}; data is stale)`,
+  cooldown: (ago, stage, hint) => `refresh FAILED (cooldown: last attempt failed ${ago} ago${stage ? ` in ${stage}` : ''}; data is stale${hint ? `; ${hint}` : ''})`,
   failed: (reason) => `refresh FAILED (${reason})`,
   mainMoved: 'refresh FAILED (main moved)',
   deadline: 'refresh FAILED (deadline: 15m since the first call)',
@@ -649,6 +649,12 @@ export const ciError = (stage, kind) => {
   if (!CI_STAGES.includes(stage) || !CI_ERROR_KINDS.includes(kind)) fail(`bad ci error ${stage}:${kind}`);
   return `${stage}:${kind}`;
 };
+/**
+ * P10: a normal publish on a rewritten main (the latest run's commit is not an ancestor, R9) fails as this error until
+ * a bootstrap. The publish message, the refresh message and `brain status` then give BOOTSTRAP_HINT (one line).
+ */
+export const NOT_DESCENDANT_ERROR = ciError('publish', 'not-descendant');
+export const BOOTSTRAP_HINT = "main was rewritten (the latest run's commit is not on it): an admin sets BRAIN_BOOTSTRAP_UNTIL (UTC, at most 2 h ahead) and runs brain-bootstrap.yml";
 /** A5 skip: all four must hold. Times are ISO strings from GitHub's clock. */
 export const shouldSkip = ({ firstAttempt, mode, full, latestCommit, sourceCommit, latestT, runCreatedAt, latestTool, tool,
   latestSanitize, sanitize }) =>

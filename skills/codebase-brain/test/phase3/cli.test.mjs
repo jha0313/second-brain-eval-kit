@@ -16,7 +16,7 @@ import { footer, guard } from '../../src/answer.mjs';
 import { GuardError } from '../../src/errors.mjs';
 import { runGit } from '../../src/pg/status.mjs';
 import { withWriteLock } from '../../src/gh-schema.mjs';
-import { REFRESH_MESSAGES as MSG, REFRESH_TRIGGERS } from '../../src/pg/contract.mjs';
+import { REFRESH_MESSAGES as MSG, REFRESH_TRIGGERS, BOOTSTRAP_HINT } from '../../src/pg/contract.mjs';
 import { SANITIZE_VERSION } from '../../src/sanitize.mjs';
 import { tempDir, stallingPgServer, FAKE_TOKEN } from './stub.mjs';
 
@@ -335,5 +335,22 @@ describe('Neon: server mode through bin/brain', { skip: NEON ? false : 'set BRAI
     assert.ok(!(r.stdout + r.stderr).includes(FAKE_TOKEN));
     assert.ok(existsSync(path), 'a busy lock leaves the other refresh\'s state alone');
     assert.equal(existsSync(join(stateDir(), '1.json')), false);
+  });
+
+  test('S7 / P10: the last attempt failed as not-descendant -> brain status gives the bootstrap hint in one row', async () => {
+    const before = await run(['status']);
+    assert.doesNotMatch(before.stdout, /^ *next /m);
+    // what ci-publish records for a normal publish on a rewritten main (the writer: insert running, then end it once)
+    const id = (await b.query('writer', "INSERT INTO brain.attempt (gha_run_id, gha_attempt, source_sha, base_run) VALUES (991, 1, $1, 2) RETURNING attempt_id", [OTHER])).rows[0].attempt_id;
+    await b.query('writer', "UPDATE brain.attempt SET status = 'failed', stage = 'publish', error = 'publish:not-descendant', finished_at = now() WHERE attempt_id = $1", [id]);
+    const r = await run(['status'], { main: OTHER });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    noSecret(r);
+    assert.match(r.stdout, /last +failed \(publish\) \d+[smh] ago$/m);
+    const rows = r.stdout.split('\n').filter((l) => /^ *next /.test(l));
+    assert.equal(rows.length, 1, r.stdout);
+    assert.ok(rows[0].includes(BOOTSTRAP_HINT), r.stdout);
+    const j = JSON.parse((await run(['status', '--json'], { main: OTHER })).stdout);
+    assert.equal(j.staleness.last.state, 'failed');
   });
 });
