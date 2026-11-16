@@ -5,8 +5,12 @@
 //   queries: a JSON array of argv arrays after `brain`, e.g. [["refs", "src/x.ts#y"], ["why", "a question"]]. Only the
 //   read commands below; a query may not carry --db, --repo, --local or --json: the harness puts them first, so no option
 //   of the query can take one of them as its value.
-//   The child gets no BRAIN_READER_URL or BRAIN_DB, and runs with --local. The kit's own .env.local is still read for
-//   the reader secrets the CLI cuts out of its output, so the harness refuses to run while that file names a reader URL.
+//   --help is refused too (it answers before either file is opened).
+//   The child's environment is PATH, HOME, TMPDIR, LANG and LC_ALL only: no reader URL, no BRAIN_DB, and no GitHub token
+//   (the CLI cuts every token it is given out of its output, which could make two outputs equal). Git runs with
+//   GIT_NO_LAZY_FETCH=1 and GIT_OPTIONAL_LOCKS=0: the freshness checks never fetch and never rewrite .git/index.
+//   The kit's own .env.local is read by the CLI even with --local (its reader secrets are cut out the same way), so the
+//   harness refuses to run while that file names a reader URL.
 // Normalization (§7.2): the keys `ms` and `freshness` are dropped at every depth; key order is ignored. Each query is:
 //   same     equal after normalization, list order included
 //   order    equal only when every list is compared as a multiset (a list whose order is not defined)
@@ -23,7 +27,8 @@ import { parseArgs } from 'node:util';
 
 const BRAIN = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'bin', 'brain');
 export const COMMANDS = new Set(['find', 'refs', 'callers', 'impact', 'deps', 'shared', 'why']);   // they read code.db only
-const OWN = ['--db', '--repo', '--local', '--json'];
+const OWN = ['--db', '--repo', '--local', '--json', '--help'];
+const ENV_KEEP = ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL'];
 const DROP = new Set(['ms', 'freshness']);
 const canon = (v) => JSON.stringify(v);
 const byCanon = (x, y) => { const a = canon(x), b = canon(y); return a < b ? -1 : a > b ? 1 : 0; };
@@ -78,7 +83,14 @@ export function compare(ra, rb) {
   return { class: 'differs', diffs: diffs(ua, ub) };
 }
 
-const childEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'BRAIN_READER_URL' && k !== 'BRAIN_DB'));
+const childEnv = () => ({ ...Object.fromEntries(ENV_KEEP.filter((k) => process.env[k] !== undefined).map((k) => [k, process.env[k]])),
+  NO_COLOR: '1', GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' });
+
+/** why the kit's CLI would alter what it prints (null: it would not): its .env.local names a reader URL */
+export async function envFileProblem() {
+  const { readerUrl, ENV_FILE } = await import('../../src/store/server.mjs');
+  return readerUrl({}, ENV_FILE) ? `${ENV_FILE} names a BRAIN_READER_URL: the CLI would cut its secrets out of the outputs compared; move it away first` : null;
+}
 
 /** why a query may not run (null: it may): a read command, none of the harness's own flags */
 export function badQuery(q) {
@@ -93,7 +105,7 @@ export const argvFor = (db, repo, q) => ['--db', db, '--repo', repo, '--local', 
 /** one query on one file → { exit, json, text }; text (stdout + stderr, db path replaced) only when stdout is not JSON */
 export function runQuery(db, repo, argv) {
   return new Promise((done) => {
-    execFile(BRAIN, argvFor(db, repo, argv), { env: { ...childEnv(), NO_COLOR: '1' }, maxBuffer: 1 << 30, timeout: 300_000 },
+    execFile(BRAIN, argvFor(db, repo, argv), { env: childEnv(), maxBuffer: 1 << 30, timeout: 300_000 },
       (err, stdout, stderr) => {
         const exit = err ? (typeof err.code === 'number' ? err.code : String(err.signal ?? err.code)) : 0;
         let json = null;
@@ -108,6 +120,8 @@ export async function parity({ a, b, repo, queries, jobs = 4 }) {
   const bad = queries.map(badQuery).findIndex(Boolean);
   if (bad >= 0) throw new Error(`query #${bad}: ${badQuery(queries[bad])}`);
   if (!Number.isInteger(jobs) || jobs < 1 || jobs > 64) throw new Error(`jobs must be 1..64, not ${jobs}`);
+  const env = await envFileProblem();
+  if (env) throw new Error(env);
   const results = new Array(queries.length);
   let next = 0;
   const worker = async () => {
@@ -130,8 +144,8 @@ async function main() {
     for (const k of ['a', 'b', 'repo', 'queries']) if (!opt[k]) throw new Error(`--${k} is required`);
     for (const k of ['a', 'b', 'repo', 'queries']) if (!existsSync(opt[k])) throw new Error(`--${k}: no such file`);
     if (opt.jobs !== undefined && !/^[1-9]\d?$/.test(opt.jobs)) throw new Error('--jobs must be 1..64');
-    const { readerUrl, ENV_FILE } = await import('../../src/store/server.mjs');
-    if (readerUrl({}, ENV_FILE)) throw new Error(`${ENV_FILE} names a BRAIN_READER_URL: the CLI would cut its secrets out of the outputs compared; move it away first`);
+    const env = await envFileProblem();
+    if (env) throw new Error(env);
   } catch (e) {
     console.error(`parity: ${e.message}\nusage: node test/pg/parity.mjs --a <code.db> --b <brain.db> --repo <checkout> --queries <file.json> [--out <file.json>] [--jobs N]`);
     process.exit(2);

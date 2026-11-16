@@ -7,7 +7,7 @@ import { copyFileSync, existsSync, writeFileSync, readFileSync, statSync } from 
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normalize, unordered, diffs, compare, parity, badQuery, argvFor } from './parity.mjs';
+import { normalize, unordered, diffs, compare, parity, badQuery, argvFor, runQuery } from './parity.mjs';
 import { fixtureRepo } from '../phase1/helpers.mjs';
 
 delete process.env.BRAIN_READER_URL;                                     // the fixture build runs in local mode
@@ -39,7 +39,7 @@ test('compare: same, order, differs (lists as multisets, keys, scalars, exit cod
 test('queries: read commands only, never the harness flags; the harness flags come first and include --local', () => {
   assert.equal(badQuery(['refs', 'src/x.ts#y', '--limit', '10']), null);
   for (const q of [['build', '.'], ['sync'], ['viz', 'x', '--out', 'f'], ['search', 'x'], [], ['find', 1], 'find',
-    ['find', 'x', '--repo'], ['find', 'x', '--db', 'f'], ['find', 'x', '--db=f'], ['find', 'x', '--local'], ['find', 'x', '--json']]) {
+    ['find', 'x', '--repo'], ['find', 'x', '--db', 'f'], ['find', 'x', '--db=f'], ['find', 'x', '--local'], ['find', 'x', '--json'], ['find', 'x', '--help']]) {
     assert.ok(badQuery(q), JSON.stringify(q));
   }
   const argv = argvFor('/a.db', '/repo', ['find', 'x', '--limit']);
@@ -62,7 +62,11 @@ test('the CLI on two copies of the fixture: equal copies are all same (exit 0); 
   writeFileSync(qfile, JSON.stringify(queries));
 
   process.env.BRAIN_READER_URL = 'postgresql://brain_reader:' + 'q9fake' + 'pass' + '@127.0.0.1:9/none';   // never reached: stripped, and --local
+  process.env.GH_TOKEN = 'no/such/file.ts#nothing';                      // the CLI cuts its tokens out of error text: not passed on
   const same = await parity({ a, b, repo, queries, jobs: 2 });
+  const miss = await runQuery(a, repo, queries.at(-1));
+  const said = JSON.stringify(miss.json ?? miss.text);
+  assert.ok(miss.exit !== 0 && said.includes('no/such/file.ts#nothing'), `the error names the target, not cut as a token: ${said}`);
   assert.deepEqual(same.summary, { same: queries.length, order: 0, differs: 0 }, JSON.stringify(same.results.filter((r) => r.class !== 'same')));
   assert.ok(same.results.at(-1).exit !== 0, 'a missing target fails on both sides, and the error text matches (db paths replaced)');
   const run = (...args) => spawnSync(process.execPath, [HARNESS, ...args], { encoding: 'utf8' });
