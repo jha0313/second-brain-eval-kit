@@ -2,7 +2,8 @@
 // Writers: brain sync (gh-sync.mjs) and relink (link.mjs), always inside withWriteLock().
 // Readers: search / get / source open it with openGithubDb(path, { readOnly: true }).
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdirSync, chmodSync, openSync, writeSync, closeSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, chmodSync, readFileSync, unlinkSync, writeFileSync, linkSync, statSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { dirname } from 'node:path';
 import { LockBusyError } from './errors.mjs';
 
@@ -118,8 +119,11 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { 
 
 /**
  * One async write lifecycle per repo: build, sync, relink, --full swap all run inside it.
- * Lock file `<codeDbPath>.lock` (O_EXCL, holds the pid). A lock whose pid is dead is removed (staleLock: true);
- * the caller decides what that means (sync marks the previous run interrupted).
+ * Lock file `<codeDbPath>.lock` holds the owner's pid. It is published atomically: the pid is written to a private
+ * temp file, then link()ed to the lock path (link fails if the lock exists), so a lock is never seen empty.
+ * - held by a live pid (including this process: nested writes are a bug) -> LockBusyError
+ * - held by a dead pid, or unreadable content -> removed (only if it is still the same file), staleLock: true;
+ *   the caller decides what that means (sync marks the previous run interrupted)
  * @template T
  * @param {string} codeDbPath
  * @param {(info: { staleLock: boolean }) => Promise<T> | T} fn
@@ -129,18 +133,23 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { 
 export async function withWriteLock(codeDbPath, fn) {
   const lock = `${codeDbPath}.lock`;
   mkdirSync(dirname(lock), { recursive: true });
-  let staleLock = false, fd;
-  for (let attempt = 0; attempt < 2 && fd === undefined; attempt++) {
-    try { fd = openSync(lock, 'wx', 0o600); }
-    catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      const pid = Number(readFileSync(lock, 'utf8').trim()) || 0;
-      if (pid && pid !== process.pid && alive(pid)) throw new LockBusyError(pid);
-      unlinkSync(lock); staleLock = true;
+  const tmp = `${lock}.${process.pid}.${randomBytes(4).toString('hex')}`;
+  writeFileSync(tmp, String(process.pid), { mode: 0o600 });
+  let staleLock = false, held = false;
+  try {
+    for (let attempt = 0; attempt < 3 && !held; attempt++) {
+      try { linkSync(tmp, lock); held = true; }
+      catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        let ino, pid;
+        try { ino = statSync(lock).ino; pid = Number(readFileSync(lock, 'utf8').trim()) || 0; }
+        catch (e2) { if (e2.code === 'ENOENT') continue; throw e2; }   // released meanwhile: try again
+        if (pid && (pid === process.pid || alive(pid))) throw new LockBusyError(pid);
+        try { if (statSync(lock).ino === ino) { unlinkSync(lock); staleLock = true; } } catch { /* gone */ }
+      }
     }
-  }
-  if (fd === undefined) throw new LockBusyError(0);
-  writeSync(fd, String(process.pid)); closeSync(fd);
+  } finally { try { unlinkSync(tmp); } catch { /* gone */ } }
+  if (!held) throw new LockBusyError(0);
   try { return { value: await fn({ staleLock }), staleLock }; }
   finally { try { if (Number(readFileSync(lock, 'utf8')) === process.pid) unlinkSync(lock); } catch { /* already gone */ } }
 }

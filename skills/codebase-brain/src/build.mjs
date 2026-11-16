@@ -1,6 +1,6 @@
 // brain build: code facts + team knowledge -> one brain.db. Never writes into the target repo.
 import { resolve } from 'node:path';
-import { statSync } from 'node:fs';
+import { statSync, rmSync } from 'node:fs';
 import { createDb, setMeta, inTransaction } from './db.mjs';
 import { trackedFiles, headCommit, git, dirtyFiles, contentHashes, TS_EXT, CPP_EXT, PY_EXT } from './files.mjs';
 import { loadTypeScript, indexTypeScript } from './index-ts.mjs';
@@ -30,7 +30,9 @@ export function build({ repo, dbPath, vault, includeRoots = [], noKnowledge = fa
   const addEdge = (src, dst, kind, path, line, col) => insEdge.run(src, dst, kind, path, line, col);
 
   const timings = {}, stats = {};
-  inTransaction(db, () => {
+  // journal_mode=OFF: a failed build cannot be rolled back, and its pages may hold text the final sweep never saw.
+  // So a failure closes and deletes the file; the next read says "no index" instead of showing unswept text
+  try { inTransaction(db, () => {
     if (tracked.some((p) => TS_EXT.test(p))) {
       const t = Date.now();
       const { ts, from } = loadTypeScript(repo);
@@ -66,7 +68,11 @@ export function build({ repo, dbPath, vault, includeRoots = [], noKnowledge = fa
     setMeta(db, 'coverage', { unresolvedLocal, programs: stats.ts?.programs ?? 0, orphans: stats.ts?.orphans ?? 0 });
     timings.total = lap(t0);
     setMeta(db, 'timings', timings);
-  });
+  }); } catch (e) {
+    try { db.close(); } catch { /* already closed */ }
+    for (const p of [dbPath, `${dbPath}-journal`, `${dbPath}-wal`, `${dbPath}-shm`]) rmSync(p, { force: true });
+    throw e;
+  }
   db.exec('ANALYZE');
   db.close();
   const size = statSync(dbPath).size;

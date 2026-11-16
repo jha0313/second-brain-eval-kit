@@ -128,3 +128,23 @@ test('seams: replay only when BRAIN_REPLAY_DIR is set; failpoints throw only for
   failpoint('sync:page:1', { BRAIN_FAIL_AT: 'sync:page:2' });
   assert.throws(() => failpoint('sync:page:2', { BRAIN_FAIL_AT: 'sync:page:2' }), (e) => e.code === 'injected');
 });
+
+test('withWriteLock: own pid is busy (nested write), empty lock is stale, no temp files left', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lock2-'));
+  const code = join(dir, 'brain.db');
+  writeFileSync(`${code}.lock`, String(process.pid));
+  await assert.rejects(withWriteLock(code, () => 1), LockBusyError);
+  writeFileSync(`${code}.lock`, '');
+  assert.deepEqual(await withWriteLock(code, () => 'ok'), { value: 'ok', staleLock: true });
+  const { readdirSync } = await import('node:fs');
+  assert.deepEqual(readdirSync(dir), []);
+  const inner = await withWriteLock(code, async () => withWriteLock(code, () => 1).catch((e) => e.code));
+  assert.equal(inner.value, 'lock-busy');
+});
+
+test('a build that fails part-way leaves no database file behind', async () => {
+  const { build } = await import('../../src/build.mjs');
+  const { repo, codeDb } = fixtureRepo({ build: false });
+  assert.throws(() => build({ repo, dbPath: codeDb, log: (s) => { if (s.includes('typescript')) throw new Error('boom'); } }), /boom/);
+  assert.equal(existsSync(codeDb), false);
+});

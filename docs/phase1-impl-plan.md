@@ -63,7 +63,7 @@ flowchart LR
 
 | PR | 작업 | 소유 파일 | 완료 = 명령 (실제 출력을 보고) |
 |---|---|---|---|
-| P0 ✅ | 계약 코드 | `src/{errors,ptr,gh-schema,context,replay,seams}.mjs`, 나머지 stub, `src/{db,build}.mjs` 훅, `src/index-knowledge.mjs`의 `pathIndex` export, `src/fmt.mjs`의 `safe`·`ext`, `test/phase1/{helpers,contracts.test}.mjs`, `test/run.mjs`, `package.json` | `npm test` = 31 + 9 통과 |
+| P0 ✅ | 계약 코드 | `src/{errors,ptr,gh-schema,context,replay,seams}.mjs`, 나머지 stub, `src/{db,build,files}.mjs` 훅, `src/index-knowledge.mjs`의 `pathIndex` export, `src/fmt.mjs`의 `safe`·`ext`, `test/phase1/{helpers,contracts.test}.mjs`, `test/run.mjs`, `package.json` | `npm test` = 31 + 9 통과 |
 | B | sanitize 구현 + Phase 0 원문 마스킹 + `sweepSecrets` | `src/sanitize.mjs`, `src/index-knowledge.mjs`, `test/phase1/sanitize.test.mjs` | `node --test test/phase1/sanitize.test.mjs` + `npm test` |
 | C | GitHub client | `src/gh-client.mjs`, `test/phase1/gh-client.test.mjs` | `node --test test/phase1/gh-client.test.mjs` + `npm test` |
 | D | linker: 추출·해석·relink | `src/link.mjs`, `test/phase1/link.test.mjs` | `node --test test/phase1/link.test.mjs` + `npm test` |
@@ -103,6 +103,9 @@ flowchart LR
 - **journal mode.** github.db는 `DELETE` + `synchronous=FULL` + `secure_delete=ON`. WAL은 쓰지 않는다: 읽기 전용 복사본(eval)이 열리고, `--full`의 close → rename이 안전하다. code.db는 `journal_mode=OFF`(빌드는 처음부터 다시 만들므로) + `secure_delete=ON`.
 - **권한.** 두 파일 모두 만들 때 `0600`. 락 파일은 `<code.db>.lock`(`wx`, pid).
 - **락 반환형.** `withWriteLock(path, fn)` → `Promise<{ value, staleLock }>`. 죽은 pid의 락은 지우고 `staleLock: true`.
+- **락 게시는 원자적이다.** pid를 임시 파일에 쓴 뒤 `link()`로 락 경로에 건다. 그래서 빈 락은 보이지 않는다. 같은 프로세스의 pid는 busy(중첩 쓰기는 버그)다. 지울 때는 읽은 파일과 inode가 같을 때만 지운다.
+- **build 실패.** `journal_mode=OFF`라 ROLLBACK을 믿을 수 없다. 실패하면 DB를 닫고 파일을 지운다(마스킹 전의 페이지가 남지 않게).
+- **자식 프로세스 stderr.** `files.mjs`의 `git()`은 stderr를 상속하지 않고 잡는다. git의 메시지는 CLI의 정리된 오류 출구로만 나간다.
 
 ### 3.2 쓰기 경계 — 무엇을 누가 마스킹하나
 
@@ -317,9 +320,16 @@ flowchart LR
 | A7 | JSON `freshness`는 Phase 0 객체 + `github` 하위 객체 | Phase 0 체크가 `freshness.state`를 본다 |
 | A8 | `viz.mjs`를 E1에, S 테스트를 `test/security/`로, H를 I로 | 출구 소유자 없음, 빨간 테스트가 필수 관문을 막음, 직렬 단계 제거 |
 | A10 | GitHub 요청 표(경로·query 키·`since` 형식·헤더)를 `gh-client.mjs` 머리에 고정 | replay는 query가 정확히 같아야 맞는다. C·G·S·I가 같은 요청을 가정해야 한다 |
+| A11 | 락: 임시 파일 + `link()` 게시, 같은 pid는 busy, inode 확인 뒤 삭제 | Codex 확인 라운드: 빈 락 틈에 두 writer가 동시에 들어갈 수 있었다 |
+| A12 | build 실패 시 DB 닫고 삭제 | Codex 확인 라운드: sweep 전 실패가 마스킹 안 된 파일을 남겼다 |
+| A13 | `git()` stderr를 잡는다 | Codex 확인 라운드: git stderr가 CLI의 마스킹 출구를 우회했다 |
 | A9 | eval arm `none · dump · v2` → `none · v1 · dump · v2` | 한 칸에 한 가지만 바뀌어야 효과를 나눠 말할 수 있다 |
 
-## 부록 B: Codex 계획 리뷰 1차 처리
+## 부록 B: Codex 계획 리뷰 처리
+
+**확인 라운드(2차, v2 + P0 코드 대상): no-go → A11–A13으로 수정.** 1차 blocker 3개 중 1개 해결, 2개 부분 해결(락 경쟁, build 실패 정리), major 11개 중 10개 해결, 1개 부분 해결(git stderr). 남은 3개를 P0에서 고치고 테스트 2개를 더했다(계약 테스트 11개). 레인 간 파일 겹침은 없다는 판정.
+
+**1차:**
 
 | 지적 | 처리 |
 |---|---|
