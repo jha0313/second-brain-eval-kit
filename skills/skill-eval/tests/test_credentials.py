@@ -57,17 +57,17 @@ def test_each_trial_gets_its_own_gh_config_dir_also_with_the_claude_token(host_e
         assert _gh_names(a) == _gh_names(b) == ["GH_CONFIG_DIR"]
 
 
-def _pairs(gh="       0\n", git="0\n", env="GH_CONFIG_DIR\n", drop=()):
+def _pairs(gh="       0\n", git="0\n", env="GH_CONFIG_DIR\n", files="       0\n", drop=()):
     """The attack call's (input JSON, output) pairs as probe.run_probe builds them, plus unrelated calls."""
     rows = [(json.dumps({"command": "ls"}), "a.ts")]
-    rows += [(json.dumps({"command": cmd}), {"gh": gh, "git": git, "env": env}[name])
+    rows += [(json.dumps({"command": cmd}), {"gh": gh, "git": git, "env": env, "files": files}[name])
              for name, cmd, _ in probe.CREDENTIAL_CMDS if name not in drop]
     return rows
 
 
 def test_probe_credential_checks_pass_on_a_clean_trial():
     r = probe.credential_checks(_pairs())
-    assert len(r) == 3 and all(ok for ok, _ in r.values()), r
+    assert len(r) == 4 and all(ok for ok, _ in r.values()), r
     r = probe.credential_checks(_pairs(git="Exit code 1\n0\n", env=""))      # a tool's exit line; no GH variable at all
     assert all(ok for ok, _ in r.values()), r
 
@@ -81,6 +81,8 @@ def test_probe_credential_checks_pass_on_a_clean_trial():
     ({"drop": ("gh",)}, "gh auth token"),                                     # not run: nothing proven
     ({"drop": ("git",)}, "git credential fill"),
     ({"drop": ("env",)}, "GH_* / GITHUB_*"),
+    ({"files": "     812\n"}, "hosts.yml"),                                    # a credential file was readable
+    ({"drop": ("files",)}, "hosts.yml"),
 ])
 def test_probe_credential_checks_fail_and_keep_no_value(kw, failing):
     r = probe.credential_checks(_pairs(**kw))
@@ -104,3 +106,21 @@ def test_probe_saved_files_drop_a_github_token(tmp_path, monkeypatch):
         json.dumps({"type": "result", "subtype": "success", "result": f"token {FAKE_TOKEN}"}) + "\n"))
     t = probe._call(["true"], tmp_path, {}, stream)
     assert FAKE_TOKEN not in stream.read_text() and "[REDACTED-GITHUB-TOKEN]" in t["final"]
+
+
+def test_trial_settings_deny_host_credential_stores_as_files_and_folders():
+    deny = isolation.trial_settings(None, [])["permissions"]["deny"]
+    for p in isolation.CREDENTIAL_PATHS:
+        for tool in ("Read", "Edit"):
+            assert f"{tool}(/{p})" in deny and f"{tool}(/{p}/**)" in deny, (tool, p)
+    assert any(str(p).endswith(".config/gh") for p in isolation.CREDENTIAL_PATHS)
+    assert any(str(p).endswith(".git-credentials") for p in isolation.CREDENTIAL_PATHS)
+
+
+def test_saved_trial_files_drop_a_github_token(tmp_path, monkeypatch):
+    from skill_eval import runner
+    monkeypatch.setattr(isolation, "token", lambda: None)
+    f = tmp_path / "trajectory.jsonl"
+    f.write_text(json.dumps({"type": "user", "content": f"cat hosts.yml -> oauth_token: {FAKE_TOKEN}"}) + "\n")
+    runner._redact_files(f)
+    assert FAKE_TOKEN not in f.read_text() and "[REDACTED-GITHUB-TOKEN]" in f.read_text()

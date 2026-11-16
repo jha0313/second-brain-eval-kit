@@ -111,9 +111,22 @@ def cmd_run(a):
     if a.max_usd is not None and est["total_usd"] > a.max_usd:
         print(f"\nnote: estimate ${est['total_usd']:.2f} is above --max-usd {a.max_usd:.2f}; trials past the cap are skipped.")
     out = Path(a.out or Path(suite.dir) / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S")).resolve()
+    # plan 6.4: every execution starts with the isolation probe (no GitHub / git credential, no user config, denied
+    # paths unreadable); a failing probe runs no trial. --skip-probe exists for dev runs only.
+    if a.skip_probe and not a.unfrozen:
+        raise SuiteError("--skip-probe is for dev runs only (--dev): a frozen run starts with the isolation probe")
+    probe_rec = {"skipped": True}
+    if not a.skip_probe:
+        pr = run_probe(out / "probe", model=a.probe_model, control=False)
+        probe_rec = {"all_ok": bool(pr["all_ok"]), "file": runner.short(out / "probe" / "probe.json")}
+        if not pr["all_ok"]:
+            print(format_probe(pr))
+            print(f"\nisolation probe failed: no trial was run ({probe_rec['file']})")
+            return 2
     data = runner.run(suite, specs, out, a.jobs, a.max_usd, est, use_judge=not a.no_judge, keep_ws=a.keep_workspaces,
                       seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None,
                       stop_after_denials=a.stop_after_denials, canary=not a.no_canary)
+    data["meta"]["probe"] = probe_rec
     html_path, text = report.write_reports(data, out)
     scan = scan_saved(out)                        # grep every saved file for the token (redacts any hit)
     data["meta"]["token_scan"] = scan
@@ -308,6 +321,8 @@ def main(argv=None):
     r.add_argument("--stop-after-denials", type=int, default=3, metavar="N",
                    help="stop the run after N trials with permission denials (0 = never; default 3)")
     r.add_argument("--no-canary", action="store_true", help="skip the 1-trial-per-arm canary before the rest")
+    r.add_argument("--skip-probe", action="store_true", help="dev only (with --dev): do not run the isolation probe first")
+    r.add_argument("--probe-model", default="haiku", help="model of the isolation probe calls (default haiku)")
     r.set_defaults(fn=cmd_run)
     rp = sub.add_parser("report", help="rebuild reports from results.json")
     rp.add_argument("run_dir")

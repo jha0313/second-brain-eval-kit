@@ -10,6 +10,8 @@
 import { BrainError, NotFoundError, StalePtrError } from './errors.mjs';
 import { parsePtr, formatPtr, GH_TYPES, MEMORY_TYPES, TYPE_OF_KIND } from './ptr.mjs';
 import { terms } from './why.mjs';
+import { resolveTarget } from './query.mjs';
+import { MAX_NAME_OWNERS } from './index-knowledge.mjs';
 import { safe, plural } from './fmt.mjs';
 import { flagSuspicious } from './sanitize.mjs';
 
@@ -161,7 +163,7 @@ function pathRefs(gh, p, build) {
 const ROW = `JOIN items r ON r.ptr IN (i.ptr, 'pr:' || i.parent_number, 'issue:' || i.parent_number) AND r.kind IN ('pr', 'issue')`;
 const ROW_DATE = 'coalesce(r.merged_at, r.closed_at, r.updated_at, r.created_at)';
 
-function itemLists(gh, t, f, build, add) {
+function itemLists(gh, t, f, build, add, seeds = []) {
   const w = [`i.kind IN (${marks(f.ghKinds)})`], p = [...f.ghKinds];
   if (f.states) { w.push(`r.state IN (${marks(f.states)})`); p.push(...f.states); }
   if (f.author) { w.push('lower(i.author) = ?'); p.push(f.author); }
@@ -185,10 +187,17 @@ function itemLists(gh, t, f, build, add) {
   const nums = t.prs.flatMap((n) => [`pr:${n.slice(1)}`, `issue:${n.slice(1)}`]);
   if (nums.length) run('items_keys', 'items i', `i.ptr IN (${marks(nums)})`, nums);
   for (const sha of t.shas) run('items_keys', 'items i', 'i.merge_sha LIKE ?', [`${sha}%`]);
+  if (seeds.length) {   // refs resolved in this build to a seed: a symbol key, a file path, or path:line inside a seed file
+    const keys = seeds.map((n) => n.key), files = seeds.filter((n) => n.kind === 'file').map((n) => n.key);
+    const ptrs = gh.prepare(`SELECT DISTINCT r.ptr FROM refs r, json_each(CASE WHEN json_valid(r.resolved) THEN r.resolved ELSE '[]' END) j
+      WHERE r.resolved_build = ? AND r.status IN ('linked', 'ambiguous') AND (j.value IN (${marks(keys)})
+      ${files.length ? `OR substr(j.value, 1, instr(j.value || ':', ':') - 1) IN (${marks(files)})` : ''})`).all(build, ...keys, ...files).map((x) => x.ptr);
+    if (ptrs.length) run('items_links', 'items i', 'i.ptr IN (SELECT value FROM json_each(?))', [JSON.stringify(ptrs)], `ORDER BY ${ROW_DATE} DESC, i.id`);
+  }
   return pending;
 }
 
-function chunkLists(code, t, f, add) {
+function chunkLists(code, t, f, add, seeds = []) {
   const w = [`c.source IN (${marks(f.sources)})`], p = [...f.sources];
   if (f.since) { w.push('c.date >= ?'); p.push(f.since); }
   if (f.path) {   // the chunk's own file, or code it links to (mentions, touches, area doc)
@@ -205,6 +214,23 @@ function chunkLists(code, t, f, add) {
   }
   for (const n of t.prs) run('chunks_keys', 'chunks c', `(' ' || c.prs || ' ') LIKE ?`, [`% ${n} %`]);
   for (const sha of t.shas) run('chunks_keys', 'chunks c', 'c.sha LIKE ?', [`${sha}%`]);
+  if (seeds.length) run('chunks_links', 'chunks c', `c.id IN (SELECT chunk FROM links WHERE node IN (${marks(seeds)}))`, seeds.map((n) => n.id), 'ORDER BY c.date DESC, c.id');
+}
+
+// name -> code link signal (design §6.7, as in why): identifiers and paths in the query that name code nodes (one node,
+// or a name with at most MAX_NAME_OWNERS exported owners), plus the file of each symbol. A doc linked to that code, or a
+// PR whose refs resolve to it in this build, is a candidate even when its text never spells the name.
+function seedNodes(code, names) {
+  const seeds = new Map();
+  for (const n of names) {
+    const r = resolveTarget(code, n);
+    const hit = r.node ? [r.node] : r.candidates?.length && r.candidates.length <= MAX_NAME_OWNERS ? r.candidates : [];
+    for (const node of hit) {
+      seeds.set(node.id, node);
+      if (node.kind !== 'file' && node.path) { const f = code.prepare('SELECT * FROM nodes WHERE key = ?').get(node.path); if (f) seeds.set(f.id, f); }
+    }
+  }
+  return [...seeds.values()];
 }
 
 // trigram terms: Korean (no word boundaries) and identifiers / paths (partial matches: "LiveRun" in useLiveRunStatus)
@@ -237,11 +263,12 @@ export function search(ctx, q, opts = {}) {
     if (rows.length > CAP) { rows = rows.slice(0, CAP); if (!out.truncatedLists.includes(name)) out.truncatedLists.push(name); }
     if (rows.length) lists.push(rows);
   };
+  const seeds = t.names.length ? seedNodes(ctx.code, t.names) : [];
   if (ctx.gh) {
     out.filesTruncated = ctx.gh.prepare(`SELECT count(*) AS n FROM items WHERE kind = 'pr' AND (' ' || flags || ' ') LIKE '% files-truncated %'`).get().n;
-    if (f.ghKinds.length) out.pathRefsPending = itemLists(ctx.gh, t, f, ctx.meta.build_id, add);
+    if (f.ghKinds.length) out.pathRefsPending = itemLists(ctx.gh, t, f, ctx.meta.build_id, add, seeds);
   }
-  if (f.sources.length) chunkLists(ctx.code, t, f, add);
+  if (f.sources.length) chunkLists(ctx.code, t, f, add, seeds);
 
   // RRF over every list, then roll children up into their parent row; total counts candidates before the roll-up
   const fused = new Map();

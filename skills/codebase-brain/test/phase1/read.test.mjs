@@ -392,3 +392,14 @@ test('integration: flags on search rows and thread entries; a child item names i
   const issueComment = brain({ items: [{ kind: 'issue', number: 7, title: 'x', body: 'y' }, { kind: 'issue_comment', id: 5, number: 7, body: 'z' }] });
   assert.equal(get(issueComment, ['ic:5']).items[0].parent, 'issue:7');
 });
+
+test('integration: search finds memory linked to the named code even when its text never spells the name (name -> code link)', () => {
+  const ctx = brain(MAIN);
+  const r = search(ctx, 'InsufficientCredits', { limit: 50 });
+  const ptrs = r.rows.map((x) => x.ptr);
+  assert.ok(ptrs.includes('pr:1121'), 'a PR whose file ref resolves to the symbol\'s file in this build');
+  assert.ok(ptrs.some((p) => p.startsWith('commit:')), 'a commit that touches the symbol\'s file');
+  // refs resolved against another build do not count (pr:1150's symbol ref is from OLD)
+  assert.ok(!search(ctx, 'src/lib/credits.ts#reserve', { limit: 50 }).rows.some((x) => x.ptr === 'pr:1150'));
+  assert.ok(search(ctx, 'src/lib/credits.ts#reserve', { limit: 50 }).rows.some((x) => x.ptr === 'issue:1100'));
+});

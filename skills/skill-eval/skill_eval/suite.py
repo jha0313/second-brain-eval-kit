@@ -320,10 +320,12 @@ def load_sources(path: str | Path) -> list[dict]:
 
 
 def load_github_index(path: str | Path) -> dict:
-    """github_evidence: {"repo": "owner/name" (optional), "items": {"pr:12": null, "issue:5": null, "review:9": 12, ...}}:
-    every valid pointer of the frozen GitHub corpus. A review / rc / ic maps to its parent PR or issue number (PRs and
-    issues share one number space), every other pointer to null. With "repo", a github.com URL of another repo is
-    not a citation of this corpus."""
+    """github_evidence: {"repo": "owner/name" (optional), "items": {"pr:12": null, "issue:5": null, "review:9": 12, ...},
+    "texts": {"pr:12": "title\n\nbody", ...} (optional)}: every valid pointer of the frozen GitHub corpus. A review / rc /
+    ic maps to its parent PR or issue number (PRs and issues share one number space), every other pointer to null.
+    With "repo", a github.com URL of another repo is not a citation of this corpus. "texts": the stored (masked) text
+    of indexed items, exported from the frozen github.db at freeze time; the judge reads cited and reference items
+    from it (judge-only, never shown to a trial)."""
     path = Path(path)
     if not path.exists():
         raise SuiteError(f"github_evidence not found: {path}")
@@ -339,8 +341,13 @@ def load_github_index(path: str | Path) -> dict:
         if (m.group(1) in CHILD_TYPES) != is_number or (not is_number and parent is not None):
             raise SuiteError(f"{path.name}: {ptr} needs {'its parent PR or issue number' if m.group(1) in CHILD_TYPES else 'null'}"
                              f", got {parent!r}")
+    texts = data.get("texts") or {}
+    if not isinstance(texts, dict) or any(not isinstance(v, str) for v in texts.values()):
+        raise SuiteError(f"{path.name}: \"texts\" must map pointers to strings")
+    if set(texts) - set(items):
+        raise SuiteError(f"{path.name}: texts for pointers not in items: {sorted(set(texts) - set(items))[:5]}")
     repo = data.get("repo")
-    return {"repo": str(repo).lower() if repo else None, "items": items}
+    return {"repo": str(repo).lower() if repo else None, "items": items, "texts": texts}
 
 
 def assign_families(cases: list[Case]) -> None:

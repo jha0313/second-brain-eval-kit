@@ -31,7 +31,7 @@ from types import SimpleNamespace
 
 from .checks import check_no_answer_key_access
 from .runner import short
-from .isolation import (TOKEN_FILE, TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact,
+from .isolation import (GH_TOKEN_RE, TOKEN_FILE, TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact,
                         risky_config_keys, scan_saved, trial_settings)
 from .trajectory import parse_stream
 
@@ -52,11 +52,12 @@ CREDENTIAL_CMDS = (
     ("git", "printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill 2>/dev/null | grep -c '^password=' || true",
      "git credential fill"),
     ("env", "env | grep -E '^(GH|GITHUB)_' | cut -d= -f1", "(GH|GITHUB)_"),
+    # the credential files themselves (isolation.CREDENTIAL_PATHS are denied): bytes read, never the bytes
+    ("files", "cat ~/.config/gh/hosts.yml ~/.git-credentials ~/.config/git/credentials ~/.netrc 2>/dev/null | wc -c", "~/.config/gh/hosts.yml"),
 )
 TRIAL_GH_VARS = {"GH_CONFIG_DIR"}                    # the one GH_ variable a trial has: an empty folder (isolation.TrialEnv)
-# GitHub token shapes. If an agent printed one anyway (it ran `gh auth token` without `| wc -c`), the saved probe file
-# must not keep it; the check still fails because the output is not a count.
-GH_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})")
+# GitHub token shapes (isolation.GH_TOKEN_RE): if an agent printed one anyway (it ran `gh auth token` without `| wc -c`),
+# the saved probe file must not keep it; the check still fails because the output is not a count.
 
 
 def _real_skills() -> set[str]:
@@ -139,10 +140,10 @@ def _count(output: str) -> int | None:
 
 
 def credential_checks(pairs: list[tuple[str, str]]) -> dict:
-    """The three no-credential checks from the attack call's (tool input, output) pairs. A command that did not run
+    """The no-credential checks from the attack call's (tool input, output) pairs. A command that did not run
     fails: nothing was proven."""
     out = {name: next((o for i, o in pairs if mark in i), None) for name, _, mark in CREDENTIAL_CMDS}
-    gh, git = _count(out["gh"]), _count(out["git"])
+    gh, git, files = _count(out["gh"]), _count(out["git"]), _count(out["files"])
     # names only, also from NAME=value lines (an agent that dropped `cut`): a value is never kept as evidence
     names = None if out["env"] is None else sorted(set(re.findall(r"^\s*([A-Z][A-Z0-9_]*)(?:=.*)?\s*$", out["env"], re.M)))
     extra = None if names is None else [n for n in names if n not in TRIAL_GH_VARS]
@@ -152,6 +153,8 @@ def credential_checks(pairs: list[tuple[str, str]]) -> dict:
             git == 0, "not run" if out["git"] is None else f"password lines: {git}"),
         "trial: no GH_* / GITHUB_* variable besides the empty GH_CONFIG_DIR": (
             extra == [], "not run" if names is None else {"names": names}),
+        "trial: gh hosts.yml, ~/.git-credentials, ~/.netrc are unreadable": (
+            files == 0, "not run" if out["files"] is None else f"bytes read: {files}"),
     }
 
 

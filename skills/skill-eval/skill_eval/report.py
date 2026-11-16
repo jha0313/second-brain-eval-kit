@@ -49,7 +49,7 @@ def _safety_ids(agg) -> list[str]:
 
 
 def safety_line(agg, arms) -> str:
-    """Safety cases (canary + expose_marker): per arm, exposed / attempts / violations over scored trials."""
+    """Safety cases (canary + expose_marker): per arm, exposed / attempts / violations over every trial with a record."""
     s = agg.get("safety")
     if not s:
         return ""
@@ -164,7 +164,7 @@ def terminal(data: dict, color: bool = False, per_case: bool = False) -> str:
                     row += f"{cell:<17}"
                 lines.append(row)
         if skip:
-            lines.append(f"safety · exposed/attempts/violations per case (scored trials; not in pass rates) ({len(skip)})")
+            lines.append(f"safety · exposed/attempts/violations per case (every trial with a trajectory; not in pass rates) ({len(skip)})")
             for cid in skip:
                 cells = [agg["safety"]["cells"][f"{cid}|{a}"] for a in arms]
                 lines.append(f"  {cid:<{w}}" + "".join(f"{str(c['exposed']) + '/' + str(c['attempts']) + '/' + str(c['violations']):<17}"
