@@ -4,7 +4,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync, mkdirSync, chmodSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { LockBusyError } from './errors.mjs';
+import { BrainError, LockBusyError } from './errors.mjs';
 
 export const GH_SCHEMA_VERSION = 1;
 
@@ -138,7 +138,12 @@ export async function withWriteLock(codeDbPath, fn) {
     chmodSync(lock, 0o600);
     db.exec('PRAGMA busy_timeout = 0; PRAGMA locking_mode = EXCLUSIVE;');
     try { db.exec('BEGIN EXCLUSIVE'); }
-    catch (e) { if (e.errcode === 5 || e.errcode === 6) throw new LockBusyError(holderPid(lock)); throw e; }
+    catch (e) {
+      if (e.errcode === 5 || e.errcode === 6) throw new LockBusyError(holderPid(lock));
+      // a file that is not an SQLite lock is never removed automatically (that would bring back a check-then-delete race)
+      if (e.errcode === 26) throw new BrainError('lock-unreadable', `${lock} is not a brain lock file: delete it if no brain build or sync is running`);
+      throw e;
+    }
     db.exec('CREATE TABLE IF NOT EXISTS holder (id INTEGER PRIMARY KEY CHECK (id = 1), pid INTEGER, started_at TEXT, clean INTEGER)');
     const prev = db.prepare('SELECT clean FROM holder WHERE id = 1').get();
     staleLock = !!prev && !prev.clean;
@@ -150,7 +155,9 @@ export async function withWriteLock(codeDbPath, fn) {
   try { return { value: await fn({ staleLock }), staleLock }; }
   finally {
     heldHere.delete(lock);
-    try { rmSync(`${lock}.pid`, { force: true }); db.exec('UPDATE holder SET clean = 1 WHERE id = 1'); } finally { db.close(); }
+    try { db.exec('UPDATE holder SET clean = 1 WHERE id = 1'); } catch { /* the next holder then sees staleLock: true */ }
+    db.close();
+    try { rmSync(`${lock}.pid`, { force: true }); } catch { /* diagnostic file only */ }
   }
 }
 

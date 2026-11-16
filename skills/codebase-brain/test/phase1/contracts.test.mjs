@@ -157,3 +157,10 @@ test('a build that fails part-way leaves no database file behind', async () => {
   assert.equal(existsSync(codeDb), false);
 });
 
+
+test('withWriteLock: a lock path that is not an SQLite file is refused with a clear error, never removed', async () => {
+  const code = join(mkdtempSync(join(tmpdir(), 'lock3-')), 'brain.db');
+  writeFileSync(`${code}.lock`, '12345 not a database, long enough to fail the header check');
+  await assert.rejects(withWriteLock(code, () => 1), (e) => e.code === 'lock-unreadable');
+  assert.ok(existsSync(`${code}.lock`));
+});
