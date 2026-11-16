@@ -124,7 +124,7 @@ function target(ctx, q, opt, write = out) {
     if (r.others && !opt.json) write(c.dim(`  ${ext(scrub(q))} → ${ident(r.node.key)} (the only exported one; ${r.others === 1 ? '1 local symbol shares' : `${r.others} local symbols share`} the name — brain find ${ident(scrub(q))})`));
     return r.node;
   }
-  if (opt.json) out(JSON.stringify({ error: 'ambiguous-or-missing', query: q, candidates: (r.candidates || []).map((n) => n.key) }));
+  if (opt.json) out(JSON.stringify({ error: 'ambiguous-or-missing', query: scrub(q), candidates: (r.candidates || []).map((n) => n.key) }));
   else {
     if (r.candidates?.length) {
       write(`${c.yellow('ambiguous')} ${ext(scrub(q))} — pick one ID and ask again:`);
@@ -235,7 +235,13 @@ const cmds = {
     // one write lifecycle: nobody reads a half-deleted code.db for relinking, no sync writes refs meanwhile
     const { value: r } = await withWriteLock(dbPath, async () => {
       const built = build({ repo, dbPath, vault: opt.vault, ...options, tilde, log: say });
-      return { ...built, relink: await relink({ codeDbPath: dbPath, repoDir: repo, log: say }) };
+      // a relink failure is recorded, never a failed build (plan §3.1)
+      try { return { ...built, relink: await relink({ codeDbPath: dbPath, repoDir: repo, log: say }) }; }
+      catch (e) {
+        const error = scrub(e?.message ?? e);
+        say(`brain build: relink failed (${error}) — the index is built; GitHub refs relink on the next build or sync`);
+        return { ...built, relink: { error } };
+      }
     });
     report({ skipped: false, ...r });
   },
@@ -286,8 +292,9 @@ const cmds = {
     const kinds = mode === 'callers' ? ['call', 'new', 'renders'] : list(opt.kind);
     const r = refs(db, node, { kinds, filter: list(opt.filter), exclude: list(opt.exclude), includeImports: opt.imports,
       limit: opt.files ? 1e9 : +(opt.limit || 50), cursor: +(opt.cursor || 0) });
-    const cov = coverageFor(db, { truncated: r.next !== null }), fr = freshFor(ctx);
-    const site = (x) => ({ kind: x.kind, site: `${x.path}:${x.line}:${x.col}`, in: x.in_kind === 'file' ? null : x.in_name, flags: x.flags || '' });
+    // Phase 0 fields as they were; the state follows partial > truncated > complete, as the footer does (plan §3.8)
+    const p0 = coverageFor(db, { truncated: r.next !== null }), shownCov = covOf(ctx, p0), cov = { ...p0, state: shownCov.state }, fr = freshFor(ctx);
+    const site =(x) => ({ kind: x.kind, site: `${x.path}:${x.line}:${x.col}`, in: x.in_kind === 'file' ? null : x.in_name, flags: x.flags || '' });
     // --files: one row per file (its first site, the site count, every kind), not one per site
     const perFile = () => [...Map.groupBy(r.rows, (x) => x.path).values()]
       .map((xs) => ({ ...site(xs[0]), kind: [...new Set(xs.map((x) => x.kind))].join(' '), sites: xs.length }));
@@ -311,7 +318,7 @@ const cmds = {
       out(tableWhole(['KIND', 'SITE', 'IN', 'ROLE'], r.rows.map((x) => [x.kind, `${ident(x.path)}:${x.line}`, x.in_kind === 'file' ? c.dim('(top level)') : safe(x.in_name), x.flags || '']), 1, { max: [0, 0, 32] }));
     }
     out(c.dim(`  ${plural(r.total, 'site')} in ${plural(r.files, 'file')}`) + (r.next !== null ? c.yellow(` · showing ${+(opt.cursor || 0) + 1}–${r.next} · next: --cursor ${r.next}`) : ''));
-    finish(fr, covOf(ctx, cov));
+    finish(fr, shownCov);
   },
 
   callers(args) { return cmds.refs(args, 'callers'); },
@@ -454,10 +461,10 @@ const cmds = {
       author: text(opt.author, 'author'), since: since(opt.since), limit: whole(opt.limit, 'limit', 1), cursor: whole(opt.cursor, 'cursor', 0) };
     if (!q.trim() && !opts.path) throw usage('brain search "<question>" [--path P] — give a question, a --path, or both');
     const ctx = open(opt);
-    const res = read.search(ctx, q, opts);
+    const res = read.search(ctx, q, opts), shown = { ...res, query: scrub(res.query) };   // the query echo is a runtime value
     const cov = coverage(ctx, { ...res.facts, truncated: res.next != null }), fr = freshFor(ctx);
-    if (opt.json) return out(JSON.stringify({ ...res, coverage: cov, freshness: jsonFresh(fr) }));
-    out(renderSearch({ ...res, query: scrub(res.query) }, { coverage: cov, freshness: fr }, { cursor: opts.cursor ?? 0 }).join('\n'));
+    if (opt.json) return out(JSON.stringify({ ...shown, coverage: cov, freshness: jsonFresh(fr) }));
+    out(renderSearch(shown, { coverage: cov, freshness: fr }, { cursor: opts.cursor ?? 0 }).join('\n'));
   },
 
   get({ pos, opt }) {
@@ -474,7 +481,9 @@ const cmds = {
     const from = whole(opt.from, 'from', 1) ?? 1, maxLines = whole(opt.lines, 'lines', 1) ?? 200;
     const ctx = open(opt);
     const src = read.source(ctx, ptr, { from, maxLines });
-    const cov = coverage(ctx, { lines: { from: src.from, to: src.to, total: src.total } }), fr = freshFor(ctx);
+    // a GitHub quote is as complete as the last sync: a failed or missing one makes it partial
+    const cov = coverage(ctx, { lines: { from: src.from, to: src.to, total: src.total }, ...(src.origin === 'github' ? { githubPresent: !!ctx.gh } : {}) });
+    const fr = freshFor(ctx);
     if (opt.json) return out(JSON.stringify({ ...src, coverage: cov, freshness: jsonFresh(fr) }));
     out(renderSource(src, { coverage: cov, freshness: fr }, read.envelope).join('\n'));
   },

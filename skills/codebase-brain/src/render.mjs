@@ -65,7 +65,7 @@ function position(t) {
 
 function threadLines(thread, cols) {
   if (!thread.length) return [kv('thread', 'none')];
-  const rows = thread.map((t) => [(t.depth ? '  ' : '') + safe(t.ptr), t.untrusted.author ? `@${cut(safe(t.untrusted.author), 24)}` : '—',
+  const rows = thread.map((t) => [(t.depth ? '  ' : '') + safe(t.ptr), who(t.untrusted.author, t.assoc),
     t.position ? position(t) : t.state ? safe(t.state) : '', day(t.date)]);
   const w = [0, 1, 2, 3].map((i) => Math.max(...rows.map((r) => width(r[i]))));
   return rows.map((r, i) => {
