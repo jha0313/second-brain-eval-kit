@@ -6,7 +6,7 @@
 // "Fresh" drops schemas brain, brain_migrate and brain_test and migrates again on the same branch: cheaper than a branch
 // per scenario, and only one branch is alive. Roles, their settings and database grants live outside those schemas, so
 // each scenario also compares SERVER_FINGERPRINT with the one taken at the start: a scenario that leaves such state
-// behind fails instead of leaking into the next one. Read-back: the latest run is pulled with pullMirror, which checks it
+// behind fails instead of leaking into the next one. Read-back: every run is pulled with pullMirror, which checks it
 // against its stored checksum (the dump drops the checksum hashes of the build stamps; this catches a bad hash). The normalized dump follows contract S0 (DUMP_EXCLUDE_TABLES,
 // DUMP_NATURAL_KEYS, DUMP_VOLATILE_COLUMNS, DUMP_VOLATILE_PATHS): surrogate ids become natural keys, run ids become run
 // ordinals (a rolled-back transaction burns identity values), and volatile values are dropped, one canonical JSON line
@@ -99,25 +99,29 @@ export async function normalizedDump(branch) {
   return { lines: lines.sort(), raw: raw.sort().join('\n') };
 }
 
-/** Server state that resetSchema does not rebuild: the brain roles (attributes, settings, memberships), the database ACL,
- * the schemas besides brain_test (harness-owned) with their ACLs, and the objects in public. */
+/** Server state that resetSchema does not rebuild: the brain roles (attributes, memberships), every role and database
+ * setting (ALTER ROLE / ALTER DATABASE ... SET; '*' = all roles), the database ACL, the schemas besides brain_test
+ * (harness-owned) with their ACLs, and the objects in public. */
 export const SERVER_FINGERPRINT = `SELECT jsonb_build_object(
   'roles', (SELECT jsonb_agg(jsonb_build_array(rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin,
     rolreplication, rolbypassrls, rolconnlimit, rolvaliduntil) ORDER BY rolname) FROM pg_roles WHERE rolname LIKE 'brain%'),
   'members', (SELECT coalesce(jsonb_agg(jsonb_build_array(r.rolname, m.rolname) ORDER BY r.rolname, m.rolname), '[]') FROM pg_auth_members a
     JOIN pg_roles r ON r.oid = a.roleid JOIN pg_roles m ON m.oid = a.member WHERE r.rolname LIKE 'brain%' OR m.rolname LIKE 'brain%'),
-  'settings', (SELECT coalesce(jsonb_agg(jsonb_build_array(r.rolname, s.setdatabase <> 0, s.setconfig) ORDER BY r.rolname, s.setdatabase), '[]')
-    FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole),
+  'settings', (SELECT coalesce(jsonb_agg(jsonb_build_array(coalesce(r.rolname, '*'), s.setdatabase <> 0, s.setconfig)
+    ORDER BY coalesce(r.rolname, '*'), s.setdatabase), '[]') FROM pg_db_role_setting s LEFT JOIN pg_roles r ON r.oid = s.setrole),
   'db', (SELECT datacl::text FROM pg_database WHERE datname = current_database()),
   'schemas', (SELECT jsonb_agg(jsonb_build_array(nspname, nspacl::text) ORDER BY nspname) FROM pg_namespace
     WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN ('information_schema', 'brain_test')),
   'public', (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public')) AS f`;
 const fingerprint = async (branch) => JSON.stringify((await branch.query('owner', SERVER_FINGERPRINT)).rows[0].f);
 
-/** pullMirror of the latest run into a scratch dir: throws unless the server's rows read back to the run's checksum. */
+/** pullMirror of every run in order (a full pull, then deltas): throws unless each reads back to its stored checksum. */
 async function readBack(branch) {
+  const runs = (await branch.query('owner', 'SELECT run_id FROM brain.run ORDER BY run_id')).rows.map((r) => Number(r.run_id));
   const dir = mkdtempSync(join(tmpdir(), 'brain-faults-'));
-  try { await pullMirror({ url: branch.readerUrl, dir: join(dir, 'm'), shapes: ['code', 'github'] }); } finally { rmSync(dir, { recursive: true, force: true }); }
+  try {
+    for (const run of runs) await pullMirror({ url: branch.readerUrl, dir: join(dir, 'm'), run, shapes: ['code', 'github'] });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 /** Drop schemas brain, brain_migrate (its ledger) and brain_test (failOn), then migrate: an empty server again. */
@@ -225,7 +229,6 @@ export const SUITES = [ROUNDTRIP];
 // CLI
 
 async function main(args) {
-  if (neonSkip()) { console.log(`faults: ${neonSkip()}`); return 0; }
   const want = args.map((a) => a.split(':'));
   const suites = SUITES.filter((s) => !want.length || want.some(([n]) => n === s.name));
   const unknown = want.filter(([n, sc]) => !SUITES.some((s) => s.name === n && (!sc || s.scenarios.some((x) => x.name === sc))));
@@ -233,6 +236,7 @@ async function main(args) {
     console.log(`faults: no such suite or scenario: ${unknown.map((w) => w.join(':')).join(' ')} (have ${SUITES.flatMap((s) => s.scenarios.map((x) => `${s.name}:${x.name}`)).join(' ')})`);
     return 2;
   }
+  if (neonSkip()) { console.log(`faults: ${neonSkip()}`); return 0; }
   const branch = await createBranch('faults');
   let failed = 0;
   try {
