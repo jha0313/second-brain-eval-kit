@@ -148,3 +148,16 @@ test('a build that fails part-way leaves no database file behind', async () => {
   assert.throws(() => build({ repo, dbPath: codeDb, log: (s) => { if (s.includes('typescript')) throw new Error('boom'); } }), /boom/);
   assert.equal(existsSync(codeDb), false);
 });
+
+test('withWriteLock: a stale lock behind an old crashed .break is still taken; a fresh .break means busy for now', async () => {
+  const { utimesSync } = await import('node:fs');
+  const dir = mkdtempSync(join(tmpdir(), 'lock3-'));
+  const code = join(dir, 'brain.db');
+  writeFileSync(`${code}.lock`, '999999');
+  writeFileSync(`${code}.lock.break`, '999998');
+  await assert.rejects(withWriteLock(code, () => 1), LockBusyError);       // a remover may be at work
+  const old = new Date(Date.now() - 60_000);
+  utimesSync(`${code}.lock.break`, old, old);
+  assert.deepEqual(await withWriteLock(code, () => 2), { value: 2, staleLock: true });
+  assert.equal(existsSync(`${code}.lock.break`), false);
+});

@@ -122,7 +122,7 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { 
  * Lock file `<codeDbPath>.lock` holds the owner's pid. It is published atomically: the pid is written to a private
  * temp file, then link()ed to the lock path (link fails if the lock exists), so a lock is never seen empty.
  * - held by a live pid (including this process: nested writes are a bug) -> LockBusyError
- * - held by a dead pid, or unreadable content -> removed (only if it is still the same file), staleLock: true;
+ * - held by a dead pid, or unreadable content -> removed by breakStale(), staleLock: true;
  *   the caller decides what that means (sync marks the previous run interrupted)
  * @template T
  * @param {string} codeDbPath
@@ -137,19 +137,45 @@ export async function withWriteLock(codeDbPath, fn) {
   writeFileSync(tmp, String(process.pid), { mode: 0o600 });
   let staleLock = false, held = false;
   try {
-    for (let attempt = 0; attempt < 3 && !held; attempt++) {
+    for (let attempt = 0; attempt < 5 && !held; attempt++) {
       try { linkSync(tmp, lock); held = true; }
       catch (e) {
         if (e.code !== 'EEXIST') throw e;
-        let ino, pid;
-        try { ino = statSync(lock).ino; pid = Number(readFileSync(lock, 'utf8').trim()) || 0; }
-        catch (e2) { if (e2.code === 'ENOENT') continue; throw e2; }   // released meanwhile: try again
+        const pid = readPid(lock);
+        if (pid === null) continue;                                     // released meanwhile: try again
         if (pid && (pid === process.pid || alive(pid))) throw new LockBusyError(pid);
-        try { if (statSync(lock).ino === ino) { unlinkSync(lock); staleLock = true; } } catch { /* gone */ }
+        if (breakStale(lock, tmp, pid)) staleLock = true;
       }
     }
   } finally { try { unlinkSync(tmp); } catch { /* gone */ } }
   if (!held) throw new LockBusyError(0);
   try { return { value: await fn({ staleLock }), staleLock }; }
-  finally { try { if (Number(readFileSync(lock, 'utf8')) === process.pid) unlinkSync(lock); } catch { /* already gone */ } }
+  finally { try { if (readPid(lock) === process.pid) unlinkSync(lock); } catch { /* already gone */ } }
+}
+
+// pid in a lock file; 0 when unreadable content; null when the file does not exist
+function readPid(path) {
+  try { return Number(readFileSync(path, 'utf8').trim()) || 0; }
+  catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+}
+
+// Only the holder of `<lock>.break` may delete a stale lock, so "is it still the dead pid?" and the unlink cannot
+// interleave with another remover. Taking a free lock never needs .break: link() fails while any lock exists.
+// A .break left by a crashed remover (it is held for microseconds) is cleared once it is 10 s old.
+function breakStale(lock, tmp, deadPid) {
+  const brk = `${lock}.break`;
+  try { linkSync(tmp, brk); }
+  catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    try {
+      const pid = readPid(brk);
+      if (pid !== null && !(pid && alive(pid)) && Date.now() - statSync(brk).mtimeMs > 10_000) unlinkSync(brk);
+    } catch { /* another remover is on it */ }
+    return false;
+  }
+  try {
+    if (readPid(lock) !== deadPid) return false;                        // released or re-taken meanwhile
+    unlinkSync(lock);
+    return true;
+  } finally { try { unlinkSync(brk); } catch { /* gone */ } }
 }
