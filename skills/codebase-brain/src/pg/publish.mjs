@@ -260,7 +260,8 @@ function descends(repoDir, older, newer) {
  *   signal?: AbortSignal }} opts
  *   checksum: contract.checksum(applyDelta(base state, delta)); commit: the source commit (= delta.meta.commit and the
  *   attempt's source_sha); repoDir: the source checkout (git ancestry, normal mode); onStage: hook awaited after each
- *   stage ('locked', 'run', 'nodes', 'items', 'facts', 'counts', 'ok') with the transaction's client; limits: default
+ *   stage ('locked', 'run', 'nodes', 'items', 'facts', 'counts', 'ok'; 'committed' once COMMIT has returned or a lost
+ *   COMMIT resolved as ok, before the connection closes; its errors are ignored) with the client; limits: default
  *   transaction_timeout 60s (10min for the first publish), statement_timeout 30s, lock_timeout 15s (each query's
  *   client deadline is statement_timeout + 15 s); recordFailure: false leaves every failure unrecorded (recorded =
  *   false) for the caller; signal: abort destroys the socket (the server rolls back) and throws code 'aborted' without
@@ -291,6 +292,7 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
   if (signal?.aborted) fail('aborted', 'publish', 'aborted before the publish connection');
   let c;
   try { c = await connect(url, { queryTimeout: durationMs(lim.statementTimeout) + 15_000 }); } catch (e) {   // statement_timeout + margin
+    if (signal?.aborted) fail('aborted', 'publish', 'aborted while the publish connection opened');   // not recorded
     const kind = errorKind(e);
     fail('publish-failed', 'connect', `could not connect to the server (${kind}): nothing was written`, { kind, recorded: await record('connect', kind) });
   }
@@ -347,6 +349,7 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
     await stage('ok');
     committing = true;
     await c.query({ text: 'COMMIT', query_timeout: 15_000 });
+    await stage('committed').catch(() => {});                       // a hook cannot undo a commit
     return { run };
   } catch (e) {
     if (signal?.aborted) {                                         // the caller is shutting down: it resolves and records
@@ -356,7 +359,7 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
     if (committing) {                                              // R12: the COMMIT reply is lost (or COMMIT failed)
       kill(c);
       const r = await resolveAttempt({ url, attemptId });
-      if (r.outcome === 'ok') return { run: r.run };
+      if (r.outcome === 'ok') { await stage('committed').catch(() => {}); return { run: r.run }; }
       if (r.outcome === 'rolled-back') {
         fail('publish-failed', 'commit', 'the COMMIT did not happen: nothing was written', { kind: 'rolled-back', recorded: await record('commit', 'rolled-back') });
       }

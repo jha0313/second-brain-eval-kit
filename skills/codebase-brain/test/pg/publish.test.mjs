@@ -345,9 +345,11 @@ it('S2: the client deadline follows statement_timeout: a 46 s statement under th
   const r1 = await pub(null, fx.s1);
   const a = await begin(fx.s2.meta.commit);
   const p = plan(r1.after, fx.s2, a);
-  const slow = async (s, { client }) => { if (s === 'locked') await client.query('SELECT pg_sleep(46)'); };   // over the old fixed 45 s
+  const seen = [];
+  const slow = async (s, { client }) => { seen.push(s); if (s === 'locked') await client.query('SELECT pg_sleep(46)'); };   // over the old 45 s
   const r = await publish(args(a, p, fx.s2, { mode: 'bootstrap', limits: C.CI_LIMITS.bootstrap, onStage: slow }));
   assert.ok(r.run > r1.run);
+  assert.deepEqual(seen, ['locked', 'run', 'nodes', 'items', 'facts', 'counts', 'ok', 'committed']);
   assert.deepEqual(await attempt(a.attemptId), { status: 'ok', stage: null, error: null });
 });
 

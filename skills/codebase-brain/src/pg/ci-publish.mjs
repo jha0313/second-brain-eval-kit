@@ -133,7 +133,8 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
   if (fault) say(`ci-publish: fault injection ${fault.stage}:${fault.point}${faultMs ? ` (limit ${faultMs} ms)` : ''}`);
 
   // ---- signals: kill the child, drop the publish socket, record within CI_SIGNAL_CLEANUP_MS, exit ----
-  // phase: 'committing' from the attempt-ok UPDATE until COMMIT returns, then 'committed' (the run is in)
+  // phase (publish's stage hook): 'committing' from the attempt-ok UPDATE, 'committed' once COMMIT has returned (or a
+  // lost COMMIT resolved as ok), back to 'writing' when publish fails with nothing committed
   const abort = new AbortController();
   let current = 'prepare', attemptId = null, group = null, stopping = null, phase = 'writing', run = null;
   const killChild = (sig) => { if (group) { try { process.kill(-group, sig); } catch { /* gone */ } } };
@@ -143,7 +144,7 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
       say(stageLine(current, 'fail'));
       abort.abort();
       killChild('SIGTERM');
-      if (phase === 'committed') say(`ci-publish: run ${run} is committed, but verify did not finish: the next refresh checks the server`);
+      if (phase === 'committed') say(`ci-publish: ${run ? `run ${run}` : 'this run'} is committed, but verify did not finish: the next refresh checks the server`);
       else if (attemptId !== null) {
         const r = await Promise.race([
           failAttempt({ url, attemptId, stage: current, error: C.ciError(current, 'signal') }).then((x) => (x.updated ? 'recorded' : 'the attempt was no longer running'), () => 'not recorded'),
@@ -298,12 +299,17 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
     try {
       ({ run } = await stage('publish', () => publish({ url, attemptId, base: base?.run ?? null, delta: up.delta, checksum: up.checksum, mode,
         commit: prep.sourceSha, toolVersion: prep.toolVersion, repoDir: src, limits: txLimits, recordFailure: false, signal: abort.signal,
-        onStage: async (name, ctx) => { if (hook) await hook(name, ctx); if (name === 'ok') phase = 'committing'; } })));
+        onStage: async (name, ctx) => {
+          if (hook) await hook(name, ctx);
+          if (name === 'ok') phase = 'committing';
+          if (name === 'committed') phase = 'committed';
+        } })));
     } catch (e) {
       if (e.code === 'outcome-unknown') {                            // R12: never written over
         say(`ci-publish: OUTCOME UNKNOWN (publish:${e.stage}): the COMMIT reply was lost; do not publish again until the next run resolves it`);
         return end(C.CI_EXIT.outcomeUnknown);
       }
+      if (!(e.code === 'aborted' && e.kind === 'outcome-unknown')) phase = 'writing';   // nothing was committed
       throw e instanceof StageFail ? e : new StageFail('publish', kindOf(e), e.message);
     }
     phase = 'committed';

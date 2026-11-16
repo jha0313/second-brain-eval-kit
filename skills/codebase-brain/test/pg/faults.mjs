@@ -109,6 +109,20 @@ export async function normalizedDump(branch) {
   return { lines: lines.sort(), raw: raw.sort().join('\n') };
 }
 
+/** Every row of every brain table but the excluded ones (attempt), exactly as stored: ids, volatile columns and all. */
+export async function exactDump(branch) {
+  const c = await branch.connect('owner');
+  try {
+    await c.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const tables = (await c.query(`SELECT c.relname AS t FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'brain' AND c.relkind = 'r' ORDER BY 1`)).rows.map((r) => r.t).filter((t) => !C.DUMP_EXCLUDE_TABLES.includes(t));
+    const out = [];
+    for (const t of tables) for (const r of (await c.query(`SELECT to_jsonb(x)::text AS j FROM brain.${t} x`)).rows) out.push(`${t} ${r.j}`);
+    await c.query('COMMIT');
+    return out.sort();
+  } finally { await c.end().catch(() => {}); }
+}
+
 /** Server state that resetSchema does not rebuild: the brain roles (attributes, memberships), every role and database
  * setting (ALTER ROLE / ALTER DATABASE ... SET; '*' = all roles), the database ACL, the schemas besides brain_test
  * (harness-owned) with their ACLs, and the objects in public. */
@@ -152,8 +166,8 @@ export function dumpDiff(a, b, n = 3) {
  * Run a suite's scenarios on one branch. ctx = { branch, suite: <the suite's own state>, baseline } is passed to every
  * step. Each scenario: fresh schema -> prepare -> arrange -> fault -> after (default: the suite's clean) -> the
  * normalized dump must equal the baseline. A scenario marked `unchanged` (a failure that must write nothing but its
- * attempt row) must also leave the raw dump (ids kept) exactly as arrange left it: a partial write that the clean run
- * would later make look right still fails.
+ * attempt row) must also leave every other row exactly as arrange left it (exactDump: ids and volatile columns kept):
+ * a partial write that the clean run would later make look right still fails.
  * @param {{ name: string, setup?: (ctx) => Promise<void>, prepare: (ctx) => Promise<void>, clean: (ctx) => Promise<void>,
  *   scenarios: { name: string, unchanged?: boolean, arrange?: (ctx) => Promise<void>, fault: (ctx) => Promise<void>,
  *     after?: (ctx) => Promise<void> }[] }} suite
@@ -177,11 +191,10 @@ export async function runSuite(suite, { branch, only = null, log = (s) => consol
       await resetSchema(branch);
       await suite.prepare(ctx);
       await s.arrange?.(ctx);
-      const before = s.unchanged ? (await normalizedDump(branch)).raw : null;
+      const before = s.unchanged ? await exactDump(branch) : null;
       await s.fault(ctx);
       if (before !== null) {
-        const mid = (await normalizedDump(branch)).raw;
-        const d = dumpDiff(before.split('\n'), mid.split('\n'));
+        const d = dumpDiff(before, await exactDump(branch));
         if (d.gone || d.extra) throw new Error(`dump differs after the fault: ${d.gone} rows gone, ${d.extra} extra (it must write nothing)\n${d.sample.map((l) => `    ${l.slice(0, 240)}`).join('\n')}`);
       }
       await (s.after ?? suite.clean)(ctx);
