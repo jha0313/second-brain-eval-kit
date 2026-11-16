@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Phase 2 설계: 팀이 같이 쓰는 brain (Neon Postgres, 쓰기는 CI 한 곳)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap">
+<style>
+/* layout: sticky section index on the left, one reading column, widgets sit inside the section they explain */
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --sunk: #eef1f5; --fg: #18202b; --muted: #5a6475; --line: #dbe0e8;
+  --accent: #2f54c8; --accent-soft: #e5ebfb; --amber: #a86512; --amber-soft: #fbf0df; --ok: #23784f; --ok-soft: #e1f3ea;
+  --bad: #b8312f; --bad-soft: #fbe6e5; --term-bg: #111722; --term-fg: #d7dee9; --term-dim: #7f8ba0;
+  --font-body: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0e131a; --surface: #151c26; --sunk: #1b2430; --fg: #e4e9f1; --muted: #98a3b4; --line: #283242;
+  --accent: #86a2ff; --accent-soft: #1e2a4a; --amber: #e3a650; --amber-soft: #3a2a14; --ok: #5ccb8e; --ok-soft: #15322a;
+  --bad: #f07a76; --bad-soft: #3a1a1c; --term-bg: #0a0e14; --term-fg: #d7dee9; --term-dim: #7f8ba0; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0e131a; --surface: #151c26; --sunk: #1b2430; --fg: #e4e9f1; --muted: #98a3b4; --line: #283242;
+  --accent: #86a2ff; --accent-soft: #1e2a4a; --amber: #e3a650; --amber-soft: #3a2a14; --ok: #5ccb8e; --ok-soft: #15322a;
+  --bad: #f07a76; --bad-soft: #3a1a1c; --term-bg: #0a0e14; --term-fg: #d7dee9; --term-dim: #7f8ba0; color-scheme: dark; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { scroll-behavior: smooth; scroll-padding-top: 16px; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; animation: none !important; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.7 var(--font-body); -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); }
+code { font: 0.86em var(--font-mono); background: var(--sunk); padding: 0.1em 0.35em; border-radius: 4px; overflow-wrap: anywhere; }
+strong { font-weight: 600; }
+.shell { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 40px; max-width: 1320px; margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 32px 80px; }
+nav.toc { position: sticky; top: 16px; align-self: start; max-height: calc(100vh - 32px); overflow: auto; font-size: 13px; padding-right: 8px; }
+nav.toc .toc-head { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+nav.toc a { display: block; text-decoration: none; color: var(--muted); padding: 3px 10px; border-left: 2px solid transparent; line-height: 1.45; }
+nav.toc a.toc-l3 { padding-left: 22px; font-size: 12.5px; }
+nav.toc a:hover { color: var(--fg); }
+nav.toc a.on { color: var(--accent); border-left-color: var(--accent); font-weight: 500; }
+details.toc-mobile { display: none; }
+main { min-width: 0; max-width: 980px; }
+header.hero { padding-bottom: 20px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+header.hero .eyebrow { font: 500 12px var(--font-mono); color: var(--accent); letter-spacing: 0.04em; }
+h1 { font-size: clamp(26px, 3.4vw, 36px); line-height: 1.25; margin: 6px 0 16px; text-wrap: balance; font-weight: 700; letter-spacing: -0.01em; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { font-size: 12.5px; background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; color: var(--fg); }
+.chip span { color: var(--muted); margin-right: 6px; }
+.theme-toggle { float: right; font: 12px var(--font-body); background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; cursor: pointer; }
+section.sec { padding-top: 28px; }
+h2 { font-size: 23px; line-height: 1.35; margin: 18px 0 12px; text-wrap: balance; font-weight: 700; padding-top: 10px; border-top: 1px solid var(--line); }
+section.sec:first-of-type h2 { border-top: 0; }
+h3 { font-size: 18px; margin: 30px 0 10px; text-wrap: balance; font-weight: 600; }
+h4 { font-size: 15px; margin: 20px 0 6px; }
+p, li { max-width: 72ch; }
+ul, ol { padding-left: 1.3em; }
+li { margin: 4px 0; }
+#s0 { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 4px 24px 14px; margin-top: 24px; }
+#s0 h2 { border-top: 0; }
+#s0 li { margin: 10px 0; }
+blockquote { margin: 14px 0; padding: 10px 16px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 0 10px 10px 0; }
+blockquote p { margin: 0; }
+.table-wrap { overflow-x: auto; margin: 14px 0 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; line-height: 1.55; }
+th, td { text-align: left; vertical-align: top; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+th { background: var(--sunk); font-weight: 600; font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td:first-child { font-weight: 500; }
+.term-wrap { overflow-x: auto; margin: 14px 0; border-radius: 10px; background: var(--term-bg); }
+pre.term { margin: 0; padding: 14px 16px; font: 12.5px/1.6 var(--font-mono); color: var(--term-fg); white-space: pre; }
+figure.diagram { margin: 16px 0 20px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; overflow-x: auto; cursor: zoom-in; }
+figure.diagram:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+figure.diagram pre.mermaid { margin: 0; text-align: center; font: 12px var(--font-mono); color: var(--muted); }
+figure.diagram svg { max-width: 100%; height: auto; }
+figure.diagram figcaption { font-size: 11.5px; color: var(--muted); text-align: right; margin-top: 4px; }
+.zoom { position: fixed; inset: 0; background: color-mix(in srgb, var(--bg) 92%, transparent); z-index: 50; display: flex; flex-direction: column;
+  padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) 16px max(16px, env(safe-area-inset-left, 0px)); }
+.zoom .bar { display: flex; justify-content: flex-end; gap: 8px; }
+.zoom .stage { flex: 1; overflow: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; margin-top: 10px; padding: 16px; }
+.zoom .stage svg { max-width: none !important; height: auto; }
+.btn { font: 500 13px var(--font-body); background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent); color: var(--surface); border-color: var(--accent); }
+/* widgets */
+.widget { margin: 22px 0 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px 18px 16px; }
+.widget > .w-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 16px; margin-bottom: 10px; }
+.widget > .w-head b { font-size: 15px; }
+.widget > .w-head small { color: var(--muted); font-size: 12.5px; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; font-size: 13px; margin: 8px 0 14px; }
+.controls label { display: inline-flex; gap: 6px; align-items: center; }
+.controls select, .controls input[type=range] { font: 13px var(--font-body); color: var(--fg); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
+.sim-out { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 14px; }
+.reqlog { background: var(--term-bg); color: var(--term-fg); border-radius: 10px; font: 12px/1.65 var(--font-mono); padding: 10px 12px; height: 260px; overflow: auto; }
+.reqlog div { white-space: pre; }
+.reqlog .ok { color: #7fd6a4; } .reqlog .err { color: #ff8f8a; } .reqlog .dim { color: var(--term-dim); } .reqlog .db { color: #9fb6ff; }
+.result { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; font-size: 13px; background: var(--sunk); }
+.result .big { font: 600 15px var(--font-body); margin-bottom: 6px; }
+.pill { display: inline-block; font: 500 11.5px var(--font-mono); padding: 1px 8px; border-radius: 999px; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); } .pill.bad { background: var(--bad-soft); color: var(--bad); } .pill.warn { background: var(--amber-soft); color: var(--amber); } .pill.info { background: var(--accent-soft); color: var(--accent); }
+.result dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 8px 0 0; }
+.result dt { color: var(--muted); } .result dd { margin: 0; font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.tab { font: 500 13px var(--font-mono); padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--sunk); color: var(--muted); cursor: pointer; }
+.tab[aria-selected="true"] { background: var(--accent); color: var(--surface); border-color: var(--accent); }
+.tab .n { opacity: .7; margin-right: 6px; }
+.term .q { color: #f4c77a; } .term .h { color: #9fb6ff; } .term .f { color: #7fd6a4; } .term .x { color: #ff8f8a; } .term .d { color: var(--term-dim); }
+.waves { display: grid; grid-template-columns: repeat(var(--waves, 5), minmax(150px, 1fr)); gap: 10px; overflow-x: auto; padding-bottom: 4px; }
+.wave h5 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: 0.03em; }
+.task { display: block; width: 100%; text-align: left; font: 13px/1.4 var(--font-body); color: var(--fg); background: var(--sunk); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; cursor: pointer; transition: opacity .2s, border-color .2s, background .2s; }
+.task b { font-family: var(--font-mono); color: var(--accent); margin-right: 6px; }
+.task .sz { float: right; font: 11px var(--font-mono); color: var(--muted); }
+.task.dim { opacity: .32; }
+.task.sel { border-color: var(--accent); background: var(--accent-soft); }
+.task.up { border-color: var(--amber); }
+.task.down { border-color: var(--ok); }
+.task.crit { box-shadow: inset 3px 0 0 var(--bad); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); margin: 8px 0; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; border: 2px solid; }
+.detail { margin-top: 10px; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; font-size: 13.5px; background: var(--sunk); min-height: 70px; }
+.detail dl { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 6px 12px; margin: 0; }
+.detail dt { color: var(--muted); }
+.detail dd { margin: 0; }
+@media (max-width: 1080px) {
+  .shell { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  nav.toc { display: none; }
+  details.toc-mobile { display: block; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 12px 0 0; font-size: 13.5px; }
+  details.toc-mobile a { display: block; padding: 3px 0; text-decoration: none; color: var(--fg); }
+  details.toc-mobile a.toc-l3 { padding-left: 14px; color: var(--muted); }
+}
+@media (max-width: 720px) {
+  .sim-out { grid-template-columns: minmax(0, 1fr); }
+  #s0 { padding: 4px 16px 10px; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="toc" aria-label="목차"><p class="toc-head">목차</p><a href="#s0" class="toc-l2" data-id="s0">0. TL;DR</a><a href="#s1" class="toc-l2" data-id="s1">1. 왜 이 phase가 필요한가</a><a href="#s1-1" class="toc-l3" data-id="s1-1">1.1 로컬 brain의 비용</a><a href="#s1-2" class="toc-l3" data-id="s1-2">1.2 왜 지금인가</a><a href="#s1-3" class="toc-l3" data-id="s1-3">1.3 왜 서버 DB인가</a><a href="#s2" class="toc-l2" data-id="s2">2. Impact와 성공 기준</a><a href="#s3" class="toc-l2" data-id="s3">3. 범위</a><a href="#s4" class="toc-l2" data-id="s4">4. 요청 해석과 가정</a><a href="#s5" class="toc-l2" data-id="s5">5. High-level design</a><a href="#s5-1" class="toc-l3" data-id="s5-1">5.1 그림</a><a href="#s5-2" class="toc-l3" data-id="s5-2">5.2 구성 요소</a><a href="#s5-3" class="toc-l3" data-id="s5-3">5.3 핵심 결정</a><a href="#s6" class="toc-l2" data-id="s6">6. Low-level design</a><a href="#s6-1" class="toc-l3" data-id="s6-1">6.1 저장소</a><a href="#s6-2" class="toc-l3" data-id="s6-2">6.2 role과 비밀</a><a href="#s6-3" class="toc-l3" data-id="s6-3">6.3 publish (CI, 한 트랜잭션)</a><a href="#s6-4" class="toc-l3" data-id="s6-4">6.4 읽기 (서버 모드)</a><a href="#s6-5" class="toc-l3" data-id="s6-5">6.5 실패</a><a href="#s6-6" class="toc-l3" data-id="s6-6">6.6 안전 (Phase 1에서 이어짐)</a><a href="#s6-7" class="toc-l3" data-id="s6-7">6.7 mirror와 매핑</a><a href="#s6-8" class="toc-l3" data-id="s6-8">6.8 버전 질의</a><a href="#s6-9" class="toc-l3" data-id="s6-9">6.9 용량과 전송량</a><a href="#s7" class="toc-l2" data-id="s7">7. 테스트 계획</a><a href="#s7-1" class="toc-l3" data-id="s7-1">7.1 불변식 (Neon branch, suite마다 새 branch)</a><a href="#s7-2" class="toc-l3" data-id="s7-2">7.2 동등성 (sandbox 소스 repo, 같은 커밋·같은 cursor)</a><a href="#s7-3" class="toc-l3" data-id="s7-3">7.3 eval: 실제 질문과 키워드</a><a href="#s8" class="toc-l2" data-id="s8">8. 구현 계획</a><a href="#s8-1" class="toc-l3" data-id="s8-1">8.1 작업 표</a><a href="#s8-2" class="toc-l3" data-id="s8-2">8.2 의존 그래프와 병렬 레인</a><a href="#s9" class="toc-l2" data-id="s9">9. 열린 질문 (리뷰에서 정해 주세요)</a><a href="#s10" class="toc-l2" data-id="s10">10. 한계</a><a href="#s-부록-리뷰-반영-기록" class="toc-l2" data-id="s-부록-리뷰-반영-기록">부록: 리뷰 반영 기록</a></nav>
+  <main>
+    <header class="hero">
+      <button class="theme-toggle" id="themeBtn" type="button">테마 전환</button>
+      <div class="eyebrow">codebase-brain · Phase 2 · 설계서</div>
+      <h1>Phase 2 설계: 팀이 같이 쓰는 brain (Neon Postgres, 쓰기는 CI 한 곳)</h1>
+      <div class="chips"><div class="chip"><span>상태</span>설계 리뷰용 (코드 없음) · Codex(gpt-6.1-sol, xhigh) 리뷰 반영</div><div class="chip"><span>날짜</span>2026-11-16</div><div class="chip"><span>대상</span>Phase 1 설계(<code>docs/phase1-design.md</code>, GitHub 기억 + 3단계 읽기) 위에 쌓는다</div><div class="chip"><span>외부 의존 추가</span>Neon(관리형 Postgres) 1개, npm <code>pg</code>(node-postgres) 1개</div></div>
+      <details class="toc-mobile"><summary>목차</summary><a href="#s0" class="toc-l2" data-id="s0">0. TL;DR</a><a href="#s1" class="toc-l2" data-id="s1">1. 왜 이 phase가 필요한가</a><a href="#s1-1" class="toc-l3" data-id="s1-1">1.1 로컬 brain의 비용</a><a href="#s1-2" class="toc-l3" data-id="s1-2">1.2 왜 지금인가</a><a href="#s1-3" class="toc-l3" data-id="s1-3">1.3 왜 서버 DB인가</a><a href="#s2" class="toc-l2" data-id="s2">2. Impact와 성공 기준</a><a href="#s3" class="toc-l2" data-id="s3">3. 범위</a><a href="#s4" class="toc-l2" data-id="s4">4. 요청 해석과 가정</a><a href="#s5" class="toc-l2" data-id="s5">5. High-level design</a><a href="#s5-1" class="toc-l3" data-id="s5-1">5.1 그림</a><a href="#s5-2" class="toc-l3" data-id="s5-2">5.2 구성 요소</a><a href="#s5-3" class="toc-l3" data-id="s5-3">5.3 핵심 결정</a><a href="#s6" class="toc-l2" data-id="s6">6. Low-level design</a><a href="#s6-1" class="toc-l3" data-id="s6-1">6.1 저장소</a><a href="#s6-2" class="toc-l3" data-id="s6-2">6.2 role과 비밀</a><a href="#s6-3" class="toc-l3" data-id="s6-3">6.3 publish (CI, 한 트랜잭션)</a><a href="#s6-4" class="toc-l3" data-id="s6-4">6.4 읽기 (서버 모드)</a><a href="#s6-5" class="toc-l3" data-id="s6-5">6.5 실패</a><a href="#s6-6" class="toc-l3" data-id="s6-6">6.6 안전 (Phase 1에서 이어짐)</a><a href="#s6-7" class="toc-l3" data-id="s6-7">6.7 mirror와 매핑</a><a href="#s6-8" class="toc-l3" data-id="s6-8">6.8 버전 질의</a><a href="#s6-9" class="toc-l3" data-id="s6-9">6.9 용량과 전송량</a><a href="#s7" class="toc-l2" data-id="s7">7. 테스트 계획</a><a href="#s7-1" class="toc-l3" data-id="s7-1">7.1 불변식 (Neon branch, suite마다 새 branch)</a><a href="#s7-2" class="toc-l3" data-id="s7-2">7.2 동등성 (sandbox 소스 repo, 같은 커밋·같은 cursor)</a><a href="#s7-3" class="toc-l3" data-id="s7-3">7.3 eval: 실제 질문과 키워드</a><a href="#s8" class="toc-l2" data-id="s8">8. 구현 계획</a><a href="#s8-1" class="toc-l3" data-id="s8-1">8.1 작업 표</a><a href="#s8-2" class="toc-l3" data-id="s8-2">8.2 의존 그래프와 병렬 레인</a><a href="#s9" class="toc-l2" data-id="s9">9. 열린 질문 (리뷰에서 정해 주세요)</a><a href="#s10" class="toc-l2" data-id="s10">10. 한계</a><a href="#s-부록-리뷰-반영-기록" class="toc-l2" data-id="s-부록-리뷰-반영-기록">부록: 리뷰 반영 기록</a></details>
+    </header>
+<section id="s0" class="sec"><h2>0. TL;DR</h2>
+<ul><li><strong>문제.</strong> Phase 1까지 brain은 사람마다 로컬 SQLite다. 각자 <code>brain build</code>와 첫 <code>brain sync</code>를 돌려야 하고, 각자 GitHub 토큰이 필요하다. 서비스 repo(비공개, PR 약 1,300개)는 첫 sync만 약 2,700번 호출한다. 사본마다 시점이 달라서 같은 질문에 사람마다 다른 답이 나온다.</li><li><strong>Phase 2가 하는 일.</strong> brain의 진실을 Neon Postgres 하나로 옮긴다. 쓰기는 CI 한 곳만 한다. 사람이 수동으로 돌리는 workflow(<code>workflow_dispatch</code>)다. 사람과 에이전트는 SELECT만 되는 reader 연결로 같은 내용을 읽는다.</li><li><strong>데이터 모델.</strong> 파일·심볼·기억 항목마다 빌드가 바뀌어도 그대로인 id가 있다. 간선·링크·참조는 그 id를 가리킨다. 내용은 <strong>revision 행을 쌓기만</strong> 하고 덮어쓰지 않는다. 버전은 성공한 publish(run) 하나다. 기본 검색은 최신 run만 본다. <code>--as-of run:42 | commit:&lt;sha&gt; | &lt;날짜&gt;</code>를 주면 그때를 본다.</li><li><strong>읽는 길 둘.</strong> 기억 검색(<code>search</code> · <code>get</code> · <code>source</code>)은 서버에서 SQL 한 문장으로 끝낸다. 지도 명령(<code>impact</code> 등)은 노트북의 <strong>mirror</strong>(run 하나의 SQLite 사본)에서 Phase 0 코드로 돈다. mirror는 처음 한 번 전부 받고, 그 뒤에는 run 사이에 바뀐 행만 받는다. Neon Free의 월 5 GB 전송 한도 때문이다.</li><li><strong>안전.</strong> writer 비밀은 CI secret에만 있다. reader role은 DB가 쓰기를 거부한다. 마스킹과 인젝션 표시(Phase 1 §6.4–6.5)는 CI 안에서 업로드 전에 끝나고, 올리기 직전에 한 번 더 검사한다.</li></ul>
+</section>
+<section id="s1" class="sec"><h2>1. 왜 이 phase가 필요한가</h2>
+<div id="s1-1" class="sub"><h3>1.1 로컬 brain의 비용</h3>
+<div class="table-wrap"><table><thead><tr><th>비용</th><th>Phase 1 (사람마다 로컬)</th><th>근거</th></tr></thead><tbody><tr><td>준비 시간</td><td>사람마다 <code>brain build</code>(서비스 repo 노트북 기준 56초) + 첫 <code>brain sync</code>(약 2,700 호출, rate limit에 따라 수십 분)</td><td>서비스 repo로 잰 값: 파일 4,648개, 노드 2.8만, 간선 16만, 청크 5,057개, <code>code.db</code> 61.5 MB</td></tr><tr><td>토큰</td><td>사람마다 GitHub 토큰을 노트북에 둔다. 읽기만 필요한데 실제로는 쓰기 권한이 있는 토큰을 쓰게 된다</td><td>Phase 1 §4 가정(<code>GH_TOKEN</code> · <code>gh auth token</code>)</td></tr><tr><td>사본 불일치</td><td>cursor와 빌드 커밋이 사람마다 다르다. 같은 질문에 A의 brain은 PR을 찾고 B의 brain은 못 찾는다. &quot;누구 brain이 맞나&quot;를 알 수 없다</td><td>Phase 1 cursor는 로컬 <code>github.db</code>의 <code>sync_state</code></td></tr><tr><td>배달</td><td>새 팀원이나 새 노트북은 처음부터 다시 만든다. 파일을 건네면 파일마다 시점이 또 다르다</td><td></td></tr><tr><td>이력 없음</td><td><code>code.db</code>는 빌드마다 지우고 다시 만든다(<code>createDb</code>가 파일을 지움). <code>github.db</code>는 upsert로 덮어쓴다. &quot;지난주에는 이 문서가 뭐라고 했나&quot;에 답할 수 없다</td><td><code>src/db.mjs</code> <code>createDb</code>, Phase 1 R6</td></tr></tbody></table></div>
+</div>
+<div id="s1-2" class="sub"><h3>1.2 왜 지금인가</h3>
+<p>Phase 0의 로컬 빌드는 1분 안쪽이라 사람마다 돌려도 견딜 만했다. Phase 1이 GitHub 기억을 더하면서 사람마다 토큰과 긴 첫 sync가 필요해졌다. 팀이 brain을 같이 쓰려면 지금 한 곳으로 모아야 한다. 그래야 Phase 3에서 그 한 곳을 자동으로 갱신할 수 있다.</p>
+</div>
+<div id="s1-3" class="sub"><h3>1.3 왜 서버 DB인가</h3>
+<div class="table-wrap"><table><thead><tr><th>대안</th><th>무엇이 남나</th><th>판단</th></tr></thead><tbody><tr><td>CI가 SQLite 파일을 만들어 artifact나 release로 배포</td><td>여전히 사람마다 파일 전체를 받는다. 파일을 통째로 바꾸므로 revision 이력이 없다. 권한은 파일을 받느냐 마느냐뿐이다. artifact 저장 용량은 GitHub 플랜 한도에 걸린다</td><td>버림. Neon을 못 쓰게 되면 이 안으로 물러난다</td></tr><tr><td>공유 드라이브에 SQLite 하나</td><td>여러 사람이 동시에 열면 잠금·손상 위험. 원격 파일 시스템에서 SQLite 잠금은 믿을 수 없다</td><td>버림</td></tr><tr><td><strong>Postgres (Neon)</strong></td><td>한 곳의 진실. DB 권한으로 쓰기를 막는다. revision 이력과 as-of 질의. Neon branch로 테스트를 production과 떼어 놓는다</td><td><strong>택함</strong></td></tr></tbody></table></div>
+</div>
+</section>
+<section id="s2" class="sec"><h2>2. Impact와 성공 기준</h2>
+<div class="table-wrap"><table><thead><tr><th>영역</th><th>Phase 1 (로컬)</th><th>Phase 2 이후 (팀 서버)</th></tr></thead><tbody><tr><td>처음 쓰기까지</td><td>각자 build + sync + 토큰</td><td>reader URL 하나, 첫 지도 명령에서 mirror 한 번 받기</td></tr><tr><td>같은 질문, 같은 답</td><td>보장 없음</td><td>같은 run을 읽으면 같다. footer에 run id가 찍힌다</td></tr><tr><td>쓰기</td><td>누구나 자기 로컬 DB에</td><td>CI만. 에이전트의 쓰기는 DB가 거부한다</td></tr><tr><td>이력</td><td>빌드·sync마다 덮어씀</td><td>revision 누적. <code>--as-of</code>로 옛 내용 검색</td></tr><tr><td>GitHub 토큰</td><td>사람마다</td><td>CI 하나</td></tr></tbody></table></div>
+<p><strong>성공 기준 (구현 후 확인).</strong> 모두 sandbox repo와 Neon test branch에서 잰다(§4).</p>
+<ol><li>불변식 테스트 V1–V23(§7.1)가 전부 통과한다.</li><li><strong>지도 동등성.</strong> 같은 커밋에서 로컬 빌드 <code>code.db</code>와 mirror로 <code>find</code> · <code>refs</code> · <code>impact</code> · <code>deps</code> · <code>why</code>를 돌린 <code>--json</code> 결과가 의미상 같다. 비교에서 빼는 것은 시간(<code>ms</code>)과 freshness 줄뿐이다(§7.2).</li><li><strong>기억 검색 동등성.</strong> 같은 커밋·같은 cursor에서 서버 <code>search</code>가 로컬 <code>search</code>보다 정답 키 기준 hit@3이 낮지 않다. 바뀐 케이스는 모두 목록으로 낸다(§7.3).</li><li><strong>권한.</strong> reader로 직접 SQL을 보내 시도한 쓰기·DDL·임시 표가 전부 거부된다. writer는 DDL과 <code>DELETE</code>가 거부된다. 에이전트 환경에는 writer 비밀이 없다.</li><li><strong>지연.</strong> 서울 노트북에서 <code>search</code> p95 1.5초 이하(compute가 깨어 있을 때, 30회). 잠든 compute의 첫 질의 5초 이하(5회). 실측값을 보고한다.</li><li><strong>전송량.</strong> full mirror와 run 하나의 delta를 바이트로 잰다. 팀 10명, 월 90 run 기준 예상 월 전송량이 Free 한도(5 GB)의 50% 이하다.</li><li><strong>agent eval.</strong> skill-eval로 v2(로컬) 대 v3(서버)를 비교한다. A/A 쌍의 통과율 차이가 ±0.05 안일 때만 판정하고, v3 − v2의 95% CI 하한이 −0.10보다 크면 통과다.</li></ol>
+</section>
+<section id="s3" class="sec"><h2>3. 범위</h2>
+<p><strong>한다.</strong></p>
+<ul><li>codebase마다 Neon project 하나. 그 기본 branch가 production이다.</li><li>스키마와 migration: 바뀌지 않는 id, revision, 유효 구간(<code>valid_from</code> · <code>valid_to</code>), 덮어쓰기 금지 trigger, role 셋.</li><li>publisher(CI): CI가 새로 만든 SQLite(<code>code.db</code> + <code>github.db</code>)를 기준 run의 mirror와 비교해, 바뀐 행만 한 트랜잭션으로 쓴다.</li><li>mirror: 서버의 run 하나를 SQLite 사본으로 받는다. 처음은 전부, 그 뒤는 delta만. CI는 mirror의 <code>github.db</code>로 Phase 1 sync를 그대로 돌리고, 노트북은 mirror의 <code>code.db</code>로 지도 명령을 돌린다.</li><li>brain CLI 서버 모드와 <code>--as-of</code>.</li><li><code>brain-publish</code> workflow(수동)와 설치 문서.</li><li>실제 질문과 키워드로 만든 eval 세트와 실행.</li></ul>
+<p><strong>하지 않는다.</strong></p>
+<ul><li>자동 갱신(schedule, 스킬이 직접 dispatch). Phase 3에서 한다.</li><li>로컬에서 production에 publish하기. publish는 workflow로만 한다. 수동 갱신은 Run workflow 버튼이다.</li><li>migration workflow. migration은 관리자가 owner URL로 직접 돌린다. 드물고, CI에 owner 비밀을 두지 않기 위해서다.</li><li>사람마다 계정, SSO, 팀별 행 수준 권한(RLS). 한 codebase 안에서는 모두 같은 것을 읽는다.</li><li>웹 UI, 임베딩, 여러 repo를 묶은 검색.</li><li>옛 revision 정리(retention). 지금 규모에서는 필요 없다(§6.9).</li><li>vault(개인 Obsidian 노트). CI에는 vault가 없다. vault는 로컬 모드에서만 쓴다.</li><li>Neon IP Allow. Scale 플랜에만 있다.</li></ul>
+</section>
+<section id="s4" class="sec"><h2>4. 요청 해석과 가정</h2>
+<p>음성 전사에서 뜻을 추정한 부분이다. 틀렸으면 리뷰에서 바로잡아 주세요.</p>
+<div class="table-wrap"><table><thead><tr><th>요청 원문(전사)</th><th>이 설계의 해석</th></tr></thead><tbody><tr><td>&quot;팀이 같이 쓰는 체크브레인&quot;</td><td>팀이 같이 쓰는 brain. 서버 DB 하나를 모두가 읽는다</td></tr><tr><td>&quot;neon을 쓸 거야&quot;</td><td>Neon 관리형 Postgres</td></tr><tr><td>&quot;프로덕션 데이터베이스는 프로젝트 단위로 분리&quot;</td><td>codebase마다 Neon project 하나. 그 기본 branch가 production. 다른 codebase와 DB·role·비밀을 나누지 않는다. 테스트는 같은 project 안의 Neon branch에서 한다</td></tr><tr><td>&quot;파일이랑 심볼에 유니크 id, 프라이머리 키 잘 디퍼런스&quot;</td><td>파일과 심볼에 빌드가 바뀌어도 그대로인 id를 준다. 간선·링크가 그 id를 외래 키로 가리킨다(reference)</td></tr><tr><td>&quot;기억은 절대 덮어쓰지 말고 리디전으로&quot;</td><td>내용이 바뀌면 새 revision 행을 쓴다. 옛 행의 내용은 바꾸지 않는다</td></tr><tr><td>&quot;검색은 최신 버전만, 옛 버전은 버전을 지정해서&quot;</td><td>기본은 최신 run. <code>--as-of</code>로 run · 커밋 · 날짜를 지정한다</td></tr><tr><td>&quot;읽는 거는 선택만&quot;</td><td>SELECT만</td></tr><tr><td>&quot;라이트는 ci 시크릿에만&quot;</td><td>writer 연결 문자열은 GitHub Actions secret에만 둔다. 에이전트와 사람의 노트북에는 없다</td></tr><tr><td>&quot;빌드는 한 곳, ci 수동 실행으로만&quot;</td><td><code>workflow_dispatch</code>만 쓴다. 로컬 <code>brain build</code>는 로컬 모드에서만 쓴다</td></tr><tr><td>&quot;실제 질문이랑 키워드로 이벨&quot;</td><td>팀이 실제로 한 질문과 코드·PR에서 뽑은 키워드로 케이스를 만든다(§7.3)</td></tr></tbody></table></div>
+<p>가정과 확인한 사실:</p>
+<ul><li><strong>Neon project.</strong> 사용자의 Neon project를 production으로 쓴다(Free 플랜, <code>aws-us-west-2</code>). 2026-11-16 그 project에서 직접 확인했다: PostgreSQL 18.7, 기본 branch 이름 <code>production</code>, DB <code>neondb</code>, collation · ctype <code>C.UTF-8</code>(builtin provider), 기본값 <code>statement_timeout = 0</code> · <code>idle_in_transaction_session_timeout = 5min</code> · <code>lock_timeout = 0</code>. <code>pg_trgm</code> 1.6은 쓸 수 있고 아직 설치되지 않았다.</li><li><strong>한국어 trigram.</strong> 같은 locale(<code>C.UTF-8</code>, builtin)의 다른 Neon project(PostgreSQL 17.12)에서 확인했다(2026-11-16): <code>show_trgm('크레딧 예약')</code>이 trigram 7개, <code>similarity('실행 전에 크레딧을 예약', '크레딧 예약') = 0.4</code>, <code>ILIKE '%크레딧%'</code>이 맞는다. <code>to_tsvector('simple', …)</code>는 한국어를 공백으로만 자른다(<code>크레딧을</code>이 한 토큰). 그래서 한국어는 trigram이 맡는다. production에는 확장 설치 뒤 V14로 다시 확인한다.</li><li><strong>Free 한도.</strong> project당 저장 1 GB, 월 100 CU-hour, branch 10개, 공개망 전송 월 5 GB. 전송 한도를 넘으면 다음 결제 주기까지 compute가 멈춘다. compute는 5분 쉬면 잠들고 끌 수 없다(<a href="https://neon.com/docs/introduction/plans">Neon plans</a>).</li><li><strong>비밀 위치.</strong> 연결 문자열은 저장소에 넣지 않는다. 노트북은 brain 자기 디렉터리의 <code>.env.local</code>(0600, gitignore. <code>neon init</code>이 쓰는 파일)이나 환경 변수에서 읽는다. CI는 Actions secret에서 읽는다. Neon API 키는 <code>~/.config/neon/</code>에 둔다.</li><li>규모: 지도 행 약 19만(노드 2.8만 + 간선 16만), 청크 5천, 링크 2.3만, 청크 본문 5.5 MB, PR·리뷰·댓글 수만 행.</li><li>팀은 20명 이하다. reader 연결 수는 적다.</li><li><strong>서비스 repo는 이번 구현에서 건드리지 않는다</strong>(2026-11-16 결정). 그래서 workflow는 운영 repo 방식을 기본으로 만든다. 운영 repo(brain-ops)의 workflow가 서비스 repo <code>main</code>을 읽기 토큰으로 checkout하고 수집한다. writer 비밀은 운영 repo에만 있다. 서비스 repo 관리자가 직접 설치하는 방식은 문서로만 둔다. 구현 검증은 사용자 소유의 sandbox repo 두 개(소스 역할 · 운영 역할)와 Neon test branch로 한다. 서비스 repo 데이터를 production에 처음 publish하는 일은 읽기 토큰을 정한 뒤다(§9).</li></ul>
+</section>
+<section id="s5" class="sec"><h2>5. High-level design</h2>
+<div id="s5-1" class="sub"><h3>5.1 그림</h3>
+<figure class="diagram" tabindex="0" title="클릭하면 크게 봅니다"><pre class="mermaid">flowchart LR
+  subgraph SRC[&quot;GitHub 소스 repo (서비스 repo)&quot;]
+    MAIN[(&quot;main 브랜치&quot;)]
+    API[(&quot;REST API&lt;br/&gt;PR · 이슈 · 리뷰 · 댓글&quot;)]
+  end
+
+  subgraph OPS[&quot;GitHub 운영 repo (brain-ops)&quot;]
+    WF[&quot;workflow brain-publish&lt;br/&gt;workflow_dispatch만&quot;]
+    SEC[[&quot;secret&lt;br/&gt;BRAIN_WRITER_URL&lt;br/&gt;BRAIN_SOURCE_TOKEN&quot;]]
+    AC[(&quot;Actions cache&lt;br/&gt;mirror&quot;)]
+  end
+
+  subgraph CI[&quot;CI job&quot;]
+    MIR[&quot;mirror 복원&lt;br/&gt;+ delta 받기&quot;]
+    BUILD[&quot;brain build&lt;br/&gt;Phase 0 + sanitize&quot;]
+    SYNC[&quot;brain sync&lt;br/&gt;Phase 1, cursor 뒤만&quot;]
+    DIFF[&quot;publisher&lt;br/&gt;delta · 검사 · 한 트랜잭션&quot;]
+  end
+
+  subgraph NEON[&quot;Neon project (codebase 하나)&quot;]
+    PROD[(&quot;production branch&lt;br/&gt;DB neondb, schema brain&quot;)]
+    BR[(&quot;test branch&lt;br/&gt;copy-on-write&quot;)]
+  end
+
+  subgraph DEV[&quot;사람 · 에이전트 노트북&quot;]
+    CLI[&quot;brain CLI 서버 모드&lt;br/&gt;reader URL&quot;]
+    LM[(&quot;mirror&lt;br/&gt;code.db 모양&quot;)]
+  end
+
+  SEC --&gt; WF
+  MAIN -- &quot;읽기 토큰으로 checkout&quot; --&gt; BUILD
+  WF --&gt; MIR
+  AC &lt;--&gt; MIR
+  MIR --&gt; SYNC
+  WF --&gt; BUILD
+  API --&gt; SYNC
+  BUILD --&gt; DIFF
+  SYNC --&gt; DIFF
+  MIR --&gt; DIFF
+  PROD -- &quot;run delta (SELECT)&quot; --&gt; MIR
+  DIFF -- &quot;writer, 전부 아니면 전무&quot; --&gt; PROD
+  PROD -. &quot;branch&quot; .-&gt; BR
+  CLI -- &quot;search · get · source&lt;br/&gt;SQL 한 문장&quot; --&gt; PROD
+  PROD -- &quot;run delta (SELECT)&quot; --&gt; LM
+  LM --&gt; CLI</pre><figcaption>클릭하면 크게 봅니다</figcaption></figure>
+</div>
+<div id="s5-2" class="sub"><h3>5.2 구성 요소</h3>
+<div class="table-wrap"><table><thead><tr><th>구성 요소</th><th>책임</th><th>새로 / 바뀜</th></tr></thead><tbody><tr><td>Neon project</td><td>codebase 하나의 production DB. role 셋(owner · writer · reader). 테스트용 branch</td><td>새로</td></tr><tr><td>스키마 (<code>sql/*.sql</code>)</td><td>identity 표, revision 표, 유효 구간 표, <code>attempt</code> · <code>run</code> · <code>sync_state</code> · <code>binding</code>, 덮어쓰기 금지 trigger, 검색 색인</td><td>새로</td></tr><tr><td>migration (<code>src/pg/migrate.mjs</code>)</td><td>관리자가 owner URL로 돌린다. 번호 붙은 SQL 파일을 한 번씩</td><td>새로</td></tr><tr><td><code>brain-publish</code> workflow</td><td>소스 <code>main</code> checkout → mirror → build → sync → publish. writer 비밀. 수동</td><td>새로</td></tr><tr><td>snapshot (<code>src/pg/snapshot.mjs</code>)</td><td>SQLite 두 파일을 정규 키·사실 키·내용 해시가 붙은 행 집합으로 바꾼다. delta 계산, checksum, 업로드 전 검사</td><td>새로</td></tr><tr><td>publisher (<code>src/pg/publish.mjs</code>)</td><td>attempt 시작·실패·결과 확인, delta를 한 트랜잭션으로 쓰기</td><td>새로</td></tr><tr><td>mirror (<code>src/pg/mirror.mjs</code>)</td><td>run R을 SQLite 사본으로 받기. 처음은 전부, 그 뒤는 delta. checksum 확인, 원자적 교체</td><td>새로</td></tr><tr><td>store (<code>src/store/pg.mjs</code>, <code>src/store/sqlite.mjs</code>)</td><td>Phase 1 읽기 코드가 부르는 async 저장소 인터페이스. SQLite 구현과 Postgres 구현</td><td>새로 (Phase 1 <code>read.mjs</code>는 store를 부르게 바뀜)</td></tr><tr><td>CLI</td><td>서버 모드 선택, <code>--as-of</code>, mirror 관리, footer에 run 표시. Phase 0 지도 명령은 mirror 위에서 <strong>코드 그대로</strong> 돈다</td><td>바뀜</td></tr><tr><td>eval suite</td><td>실제 질문 + 키워드 케이스, 정답 키, 사전 등록</td><td>새로</td></tr></tbody></table></div>
+</div>
+<div id="s5-3" class="sub"><h3>5.3 핵심 결정</h3>
+<div class="table-wrap"><table><thead><tr><th>결정</th><th>이유</th><th>버린 대안</th></tr></thead><tbody><tr><td>codebase마다 Neon project 하나</td><td>project가 Neon에서 role · 비밀 · 용량 · 전송량 · 과금이 갈리는 단위다. 한 codebase의 사고가 다른 codebase로 번지지 않는다</td><td>한 project에 codebase마다 DB: role과 전송 한도가 project 전체에 걸린다</td></tr><tr><td>노드 identity는 <strong>정규 키</strong>: 파일 <code>path</code>, 디렉터리 <code>dir:path</code>, 심볼 <code>path#Name@kind</code>(kind를 늘 붙임). <code>Name</code>은 Phase 0의 <code>keyName</code>이다: 클래스 멤버는 <code>클래스.멤버</code>(<code>f#A.run@method</code>, <code>f#B.run@method</code>)</td><td>Phase 0 <code>nodes.key</code>는 이름이 겹칠 때만 <code>@kind</code>를 붙이고, 먼저 나온 선언이 접미사 없는 키를 가진다(<code>src/index-ts.mjs</code> <code>add</code>). <code>const Plan</code>과 <code>type Plan</code>의 순서만 바뀌어도 <code>file#Plan</code>의 주인이 바뀐다. Phase 0에서 (파일, <code>keyName</code>, kind)는 한 노드로 합쳐지므로 정규 키는 유일하다</td><td>Phase 0 key 그대로: 순서에 따라 바뀐다. Phase 0 정수 id: 빌드마다 바뀐다</td></tr><tr><td>파일 이름이 바뀌면 새 identity</td><td>git rename 추적은 추측이 섞인다. 옛 경로의 기억은 옛 identity에 남고 as-of로 찾는다</td><td>rename 추적(<code>git log --follow</code>)</td></tr><tr><td>내용은 revision 행으로만 쌓는다. 옛 행은 <code>valid_to</code>를 한 번 닫는 것 말고는 바꾸지 않는다</td><td>요구사항. 옛 포인터(<code>pr:1121@r2</code>)가 영원히 같은 글을 가리킨다. Phase 1의 build id 포인터 거부 규칙이 필요 없어진다</td><td>head 포인터 표(현재 revision을 가리키는 표를 따로 갱신): 쓰기가 두 번이고, as-of에는 어차피 유효 구간이 필요하다</td></tr><tr><td>버전 = run. run 행은 publish 트랜잭션 안에서만, 잠금을 쥔 채로 만든다. 실행 기록은 <code>attempt</code> 표에 따로 둔다</td><td>run id가 커밋 순서대로 커진다. 그래서 유효 구간을 run id로 비교할 수 있다. 실패한 실행은 run을 남기지 않는다</td><td>시작할 때 run 행을 만들기: 늦게 시작한 실행이 먼저 커밋하면 id 순서와 커밋 순서가 어긋난다</td></tr><tr><td>차이는 CI에서 계산하고, 트랜잭션에는 delta만 넣는다</td><td>기준 run의 mirror가 CI에 있다. 트랜잭션이 짧다</td><td>서버 쪽 staging 표 + 집합 연산: 행 19만 개를 매번 보낸다</td></tr><tr><td>경쟁은 잠금 + 기준 run 확인 + 커밋 순서 확인으로 막는다</td><td>트랜잭션 안에서 최신 run이 기준 run B이고, 새 커밋이 B 커밋의 자손이어야 쓴다. 아니면 쓰지 않고 끝낸다</td><td>긴 잠금: 빌드하는 몇 분 동안 잠금을 쥔다</td></tr><tr><td>서버가 진실이다. CI와 노트북은 <strong>mirror</strong>로 run을 따라간다. mirror는 처음 한 번 전부, 그 뒤 delta만 받는다</td><td>전송량. full mirror는 약 25 MB(서비스 repo 행 크기로 어림), delta는 run당 1 MB 안쪽이다. Free 전송 한도는 월 5 GB다. CI의 Actions cache는 속도용일 뿐, 없으면 서버에서 다시 받는다</td><td>run마다 전체 export: 팀 10명 × 월 90 run × 25 MB = 22 GB. CI가 artifact로 SQLite 배포: 이력 · 권한이 없다(§1.3)</td></tr><tr><td>지도 명령(<code>find</code> · <code>refs</code> · <code>impact</code> · <code>why</code> …)은 mirror에서 Phase 0 코드로</td><td>Phase 0 <code>impact</code>는 BFS를 돌며 노드마다 SQL을 한 번씩 부른다(<code>src/query.mjs</code> <code>impact</code>). 서버에 직접 하면 서울–오리건 왕복(약 130 ms)이 수백 번이다</td><td>지도 질의를 Postgres로 옮기기: 동작이 달라질 위험, 질의를 다시 짠다</td></tr><tr><td>기억 검색(<code>search</code> · <code>get</code> · <code>source</code>)은 서버에서, 명령마다 SQL 한 문장</td><td>한 문장은 스냅숏 하나를 본다. 그래서 run을 고르는 일과 후보 목록이 섞이지 않는다(<a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL isolation</a>). 왕복도 한 번이다</td><td>문장 여러 개를 READ COMMITTED로: 문장마다 다른 run을 볼 수 있다</td></tr><tr><td>순위는 Phase 1처럼 RRF를 클라이언트에서 합친다. 목록마다 후보는 SQL에서 뽑는다</td><td>Postgres <code>ts_rank</code>는 BM25와 다르다. 합치는 단계를 같은 코드로 두면 차이가 후보 목록에만 남고 eval로 잰다</td><td>Postgres 쪽 순위 함수 하나로 끝내기</td></tr><tr><td>한국어는 <code>pg_trgm</code></td><td>Neon에 <code>pg_trgm</code> 1.6은 있고 <code>pg_bigm</code> · <code>pgroonga</code>는 없다(<a href="https://neon.com/docs/extensions/pg-extensions">Neon extensions</a>, 2026-11-16 project에서 확인). 한국어 trigram 동작은 같은 locale에서 확인했다(§4)</td><td><code>pg_bigm</code>: Neon에 없다. ICU locale DB: builtin <code>C.UTF-8</code>에서 이미 동작해서 필요 없다</td></tr><tr><td>연결은 <code>pg</code> TCP 5432, <code>sslmode=require</code>. writer는 direct endpoint, reader는 pooled endpoint</td><td>Neon pooler는 PgBouncer transaction 모드라 <code>SET</code>, session 잠금, 트랜잭션을 넘는 임시 표를 못 쓴다(<a href="https://neon.com/docs/connect/connection-pooling">Neon pooling</a>). reader는 문장 하나라 pooler로 충분하다</td><td>Neon serverless driver(HTTP/WebSocket): 회사망에서 5432가 막힐 때의 대안으로만 남긴다(§9)</td></tr><tr><td>운영 repo 방식이 기본</td><td>서비스 repo를 건드리지 않는다(§4). writer 비밀을 운영 repo에만 두면, 서비스 repo에 쓸 수 있는 사람이나 에이전트가 브랜치 workflow로 비밀을 꺼내지 못한다</td><td>서비스 repo에 직접 설치: 비공개 repo에서 environment secret은 GitHub Pro · Team · Enterprise에서만 쓴다(<a href="https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments">GitHub environments</a>)</td></tr></tbody></table></div>
+</div>
+</section>
+<section id="s6" class="sec"><h2>6. Low-level design</h2>
+<div id="s6-1" class="sub"><h3>6.1 저장소</h3>
+<figure class="diagram" tabindex="0" title="클릭하면 크게 봅니다"><pre class="mermaid">erDiagram
+  attempt |o--o| run : &quot;성공하면 run 하나&quot;
+  run ||--o{ sync_state : &quot;출처별 상태&quot;
+  node ||--o{ node_rev : &quot;revision&quot;
+  node ||--o{ edge : &quot;src · dst&quot;
+  item ||--o{ item_rev : &quot;revision&quot;
+  item_rev ||--o{ chunk : &quot;본문 조각&quot;
+  item_rev ||--o{ ref : &quot;원시 참조&quot;
+  ref ||--o{ ref_link : &quot;해석 결과&quot;
+  chunk ||--o{ link : &quot;기억 → 코드&quot;
+  node ||--o{ link : &quot;대상&quot;
+
+  attempt {
+    bigint attempt_id PK
+    bigint gha_run_id &quot;Actions run id&quot;
+    int gha_attempt &quot;UK와 함께&quot;
+    text source_sha &quot;checkout한 소스 커밋&quot;
+    bigint base_run &quot;시작할 때 본 최신 run&quot;
+    text status &quot;running, ok, failed, abandoned, skipped&quot;
+    text stage &quot;실패한 단계&quot;
+    text error &quot;종류만, 비밀 없음&quot;
+    timestamptz started_at
+    timestamptz finished_at
+  }
+  run {
+    bigint run_id PK &quot;publish 트랜잭션 안에서&quot;
+    bigint attempt_id UK
+    text commit_sha
+    text mode &quot;normal, bootstrap&quot;
+    timestamptz published_at
+    text tool_version
+    int sanitize_version
+    jsonb meta &quot;Phase 0 meta, 로컬 경로 뺌&quot;
+    jsonb checksum &quot;표마다 행 수와 해시&quot;
+  }
+  sync_state {
+    bigint run_id PK
+    text source PK &quot;github, git&quot;
+    jsonb state &quot;Phase 1 sync_state 전체 + 항목별 수집 장부&quot;
+  }
+  node {
+    bigint node_id PK
+    text key UK &quot;path, dir:path, path#Name@kind&quot;
+    text node_kind &quot;file, dir, symbol&quot;
+    bigint file_id FK &quot;심볼이 속한 파일&quot;
+  }
+  node_rev {
+    bigint rev_id PK
+    bigint node_id FK
+    int rev_no
+    bigint valid_from
+    bigint valid_to &quot;null이면 현재&quot;
+    bytea hash
+    text p0_key &quot;Phase 0 표시용 key&quot;
+    text kind
+    text name
+    int line
+    int end_line
+    bigint parent_id FK
+    bool exported
+  }
+  edge {
+    bigint edge_id PK
+    bytea fact_key &quot;사실 튜플 해시&quot;
+    bigint src_id FK
+    bigint dst_id FK
+    text kind
+    bigint site_file_id FK
+    int line
+    int col
+    bigint valid_from
+    bigint valid_to
+  }
+  item {
+    bigint item_id PK
+    text ptr UK &quot;pr:123, review:9, doc:docs/a.md, commit:sha40&quot;
+    text kind
+    text origin &quot;github, repo&quot;
+  }
+  item_rev {
+    bigint rev_id PK
+    bigint item_id FK
+    int rev_no
+    bigint valid_from
+    bigint valid_to
+    bytea hash
+    text title
+    text body
+    text state
+    text author
+    timestamptz source_updated_at
+    jsonb meta
+    int sanitize_version
+  }
+  chunk {
+    bigint chunk_id PK
+    bigint rev_id FK
+    int ord
+    int start_line
+    int end_line
+    text title
+    text body
+    tsvector tsv &quot;생성 열&quot;
+  }
+  ref {
+    bigint ref_id PK
+    bigint rev_id FK
+    text kind &quot;file, dir, symbol, commit, item, route, name&quot;
+    text target &quot;문자열 키&quot;
+    text origin &quot;pr-files, merge-sha, inline, text&quot;
+  }
+  ref_link {
+    bigint ref_link_id PK
+    bytea fact_key
+    bigint ref_id FK
+    text status &quot;linked, ambiguous, unlinked&quot;
+    jsonb resolved &quot;노드 정규 키, 최대 10&quot;
+    bigint valid_from
+    bigint valid_to
+  }
+  link {
+    bigint link_id PK
+    bytea fact_key
+    bigint chunk_id FK
+    bigint node_id FK
+    text kind
+    text evidence
+    bigint valid_from
+    bigint valid_to
+  }</pre><figcaption>클릭하면 크게 봅니다</figcaption></figure>
+<p>그림에서 <code>binding</code>(소스 repo id · 이름, 운영 repo, workflow 파일. 한 행, 한 번만 쓴다)과 <code>unresolved</code>(Phase 0 <code>unresolved</code>와 같은 열 + <code>fact_key</code> + 유효 구간)는 뺐다.</p>
+<p><strong>표의 세 모양.</strong></p>
+<div class="table-wrap"><table><thead><tr><th>모양</th><th>표</th><th>쓰기 규칙</th></tr></thead><tbody><tr><td>identity</td><td><code>node</code>, <code>item</code>, <code>binding</code></td><td>한 번 쓰면 바뀌지 않는다. 사라졌다 다시 나타나면 같은 identity를 다시 쓴다</td></tr><tr><td>revision</td><td><code>node_rev</code>, <code>item_rev</code></td><td>내용 해시가 다를 때만 새 행. <code>rev_no</code>는 그 identity의 전체 이력에서 다음 번호. 딸린 <code>chunk</code> · <code>ref</code>는 revision과 함께 쓰고 바꾸지 않는다</td></tr><tr><td>유효 구간 사실</td><td><code>edge</code>, <code>unresolved</code>, <code>link</code>, <code>ref_link</code></td><td>행 하나가 사실 하나. 사실이 사라지면 <code>valid_to</code>를 닫고, 다시 생기면 새 행</td></tr><tr><td>기록</td><td><code>run</code>, <code>sync_state</code></td><td>publish 트랜잭션에서 넣기만 한다</td></tr><tr><td>실행 기록</td><td><code>attempt</code></td><td><code>status</code>가 <code>running</code>에서 끝 상태로 한 번만 바뀐다</td></tr></tbody></table></div>
+<p><strong>보이는 행.</strong></p>
+<ul><li>run R 시점: <code>valid_from &lt;= R AND (valid_to IS NULL OR valid_to &gt; R)</code>. <code>chunk</code> · <code>ref</code>는 자기 revision이 보이면 보인다.</li><li>최신: 위 식에 R = 최신 run을 넣는다. 한 문장 안에서 최신 run을 고르고 그 R로 거른다. 그래서 문장 도중에 publish가 끝나도 섞이지 않는다.</li><li>run id는 publish 잠금을 쥔 채로 매기므로 커밋 순서대로 커진다. 구간은 run id로 비교해도 된다.</li></ul>
+<p><strong>포인터.</strong> Phase 1 문법을 그대로 쓰고 revision 접미사를 더한다.</p>
+<div class="table-wrap"><table><thead><tr><th>포인터</th><th>뜻</th></tr></thead><tbody><tr><td><code>pr:1121</code></td><td>그 항목의 최신 revision (<code>--as-of</code>가 있으면 그 시점의 revision)</td></tr><tr><td><code>pr:1121@r2</code></td><td>그 항목의 2번째 revision. 영원히 같은 글</td></tr><tr><td><code>doc:docs/billing.md:12-31@r3</code></td><td>그 문서 3번째 revision의 12–31줄 청크. Phase 1의 <code>@&lt;build_id&gt;</code>를 대신한다</td></tr><tr><td><code>commit:6b820f87</code></td><td>커밋. 내용이 바뀌지 않으므로 revision이 하나다</td></tr></tbody></table></div>
+<p><strong>제약과 색인.</strong></p>
+<ul><li>유일: <code>node(key)</code>, <code>item(ptr)</code>, <code>node_rev(node_id, rev_no)</code>, <code>item_rev(item_id, rev_no)</code>, <code>attempt(gha_run_id, gha_attempt)</code>, <code>run(attempt_id)</code>.</li><li>현재 행은 하나뿐: <code>node_rev(node_id)</code>, <code>item_rev(item_id)</code>, 사실 표의 <code>(fact_key)</code>에 <code>WHERE valid_to IS NULL</code> 유일 partial index.</li><li><code>CHECK (valid_to IS NULL OR valid_to &gt; valid_from)</code>. 옛 구간끼리 겹칠 수 없다. 새 행의 <code>valid_from</code>은 늘 지금 publish의 run id(지금까지 가장 큰 값)이고, 닫을 수 있는 행은 현재 행뿐이기 때문이다. 별도 배제 제약(<code>btree_gist</code>)은 두지 않는다.</li><li><code>ref_link.resolved</code>는 표시용 증거라 외래 키가 아니다. 노드 정규 키 문자열로 둔다.</li><li>검색: <code>chunk.tsv</code>와 <code>item_rev</code> 제목에 GIN, <code>chunk.body</code>에 <code>gin_trgm_ops</code> GIN. 현재 행 전용 색인은 따로 두지 않는다. 청크 5천 개 규모라 재 보고 필요할 때 더한다.</li><li>조회: <code>edge(dst_id, kind) WHERE valid_to IS NULL</code>, <code>edge(src_id, kind) WHERE valid_to IS NULL</code>, <code>ref(target)</code>, <code>ref(rev_id)</code>, <code>link(node_id)</code>.</li></ul>
+<p><strong><code>tsv</code>.</strong> <code>setweight(to_tsvector('english', title), 'A') || setweight(to_tsvector('english', body), 'B')</code>. Phase 0 FTS의 porter 어간 처리와 가장 가깝다. 한국어는 trigram 색인이 맡는다(§4).</p>
+</div>
+<div id="s6-2" class="sub"><h3>6.2 role과 비밀</h3>
+<div class="table-wrap"><table><thead><tr><th>role</th><th>만드는 곳</th><th>권한</th><th>비밀을 아는 곳</th></tr></thead><tbody><tr><td><code>neondb_owner</code></td><td>Neon이 만든 기본 role (<code>neon_superuser</code>)</td><td>DDL, migration, 비상시 정리</td><td>관리자 1–2명의 <code>.env.local</code>(<code>neon init</code>이 쓴 것)이나 <code>~/.config/neon/</code></td></tr><tr><td><code>brain_writer</code></td><td>SQL (<code>CREATE ROLE … LOGIN</code>)</td><td>schema <code>brain</code> <code>USAGE</code>. 표 <code>SELECT</code> · <code>INSERT</code>. revision·사실 표는 <code>UPDATE (valid_to)</code>만, <code>attempt</code>는 <code>UPDATE (status, stage, error, finished_at)</code>만. sequence <code>USAGE</code>. <code>DELETE</code> · <code>TRUNCATE</code> · DDL · <code>TEMPORARY</code> 없음</td><td>운영 repo의 Actions secret <code>BRAIN_WRITER_URL</code>(direct endpoint)만</td></tr><tr><td><code>brain_reader</code></td><td>SQL</td><td><code>CONNECT</code>, schema <code>brain</code> <code>USAGE</code>, 표 <code>SELECT</code>. 기본값 <code>default_transaction_read_only = on</code>, <code>statement_timeout = 15s</code></td><td>팀 비밀 저장소. 노트북은 brain 디렉터리의 <code>.env.local</code>이나 환경 변수</td></tr></tbody></table></div>
+<ul><li>SQL로 만든 role은 <code>neon_superuser</code>에 들어가지 않고, 권한을 명시적으로 줘야 한다(<a href="https://neon.com/docs/manage/roles">Neon roles</a>). 그래서 writer와 reader는 SQL로 만든다.</li><li>PUBLIC에서 걷어 낸다: <code>REVOKE ALL ON SCHEMA brain FROM PUBLIC</code>, <code>REVOKE CREATE ON SCHEMA public FROM PUBLIC</code>, <code>REVOKE CREATE, TEMPORARY ON DATABASE neondb FROM PUBLIC</code>. 기본값으로는 PUBLIC에 <code>TEMPORARY</code>가 있어서, reader가 읽기 전용을 끄면 임시 표를 만들 수 있다(<a href="https://www.postgresql.org/docs/current/ddl-priv.html">PostgreSQL privileges</a>). 앞으로 만들 표에도 같은 권한이 가도록 <code>ALTER DEFAULT PRIVILEGES</code>를 쓴다.</li><li><code>default_transaction_read_only</code>는 세션이 끌 수 있다(<a href="https://www.postgresql.org/docs/current/sql-set-transaction.html">PostgreSQL SET TRANSACTION</a>). 막는 장치는 GRANT다. 읽기 전용 기본값은 실수를 줄이는 보조 장치다.</li><li><strong>변수 이름 (읽는 쪽은 reader만).</strong> brain CLI의 서버 모드는 <code>BRAIN_READER_URL</code> 하나만 읽는다: 환경 변수, 없으면 brain 자기 디렉터리의 <code>.env.local</code>에 있는 같은 이름. <code>DATABASE_URL</code> · <code>DATABASE_URL_UNPOOLED</code>(<code>neon init</code>이 쓰는 owner URL)는 <strong>어디서도 읽지 않는다.</strong> 관리자 노트북의 <code>.env.local</code>에 owner URL이 있어도 에이전트가 그 권한을 얻지 못한다. 연결한 뒤 첫 문장에서 <code>current_user = 'brain_reader'</code>이고 <code>has_table_privilege(current_user, 'brain.run', 'INSERT')</code>가 거짓인지 확인하고, 아니면 연결을 끊고 거부한다(exit 2, &quot;reader 계정이 아닙니다&quot;). 이어서 <code>brain.binding</code>의 소스 repo가 지금 checkout의 <code>origin</code>과 같은지 확인하고, 다르면 거부한다.</li><li>writer URL은 <code>ci-publish</code>만 <code>BRAIN_WRITER_URL</code>에서 읽는다. owner URL은 <code>migrate</code>만 명령행 인자로 받는다. 세 이름이 겹치지 않으므로 한 변수로 권한이 새지 않는다(V2에 &quot;owner URL이 든 <code>.env.local</code>에서 서버 모드&quot; 시나리오를 더한다).</li><li>reader 비밀이 새면: 누구든 brain을 읽을 수 있다(마스킹된 글과 지도). 쓰지는 못한다. <code>ALTER ROLE brain_reader PASSWORD …</code>로 바꾸고 팀에 새 URL을 돌린다. IP 제한은 Scale 플랜에만 있다.</li><li>writer 비밀의 경계: 운영 repo에 push할 수 있는 사람은 workflow를 고쳐 secret을 꺼낼 수 있다. 그래서 운영 repo의 쓰기 권한은 관리자만 갖는다. 서비스 repo에 쓰기 권한이 있는 사람과 에이전트는 운영 repo에 push할 수 없다.</li><li>fork에서 온 workflow에는 기본값으로 <code>GITHUB_TOKEN</code> 말고는 secret이 넘어가지 않는다(<a href="https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets">GitHub secrets</a>). 비공개 repo에는 fork PR에 secret을 보내는 설정이 있다(<a href="https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository">GitHub Actions settings</a>). 운영 repo에서는 그 설정을 끄고, <code>brain-publish</code>는 <code>pull_request</code> · <code>pull_request_target</code>으로 돌지 않는다.</li></ul>
+<p><strong>덮어쓰기 금지 trigger.</strong></p>
+<ul><li>revision·사실·기록 표에 <code>BEFORE UPDATE OR DELETE</code>: <code>DELETE</code>는 거부한다. <code>UPDATE</code>는 <code>OLD.valid_to IS NULL</code>이고 <code>NEW.valid_to IS NOT NULL</code>이며 나머지 열이 모두 같을 때만 허용한다. <code>run</code> · <code>sync_state</code> · identity 표는 <code>UPDATE</code>도 거부한다.</li><li><code>attempt</code>: <code>OLD.status = 'running'</code>일 때만 끝 상태로 바꿀 수 있다. <code>ok</code>는 publish 트랜잭션 안에서만 된다(같은 트랜잭션이 <code>run</code> 행을 넣었을 때).</li><li>column 단위 GRANT와 겹치는 이중 장치다. owner의 실수도 막는다. 정리(retention)를 하게 되면 owner가 trigger를 잠시 끄는 migration으로만 한다.</li></ul>
+</div>
+<div id="s6-3" class="sub"><h3>6.3 publish (CI, 한 트랜잭션)</h3>
+<figure class="diagram" tabindex="0" title="클릭하면 크게 봅니다"><pre class="mermaid">sequenceDiagram
+  autonumber
+  participant WF as brain-publish job
+  participant DB as Neon production (writer)
+  participant GH as 소스 repo (GitHub)
+
+  WF-&gt;&gt;GH: main checkout (읽기 토큰, fetch-depth 0)
+  WF-&gt;&gt;DB: 짧은 트랜잭션: attempt INSERT (running), 기준 run B = 최신 run
+  WF-&gt;&gt;WF: mirror 복원 (Actions cache) + delta로 B까지, checksum 확인
+  WF-&gt;&gt;WF: brain build (Phase 0 + sanitize) → 새 code.db
+  WF-&gt;&gt;GH: brain sync (Phase 1, mirror의 github.db 사본 위에서)
+  WF-&gt;&gt;WF: snapshot. delta = 새 상태 − B. 업로드 전 검사
+  WF-&gt;&gt;DB: 새 연결. BEGIN, 잠금
+  alt 최신 run = B, 새 커밋이 B의 자손, attempt가 running
+    WF-&gt;&gt;DB: run INSERT (새 run id), identity · revision · 사실, valid_to 닫기
+    WF-&gt;&gt;DB: sync_state, 행 수 검사, attempt = ok
+    WF-&gt;&gt;DB: COMMIT
+  else 기준이 바뀜
+    WF-&gt;&gt;DB: ROLLBACK. attempt = failed (stale-base)
+  end
+  WF-&gt;&gt;DB: 새 연결로 결과 확인, mirror를 새 run으로 올려 cache에 저장</pre><figcaption>클릭하면 크게 봅니다</figcaption></figure>
+<p><strong>규칙.</strong></p>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>규칙</th><th>근거</th></tr></thead><tbody><tr><td>R1</td><td>workflow 파일에 소스 repo(<code>owner/name</code>)를 적는다. 입력으로 받지 않는다. 시작할 때 소스 repo id가 <code>brain.binding</code>과 같은지 본다. 다르면 쓰지 않는다</td><td>설정이 틀린 publisher가 다른 repo의 <code>pr:N</code>을 같은 identity에 섞지 않게</td></tr><tr><td>R2</td><td>시작할 때 짧은 트랜잭션 하나로 <code>attempt</code>(running, Actions run id · attempt 번호, 소스 커밋)를 쓰고 기준 run B를 읽는다. 연결은 닫는다</td><td>빌드·sync 동안 연결을 쥐지 않는다. 같은 Actions attempt가 두 번 오면 유일 제약이 막는다</td></tr><tr><td>R3</td><td>기준 상태 = B의 mirror. Actions cache에 있으면 그것을 B까지 delta로 올리고, 없으면 서버에서 전부 받는다. 어느 쪽이든 checksum이 <code>run[B].checksum</code>과 같아야 한다</td><td>CI는 디스크가 없어도 증분이 된다. Phase 1 sync가 mirror의 <code>github.db</code>에서 그대로 돈다</td></tr><tr><td>R4</td><td>지도와 repo 기억(문서 · <code>changes/</code> · CHANGELOG · 커밋 메시지)은 매번 checkout에서 전부 다시 만든다(Phase 0 build)</td><td>빌드는 1분 안쪽이다. 증분 빌드의 버그 위험을 지지 않는다</td></tr><tr><td>R5</td><td>정규 키: 노드 = §5.3의 정규 키. 사실 키 = sha256(정규 튜플). 간선 = (src 키, dst 키, kind, site 경로, line, col). 링크 = (청크 키, 노드 키, kind, evidence). ref_link = (항목 ptr, rev_no, ref 순번, status, resolved). 청크 키 = (ptr, rev_no, ord). 항목 = <code>ptr</code>. snapshot은 같은 튜플을 하나로 합친다</td><td>정수 id 없이 두 상태를 비교한다. Phase 0 <code>edges</code>에는 유일 제약이 없다(<code>src/db.mjs</code>)</td></tr><tr><td>R6</td><td>내용 해시 = sha256(정해 둔 열의 정규화 JSON). 노드: kind · name · line · end_line · parent 키 · exported · lang · flags · Phase 0 key. 항목: 정리된 제목 · 본문 · 상태 · 작성자 · 메타 · <code>sanitize_version</code> · 청크 목록 · ref 목록. 관측 시각(<code>fetched_at</code>), 수집 장부(<code>detail_for</code> · <code>reviews_at</code>)는 넣지 않는다. 열 목록은 Q0에서 고정한다</td><td>같은 내용이면 같은 해시. 다시 돌려도 새 revision이 생기지 않는다(멱등)</td></tr><tr><td>R7</td><td>snapshot에 범위 표(manifest)를 붙인다: 지도 · repo 문서 = <code>full</code>, 커밋 = <code>append</code>, GitHub = <code>incremental</code> 또는 <code>full</code>. <code>full</code> 범위에서 사라진 키는 현재 행을 닫는다. <code>append</code> · <code>incremental</code>에서는 안 보인다고 닫지 않는다. 다시 나타난 키는 같은 identity에 새 revision</td><td>증분 sync는 삭제를 모른다. Phase 1 §10 삭제 규칙(삭제는 <code>--full</code>에서만) 유지</td></tr><tr><td>R8</td><td>커밋 항목과 그 청크는 닫지 않는다. Phase 0은 최근 커밋 5,000개만 색인하므로 목록에서 빠져도 사라진 것이 아니다. 커밋 청크의 <code>link</code>는 대상 노드가 닫힐 때만 닫는다</td><td>기억이 이유 없이 지워지지 않게. mirror에는 남은 커밋이 모두 있다</td></tr><tr><td>R9</td><td>쓰기 트랜잭션: 연결 옵션 <code>transaction_timeout=60s</code>(PostgreSQL 17 이상) → <code>BEGIN</code> → <code>SET LOCAL statement_timeout = '30s'</code>, <code>lock_timeout = '15s'</code> → <code>pg_advisory_xact_lock(&lt;publish 키&gt;)</code> → 확인 셋(최신 run = B, 새 커밋이 B 커밋의 자손 또는 같음, 내 attempt가 <code>running</code>) → <code>run</code> INSERT → delta → <code>sync_state</code> → 현재 행 수 = checksum의 행 수 → <code>attempt = ok</code> → <code>COMMIT</code></td><td>지도 · 기억 · cursor가 같이 들어가거나 같이 안 들어간다. 잠금은 트랜잭션이 끝나면 저절로 풀린다. 예외 하나: bootstrap(Phase 3, 관리자가 게이트를 연 실행)은 force-push 복구를 위해 자손 확인만 건너뛰고 <code>run.mode = bootstrap</code>을 남긴다. 잠금과 &quot;최신 run = B&quot;는 그대로다</td></tr><tr><td>R10</td><td>확인 셋 중 하나라도 틀리면 <code>ROLLBACK</code>하고 attempt를 <code>failed (stale-base)</code>로 끝낸다. 다시 돌지 않는다. 다음 실행이 새 기준으로 한다</td><td>publish는 workflow 하나뿐이고 concurrency로 줄을 선다. 이 경우는 드물다. 재시도가 옛 checkout을 새 run 위에 쓰는 일을 막는다</td></tr><tr><td>R11</td><td>실패 기록: 새 연결에서 <code>BEGIN</code> → 같은 잠금 → <code>UPDATE attempt SET status = 'failed' … WHERE attempt_id = $1 AND status = 'running'</code> → <code>COMMIT</code>. <code>error</code>에는 단계와 종류만 쓴다</td><td>잠금을 쥐면 원래 트랜잭션은 끝난 것이다. <code>ok</code>를 <code>failed</code>로 덮지 않는다</td></tr><tr><td>R12</td><td><code>COMMIT</code> 응답을 못 받으면: 새 연결에서 같은 잠금을 쥔 뒤(<code>lock_timeout = 60s</code>) <code>run</code>에 내 attempt가 있는지 본다. 있으면 성공이다. 없으면 롤백된 것이고 R11로 간다. 잠금을 못 쥐면 결과를 &quot;모름&quot;으로 남기고 job을 실패로 끝낸다. 다시 쓰지 않는다</td><td>원래 트랜잭션은 끝날 때까지 잠금을 쥔다. 잠금 없이 상태를 읽으면 커밋 중인 트랜잭션을 롤백으로 오판한다</td></tr><tr><td>R13</td><td>첫 publish(서버가 빈 상태)는 행이 19만 개 넘게 들어간다. 1만 행 묶음으로 같은 트랜잭션 안에서 쓰고, 이때만 <code>transaction_timeout</code>을 10분으로 둔다</td><td>평소 delta는 수천 행 이하라 수 초 안에 끝난다</td></tr><tr><td>R14</td><td>migration이 <code>CREATE EXTENSION pg_trgm</code>을 하고, V14(한국어 trigram)를 production branch에서 바로 돌린다</td><td>확인은 같은 locale의 다른 project에서 했다(§4). production에서 한 번 더 본다</td></tr><tr><td>R15</td><td>sanitize 규칙이 바뀌면(<code>sanitize_version</code> 증가) 다음 publish는 <code>--full</code>이어야 한다(GitHub 전부 다시 받아 다시 정리). 이번 빌드가 다시 만들지 않는 현재 revision(빌드 창 5,000개 밖의 커밋 청크 등)은 CI가 mirror에서 읽어 새 규칙으로 다시 정리하고 새 revision으로 쓴다. 그래서 <code>--full</code> 뒤 현재 revision은 모두 새 <code>sanitize_version</code>이다(V20이 확인). 해시에 버전이 들어가므로 글이 있는 revision은 모두 새로 생긴다. 옛 revision은 그대로다. 옛 규칙이 놓친 비밀이 옛 revision에 있으면 owner가 그 행만 지우는 비상 migration을 쓴다(trigger를 잠시 끔)</td><td>&quot;덮어쓰지 않음&quot;과 &quot;새 비밀은 지워야 함&quot;이 부딪히는 유일한 곳. 비상 절차로만 연다</td></tr><tr><td>R16</td><td>업로드 전 검사: delta의 모든 문자열(키 · 경로 · import 문자열 · 메타 · 오류)에 Phase 1 비밀 탐지를 돌린다. 하나라도 걸리면 쓰지 않고 실패한다. 키는 마스킹하지 않는다(참조가 깨진다). meta의 로컬 경로(<code>repo</code>, 작업 트리)는 빼고 올린다</td><td>Phase 1의 마스킹은 글 본문만 본다. Phase 0은 경로와 import 문자열을 그대로 저장한다</td></tr></tbody></table></div>
+<p><strong>호출·시간 추정 (서비스 repo).</strong></p>
+<div class="table-wrap"><table><thead><tr><th>단계</th><th>크기</th><th>시간 추정</th></tr></thead><tbody><tr><td>mirror (cache 있음, delta)</td><td>1 MB 안쪽</td><td>수 초</td></tr><tr><td>mirror (cache 없음, 전부)</td><td>약 25–50 MB (<code>github.db</code> 포함)</td><td>10–30초</td></tr><tr><td><code>brain build</code></td><td>파일 4,648개</td><td>노트북 56초, CI 러너 2분 안쪽</td></tr><tr><td><code>brain sync</code> (증분)</td><td>약 80 호출</td><td>1분 안쪽</td></tr><tr><td>delta 쓰기</td><td>평소 수백–수천 행</td><td>수 초</td></tr></tbody></table></div>
+</div>
+<div id="s6-4" class="sub"><h3>6.4 읽기 (서버 모드)</h3>
+<figure class="diagram" tabindex="0" title="클릭하면 크게 봅니다"><pre class="mermaid">sequenceDiagram
+  participant A as 에이전트
+  participant B as brain CLI
+  participant P as Neon (reader, pooled)
+  participant M as mirror (로컬 SQLite)
+
+  A-&gt;&gt;B: brain search &quot;왜 실행 전에 예약하나&quot; --path lib/credits.ts
+  B-&gt;&gt;P: SQL 한 문장: 최신 run R 고르기 + 후보 목록 (FTS · trigram · ref 경로)
+  P--&gt;&gt;B: R과 후보 (목록마다 최대 2,000)
+  B-&gt;&gt;B: RRF로 합치기, 부모 PR로 묶기 (Phase 1 코드)
+  B--&gt;&gt;A: 포인터 + 한 줄 요약 + footer (run R)
+  A-&gt;&gt;B: brain impact lib/credits.ts
+  B-&gt;&gt;P: 최신 run id
+  alt mirror가 R보다 뒤
+    B-&gt;&gt;P: run 사이 delta (새 행, 닫힌 행)
+    P--&gt;&gt;B: 행
+    B-&gt;&gt;M: 임시 사본에 적용, checksum 확인, 이름 바꿔 교체
+  end
+  B-&gt;&gt;M: Phase 0 impact 그대로
+  B--&gt;&gt;A: 결과 + footer (run R, code vs HEAD)</pre><figcaption>클릭하면 크게 봅니다</figcaption></figure>
+<div class="table-wrap"><table><thead><tr><th>명령</th><th>어디서</th><th>메모</th></tr></thead><tbody><tr><td><code>search</code> · <code>get</code> · <code>source</code></td><td>서버, 명령마다 SQL 한 문장</td><td>최신 run 기본. <code>--as-of</code>. Phase 1 렌더러·봉투·footer 재사용</td></tr><tr><td><code>find</code> · <code>refs</code> · <code>callers</code> · <code>impact</code> · <code>deps</code> · <code>shared</code> · <code>why</code> · <code>viz</code></td><td>mirror</td><td>Phase 0 코드를 바꾸지 않는다</td></tr><tr><td><code>status</code></td><td>서버 + mirror</td><td>최신 run, 마지막 attempt(실패 · running), mirror run, 이번 달 mirror로 받은 바이트</td></tr><tr><td><code>build</code> · <code>sync</code></td><td>로컬 모드에서만</td><td>서버 모드에서 부르면 &quot;서버 모드에서는 CI만 씁니다&quot; 오류</td></tr></tbody></table></div>
+<ul><li>서버 모드 선택: brain 연결 변수(§6.2)가 있으면 서버 모드, <code>--local</code>이면 로컬 모드. 둘 다 없으면 Phase 1과 같다.</li><li>store: Phase 1 <code>read.mjs</code>는 열린 SQLite 둘(<code>ctx = { code, gh, meta, sync, … }</code>, <code>src/context.mjs</code>)을 받는다. Phase 2는 이것을 async store 인터페이스(<code>candidates</code>, <code>get</code>, <code>thread</code>, <code>refs</code>, <code>source</code>, <code>resolveAsOf</code>)로 바꾸고, SQLite 구현과 Postgres 구현을 둔다. 렌더링 · 봉투 · footer는 store 밖에 그대로 둔다.</li><li><strong>한 명령 = 한 스냅숏의 사실.</strong> store의 모든 결과는 <code>{ rows…, view: { run, runCommit, publishedAt, sync, codeSanitizeVersion, githubSanitizeVersion } }</code>를 함께 낸다. Postgres 구현은 이 <code>view</code>를 결과 행과 <strong>같은 SQL 문장</strong>에서 읽는다(CTE). footer(<code>answer.freshness</code>)와 가드(<code>answer.guard</code>)는 <code>ctx.meta</code> · <code>ctx.sync</code> 대신 이 <code>view</code>를 쓴다. 그래서 <code>--as-of</code>의 footer와 가드가 고른 run과 어긋나지 않는다.</li><li><code>--as-of run:42 | commit:&lt;sha&gt; | 2026-11-01</code>: 커밋은 그 커밋을 publish한 최신 run, 날짜는 그 날 끝(UTC, <code>+09:00</code>처럼 오프셋을 붙이면 그 시간대)까지 publish된 최신 run으로 바꾼다. 못 찾으면 오류.</li><li>지도 명령에 <code>--as-of</code>를 주면 그 run의 mirror를 따로 전부 받는다(한 번에 약 25 MB). mirror는 최신 하나와 as-of 하나까지만 남긴다.</li><li>mirror meta에는 run id, run 커밋, checksum이 있다. freshness(Phase 0 <code>freshness</code>)는 run 커밋과 지금 checkout의 HEAD를 비교한다. 로컬 작업 트리 비교는 지금 checkout 기준이다.</li><li>footer(Phase 1 §6.8)에 run을 더한다: <code>brain data: run 42 @9f3c2e1a (published 3h ago)</code>.</li></ul>
+</div>
+<div id="s6-5" class="sub"><h3>6.5 실패</h3>
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>동작</th><th>서버 상태</th><th>보이는 것</th></tr></thead><tbody><tr><td>mirror · build · sync 실패 (트랜잭션 전)</td><td>job 실패. 쓰기 트랜잭션을 열지 않는다</td><td>그대로. attempt = failed (R11)</td><td><code>brain status</code>: last attempt FAILED (sync) · data = run B</td></tr><tr><td>업로드 전 검사에 걸림 (R16)</td><td>쓰지 않고 실패</td><td>그대로. attempt = failed (outbound)</td><td>같음. 걸린 표와 열 이름만</td></tr><tr><td>트랜잭션 안의 오류 · 시간 초과</td><td>ROLLBACK</td><td>그대로</td><td>위와 같음 (publish)</td></tr><tr><td>트랜잭션 중 연결 끊김 · job 강제 종료</td><td>서버가 트랜잭션을 버린다</td><td>그대로. attempt는 running → 표시는 abandoned (Phase 3 §6.5)</td><td>같음</td></tr><tr><td>COMMIT 응답 유실</td><td>R12</td><td>성공했으면 반영, 아니면 그대로</td><td>결과대로. 모르면 &quot;outcome unknown&quot;</td></tr><tr><td>기준이 바뀜</td><td>R10</td><td>그대로</td><td>attempt failed (stale-base)</td></tr><tr><td>Neon compute가 잠들어 있음</td><td>연결 재시도(1, 2, 4, 8초, 최대 30초)</td><td>—</td><td>진행 로그</td></tr><tr><td>reader가 쓰기 시도</td><td>DB가 거부 (<code>permission denied</code>)</td><td>그대로</td><td><code>brain error … read-only</code></td></tr><tr><td>mirror 받기 중 끊김</td><td>임시 사본을 버린다. 기존 mirror는 그대로</td><td>—</td><td>다음 명령이 다시 받는다</td></tr><tr><td>mirror checksum 불일치</td><td>그 mirror를 버리고 전부 다시 받는다</td><td>—</td><td>진행 로그</td></tr><tr><td>서버 연결 실패 (읽기)</td><td>mirror가 있으면 지도 명령은 mirror로 답하고 footer에 <code>server unreachable, mirror run 41</code></td><td>—</td><td>기억 명령은 오류</td></tr><tr><td>전송 한도 초과</td><td>Neon이 compute를 멈춘다(연결이 SQLSTATE 53000으로 실패)</td><td>그대로</td><td><code>brain status</code>가 이유를 말한다. 로컬 모드로 쓴다</td></tr></tbody></table></div>
+</div>
+<div id="s6-6" class="sub"><h3>6.6 안전 (Phase 1에서 이어짐)</h3>
+<ul><li>마스킹·정규화·인젝션 표시(Phase 1 §6.4–6.5)는 CI의 build·sync 안에서 끝난다. 올리기 직전에 R16이 delta 전체를 한 번 더 검사한다. 로그와 <code>attempt.error</code>에도 같은 검사를 한다.</li><li>서버로 가는 것: 지도(경로 · 심볼 이름 · 줄 번호 · 간선), 문서·<code>changes/</code>·CHANGELOG 본문, 커밋 메시지, PR·이슈·리뷰·댓글 제목과 본문(마스킹됨), PR 변경 파일 목록, 참조. <strong>소스 파일 본문은 가지 않는다.</strong> Phase 0 <code>nodes</code>에는 이름과 위치만 있고, <code>chunks</code>에는 마크다운과 커밋 메시지만 있다(<code>src/db.mjs</code>). 다만 마크다운과 토론 본문에는 코드 조각이 들어 있을 수 있다.</li><li>읽기 출력은 Phase 1의 안전 렌더러와 인용 봉투를 그대로 쓴다. 서버 모드든 로컬 모드든 같은 코드다.</li><li>에이전트가 인용 속 지시에 속아도 brain에 쓸 수 없다. reader 권한 밖이다. 이것이 &quot;오염 방지&quot;의 실제 장치다.</li></ul>
+</div>
+<div id="s6-7" class="sub"><h3>6.7 mirror와 매핑</h3>
+<div class="table-wrap"><table><thead><tr><th>mirror 표</th><th>서버에서</th><th>id</th></tr></thead><tbody><tr><td><code>code.db</code> <code>nodes</code></td><td>run R에 보이는 <code>node_rev</code> + <code>node</code>. <code>key</code>는 Phase 0 key(<code>p0_key</code>). <code>lang</code> · <code>flags</code> · <code>exported</code> · <code>line</code> · <code>end_line</code> · <code>parent</code>도 revision 열로 그대로</td><td><code>nodes.id = node_id</code></td></tr><tr><td><code>code.db</code> <code>edges</code> · <code>unresolved</code> · <code>links</code></td><td>R에 보이는 사실 행</td><td>SQLite <code>rowid</code> = 서버 행 id</td></tr><tr><td><code>code.db</code> <code>chunks</code></td><td>R에 보이는 <code>item_rev</code>(origin repo)의 <code>chunk</code>. <code>body_line</code>(Phase 1)도 그대로</td><td><code>chunks.id = chunk_id</code></td></tr><tr><td><code>code.db</code> <code>meta</code></td><td><code>run.meta</code> + run id · 커밋 · checksum</td><td>—</td></tr><tr><td><code>github.db</code> 항목 · 스레드 · refs</td><td>R에 보이는 <code>item_rev</code>(origin github) + <code>ref</code> + <code>ref_link</code>. refs는 <code>status</code>(<code>pending</code> 포함) · <code>reason</code> · <code>resolved_build</code> · <code>resolved</code>를 그대로 옮긴다. <code>resolved</code>가 노드 키나 포인터일 때는 문자열 그대로 두고, 서버 쪽 <code>ref_link</code>는 그 문자열을 정규 키로 푼 결과를 따로 가진다</td><td>서버 id</td></tr><tr><td><code>github.db</code> <code>sync_state</code> · 수집 장부</td><td><code>sync_state[R]</code></td><td>—</td></tr></tbody></table></div>
+<ul><li>FTS 색인(<code>chunks_fts</code>, <code>chunks_tri</code>)은 받은 뒤 로컬에서 만든다. delta로 바뀐 청크만 넣고 뺀다.</li><li>delta(A → B): <code>valid_from</code>이 (A, B]인 행은 넣고, <code>valid_to</code>가 (A, B]인 행은 지운다. 둘 다인 행(그 사이에 생겼다 닫힘)은 건너뛴다. revision은 새 행이 같은 id의 옛 행을 대신한다.</li><li>적용 순서: 먼저 지우고(닫힌 revision에 딸린 <code>chunk</code> · <code>ref</code> 포함), 그다음 넣는다(같은 id면 덮어쓴다). 반대로 하면 같은 <code>node_id</code>로 막 넣은 새 revision이 지워진다.</li><li>노트북은 <code>code.db</code> 모양만 받는다. 기억은 서버에서 읽기 때문이다. CI는 둘 다 받는다.</li><li><strong>매핑은 손실이 없어야 한다.</strong> Phase 0 · Phase 1 스키마의 모든 열이 매핑 표에 행으로 있다(옮기는 열, 또는 &quot;버림 + 이유&quot;). 버리는 것은 로컬 경로 meta(<code>repo</code>, <code>worktree</code>)뿐이다(R16). 열 단위 매핑 표와 왕복 golden fixture(SQLite → snapshot → 서버 → mirror → snapshot이 바이트 단위로 같다, 버린 열 제외)는 Q0이 내놓고, Q2 · Q4가 테스트한다.</li><li>크기: 서비스 repo 행 크기로 어림하면 <code>code.db</code> 모양 full mirror는 약 25 MB(노드 3.7 MB, 간선 6.5 MB, 청크 5.9 MB, 링크 0.9 MB에 전송 부담). delta는 run당 1 MB 안쪽. 구현 뒤 바이트로 잰다.</li></ul>
+</div>
+<div id="s6-8" class="sub"><h3>6.8 버전 질의</h3>
+<div class="term-wrap"><pre class="term">$ brain search &quot;크레딧 예약&quot; --as-of 2026-10-01
+  ...
+  coverage: complete · 3 hits
+  freshness: brain data as of run 17 @6b820f87 (2026-10-01, as-of) · latest run 42</pre></div>
+<ul><li><code>--as-of</code>는 기억 검색(<code>search</code> · <code>get</code>)과 지도(그 run의 mirror) 모두에 쓴다.</li><li><code>get pr:1121</code>은 최신 revision과 함께 revision 목록(<code>r1 09-10</code>, <code>r2 09-12 · state closed_unmerged</code>)을 보여 준다. <code>source pr:1121@r1</code>로 옛 본문을 본다.</li></ul>
+<style>
+.asof-grid { display: grid; grid-template-columns: minmax(150px, 1.3fr) repeat(6, minmax(34px, 1fr)); gap: 4px 2px; font-size: 12px; align-items: center; overflow-x: auto; }
+.asof-grid .h { font: 500 11px var(--font-mono); color: var(--muted); text-align: center; padding: 2px 0; border-radius: 6px; }
+.asof-grid .h.on { background: var(--accent); color: var(--surface); }
+.asof-grid .lab { font: 12px var(--font-mono); overflow-wrap: anywhere; padding-right: 6px; }
+.asof-grid .seg { height: 22px; border-radius: 5px; font: 10.5px/22px var(--font-mono); text-align: center; color: var(--fg); background: var(--sunk); border: 1px solid var(--line); white-space: nowrap; overflow: hidden; }
+.asof-grid .seg.v0 { background: var(--accent-soft); border-color: var(--accent); }
+.asof-grid .seg.v1 { background: var(--ok-soft); border-color: var(--ok); }
+.asof-grid .seg.v2 { background: var(--amber-soft); border-color: var(--amber); }
+.asof-grid .seg.hit { outline: 2px solid var(--fg); outline-offset: -2px; font-weight: 600; }
+.asof-grid .gap { height: 22px; }
+#asofSql { white-space: pre-wrap; }
+.asof-out { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 14px; margin-top: 12px; }
+@media (max-width: 720px) { .asof-out { grid-template-columns: minmax(0, 1fr); } }
+</style>
+<div class="widget" id="w-asof">
+  <div class="w-head"><b>직접 움직여 보기 · 유효 구간과 as-of</b><small>데모 데이터 · run 6개 · 칸 하나 = run 하나</small></div>
+  <div class="controls">
+    <label><input type="checkbox" id="asofLatest" checked> 최신만 (기본)</label>
+    <label for="asofRun">--as-of run <input type="range" id="asofRun" min="1" max="6" step="1" value="6"> <output id="asofRunOut">6</output></label>
+    <label for="asofMirror">내 mirror run
+      <select id="asofMirror"><option value="0">없음 (처음)</option><option value="2">2</option><option value="4">4</option><option value="5" selected>5</option><option value="6">6</option></select></label>
+  </div>
+  <div class="asof-grid" aria-label="행마다 유효 구간"></div>
+  <div class="asof-out">
+    <div class="result" id="asofRes"></div>
+    <div class="term-wrap"><pre class="term" id="asofSql"></pre></div>
+  </div>
+</div>
+
+</div>
+<div id="s6-9" class="sub"><h3>6.9 용량과 전송량</h3>
+<ul><li>저장: 지금 지도 19만 행, 청크 5천, 항목 수만 행. 색인을 합쳐 수백 MB 안쪽으로 본다(구현 뒤 실측).</li><li>바뀐 행만 쌓는다. 서비스 repo는 최근 30일에 커밋 208개가 파일 3,076개를 건드렸다. 파일이 바뀌면 그 파일 안의 간선 줄 번호가 밀려 간선 행이 닫히고 새로 생긴다. 하루 수천 행, 1년에 백만 행 안팎으로 본다. Free 1 GB 안에서 시작하고, 70%를 넘으면 Launch로 옮기거나 retention을 연다(§9).</li><li>전송(월 30일, 어림): 팀 10명 첫 mirror 250 MB + 노트북 run delta(90 run × 10명 × 1 MB) 900 MB + CI 평소 delta(90 run × 1 MB) 90 MB + CI cache 없을 때 전부 받기(월 8번 × 25 MB) 200 MB + 검색 결과(30일 × 하루 50회 × 10명 × 20 KB) 300 MB = 약 1.74 GB. 한도 5 GB의 약 35%다. 70%를 넘으면 Launch로 옮긴다.</li></ul>
+</div>
+</section>
+<section id="s7" class="sec"><h2>7. 테스트 계획</h2>
+<div id="s7-1" class="sub"><h3>7.1 불변식 (Neon branch, suite마다 새 branch)</h3>
+<p>하네스는 Neon API로 <code>production</code>에서 suite마다 branch를 하나 만들고(copy-on-write), suite가 끝나면 지운다(<a href="https://neon.com/docs/manage/branches">Neon branching</a>). Free는 project당 branch 10개라 suite는 순서대로 돈다. API 키는 <code>~/.config/neon/</code> 또는 테스트 workflow의 secret에만 둔다. &quot;그대로&quot;는 도메인 표 전체(모든 행 · 모든 열, 이력 포함)의 dump가 같다는 뜻이다. <code>attempt</code>는 비교에서 뺀다.</p>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>시나리오</th><th>통과 조건</th></tr></thead><tbody><tr><td>V1</td><td>writer로 revision 표 <code>UPDATE body</code> · <code>DELETE</code>, <code>run</code> <code>UPDATE</code></td><td>모두 거부. <code>valid_to</code> 닫기는 한 번만, 두 번째는 거부</td></tr><tr><td>V2</td><td>owner URL만 든 <code>.env.local</code>에서 서버 모드 명령을 부름: reader 확인에 걸려 거부. 직접 SQL. reader: <code>INSERT</code> · <code>UPDATE</code> · <code>DELETE</code> · <code>CREATE TABLE</code> · <code>CREATE TEMP TABLE</code>, <code>SET default_transaction_read_only = off</code> 뒤 같은 것. writer: DDL · <code>TRUNCATE</code> · <code>DELETE</code> · <code>CREATE TEMP TABLE</code></td><td>전부 거부</td></tr><tr><td>V3</td><td>같은 스냅숏을 두 번 publish. 같은 Actions attempt로 두 번 시작</td><td>두 번째 run은 새 revision · 사실 0개. 같은 attempt는 유일 제약이 막는다</td></tr><tr><td>V4</td><td>문서 하나 수정 → publish</td><td>그 문서만 새 revision. 옛 포인터 <code>@r1</code>의 <code>source</code>가 옛 글 그대로</td></tr><tr><td>V5</td><td>파일 삭제 · 심볼 삭제 → publish</td><td>최신에서 사라짐, <code>--as-of</code> 이전 run에서는 보임</td></tr><tr><td>V6</td><td>파일 이름 변경</td><td>새 identity, 옛 identity는 닫힘. 옛 경로의 PR refs는 <code>--path 옛경로</code>로 여전히 찾힘</td></tr><tr><td>V7</td><td>지운 파일을 다시 추가</td><td>같은 <code>node_id</code>, <code>rev_no</code>가 이어짐, 구간이 겹치지 않음</td></tr><tr><td>V8</td><td><code>const X</code>와 <code>type X</code>의 선언 순서를 바꿔 다시 빌드. 한 파일의 클래스 <code>A</code> · <code>B</code>에 같은 이름의 메서드 <code>run</code></td><td>정규 키 둘 다 그대로, 새 identity 0개. <code>f#A.run@method</code>와 <code>f#B.run@method</code>가 따로 있다</td></tr><tr><td>V9</td><td>publish 트랜잭션 중간에 오류 주입 (노드 쓰기 뒤)</td><td>도메인 dump 그대로, attempt = failed</td></tr><tr><td>V10</td><td>트랜잭션 중 프로세스 kill</td><td>같음</td></tr><tr><td>V11</td><td>테스트용 TCP proxy가 COMMIT은 넘기고 응답을 버림</td><td>R12로 성공 판정, 다시 쓰지 않음</td></tr><tr><td>V12</td><td>proxy가 COMMIT을 5초 늦춰 넘기고, 그 사이 복구 연결이 시작됨</td><td>복구가 잠금을 기다린 뒤 성공으로 판정. <code>ok</code>가 <code>failed</code>로 바뀌지 않음</td></tr><tr><td>V13</td><td>두 publish가 같은 기준 run으로 겹침 (스냅숏이 서로 다름)</td><td>하나만 커밋. 다른 하나는 stale-base로 끝남. run id가 커밋 순서</td></tr><tr><td>V14</td><td>한국어 trigram (R14)</td><td><code>show_trgm('크레딧 예약')</code>이 비지 않음. &quot;크레딧&quot; · &quot;크레딧 예약&quot;이 trigram 검색으로 맞음. 두 글자 질의(&quot;예약&quot;)의 결과를 기록</td></tr><tr><td>V15</td><td><code>--as-of run:R</code> · <code>commit:</code> · 날짜(UTC, <code>+09:00</code>)</td><td>각 시점의 정답 revision 집합과 같다 (fixture로 미리 만든 표와 비교)</td></tr><tr><td>V16</td><td>읽기 문장이 도는 동안 publish 커밋</td><td>한 명령의 결과가 모두 한 run에서 나옴</td></tr><tr><td>V17</td><td>mirror: r1 전부 받기 → r2 publish → delta 받기. 또 r1 mirror에서 r4로 한 번에(그 사이 같은 노드가 두 번 바뀌고, 생겼다 닫힌 행 포함)</td><td>각각 그 run을 전부 받은 mirror와 dump가 같다. checksum 일치</td></tr><tr><td>V18</td><td>mirror 받기 중 kill. mirror checksum을 일부러 틀리게</td><td>기존 mirror 그대로. 틀린 것은 버리고 전부 다시 받음</td></tr><tr><td>V19</td><td>마스킹 corpus(Phase 1 T7)로 publish. 경로 · import 문자열에 비밀 모양 문자열 주입</td><td>서버 표와 출력에 비밀 원문 0건. 주입은 R16이 거부, 쓰기 연결을 열지 않음</td></tr><tr><td>V20</td><td><code>sanitize_version</code> 증가</td><td><code>--full</code> 없이는 publish 거부. <code>--full</code> 뒤 글 revision이 모두 새로, 옛 revision 그대로</td></tr><tr><td>V21</td><td>GitHub <code>full</code> 범위에서 사라진 항목, <code>incremental</code>에서 안 보이는 항목</td><td>앞은 닫힘, 뒤는 그대로</td></tr><tr><td>V22</td><td>소스 repo id가 <code>binding</code>과 다름. 소스 repo에 push한 브랜치 workflow가 writer 비밀을 읽으려 함</td><td>publish 거부. 소스 repo에는 비밀이 없어 빈 값</td></tr><tr><td>V23</td><td><code>main</code> force-push 뒤 평소 publish, 그다음 bootstrap publish</td><td>평소는 자손 확인에 걸려 쓰지 않음. bootstrap은 성공, <code>run.mode = bootstrap</code>, 기준 run 경쟁은 그대로 막음</td></tr></tbody></table></div>
+</div>
+<div id="s7-2" class="sub"><h3>7.2 동등성 (sandbox 소스 repo, 같은 커밋·같은 cursor)</h3>
+<ul><li>지도: 로컬 빌드 <code>code.db</code>와 mirror에 <code>--db</code>로 <code>find</code> · <code>refs</code> · <code>callers</code> · <code>impact</code> · <code>deps</code> · <code>why</code>를 eval 케이스 질의(Phase 0 suite 25건 + 키워드 케이스)로 돌린다. Phase 0 테스트 러너(<code>test/run.mjs</code>)는 fixture를 직접 빌드하고 바꾸므로 쓰지 않는다. 질의만 돌리는 하네스를 새로 둔다.</li><li>비교: <code>--json</code>을 키 순서로 정렬해 비교한다. <code>ms</code>와 freshness는 뺀다. 목록 순서가 정해져 있지 않은 곳은 집합으로 비교한다. 커밋 청크는 Phase 0 창(최근 5,000개) 안의 것만 비교한다(R8).</li><li>기억: <code>search</code> 상위 10개 포인터의 겹침(Jaccard)과 순위 차이를 낸다. 품질 판정은 §7.3의 정답 키로 한다.</li></ul>
+</div>
+<div id="s7-3" class="sub"><h3>7.3 eval: 실제 질문과 키워드</h3>
+<div class="table-wrap"><table><thead><tr><th>묶음</th><th>어디서 모으나</th><th>개수</th><th>정답 키</th></tr></thead><tbody><tr><td>E1 실제 &quot;왜&quot; 질문</td><td>팀이 에이전트에게 실제로 한 질문(세션 기록의 사용자 질문 중 이유·이력을 묻는 것), PR 리뷰에서 나온 질문</td><td>10</td><td>사람이 git·GitHub에서 찾은 출처 포인터</td></tr><tr><td>E2 기각된 대안 · 리뷰 반대</td><td>머지 안 되고 닫힌 PR, CHANGES_REQUESTED 리뷰</td><td>8</td><td>그 PR·리뷰 포인터</td></tr><tr><td>E3 키워드</td><td>실제 인덱스에서 뽑은 심볼 이름 · route 문자열 · PR 번호 · 커밋 SHA · 한국어 용어 · 오류 메시지</td><td>12</td><td>그 키워드가 실제로 나오는 항목 집합</td></tr><tr><td>E4 as-of</td><td>내용이 바뀐 문서 · 상태가 바뀐 PR</td><td>6</td><td>지정한 run의 revision과 최신 revision이 각각 맞나</td></tr><tr><td>E5 대조</td><td>레포 안에 답이 있는 질문 (Phase 0 suite 재사용)</td><td>6</td><td>Phase 0 정답 키</td></tr></tbody></table></div>
+<ul><li>사전 등록: 케이스와 정답은 구현 결과를 보기 전에 동결한다(Phase 0 PREREG 형식). 정답은 brain이 아니라 git · GitHub 웹 · <code>gh</code>로 사람이 만든다. 케이스와 정답은 서비스 repo의 비공개 정보라 <strong>공개 repo에 넣지 않는다.</strong></li><li>도구 단위 지표(LLM 없음, 싸다): 묶음마다 hit@3, recall@10, as-of 정확도, 지연 p50 · p95. 로컬 Phase 1과 서버를 나란히 낸다.</li><li>지연 측정: 서울 노트북. 깨어 있는 compute는 연결 확인 질의 뒤 30회, 잠든 compute는 6분 쉰 뒤 첫 질의 5회.</li><li>agent 단위: skill-eval suite <code>codebase-brain-team</code>, arm은 v2(로컬 Phase 1)와 v3(서버), A/A 한 쌍. k=3. 통과율 Δ와 bootstrap CI, 토큰·시간. 판정은 §2 기준 7.</li></ul>
+</div>
+</section>
+<section id="s8" class="sec"><h2>8. 구현 계획</h2>
+<div id="s8-1" class="sub"><h3>8.1 작업 표</h3>
+<p>PR 하나 크기로 나눴다. &quot;받는 것&quot;과 &quot;내놓는 것&quot;이 레인 사이의 계약이다. 계약(Q0)이 먼저 고정되면 나머지는 서로 기다리지 않는다. 의존 칸에는 완료 기준을 확인하는 데 필요한 작업까지 적었다.</p>
+<div class="table-wrap"><table><thead><tr><th>ID</th><th>작업</th><th>받는 것</th><th>내놓는 것 (소유 파일)</th><th>의존</th><th>크기</th><th>완료 기준</th></tr></thead><tbody><tr><td>Q0</td><td>계약 고정: DDL 초안, 정규 키 · 사실 키 · 해시 열 목록(R5–R6), manifest, checksum 정의, 열 단위 매핑 표(§6.7), 포인터 <code>@r&lt;n&gt;</code> 문법, async store 인터페이스, attempt · publish 함수 서명</td><td>Phase 0 <code>code.db</code> 스키마, Phase 1 <code>github.db</code> 스키마와 <code>ctx</code></td><td><code>sql/001_init.sql</code>(초안), <code>src/pg/contract.mjs</code>(타입 · 키 함수 · 서명), <code>test/pg/golden/*</code>(매핑 왕복 fixture, seed SQL)</td><td>—</td><td>M</td><td>다른 레인이 이것만 보고 시작한다. golden fixture가 매핑 표와 맞는다</td></tr><tr><td>Q11</td><td>테스트 하네스: suite마다 Neon branch 만들기 · 지우기, 도메인 dump 비교, 테스트용 TCP proxy(COMMIT 응답 버리기 · 늦추기), 실패 주입 훅</td><td>Neon API 키(테스트 전용), Q0 서명</td><td><code>test/pg/harness.mjs</code>, <code>test/pg/proxy.mjs</code>, <code>ci/brain-test.yml</code></td><td>Q0</td><td>M</td><td>빈 suite로 branch 왕복, proxy로 응답 버리기 확인</td></tr><tr><td>Q1</td><td>migration 실행기, role, 덮어쓰기 금지 trigger, <code>pg_trgm</code></td><td><code>sql/001_init.sql</code></td><td><code>sql/*.sql</code>, <code>src/pg/migrate.mjs</code>: <code>migrate(ownerUrl)</code></td><td>Q0, Q11</td><td>M</td><td>V1 · V2 · V14 통과 (branch)</td></tr><tr><td>Q2</td><td>snapshot · delta · checksum · 업로드 전 검사</td><td><code>code.db</code> · <code>github.db</code> 경로, manifest</td><td><code>src/pg/snapshot.mjs</code>: <code>snapshot({codeDb, githubDb, manifest})</code>, <code>diff(base, next) → delta</code>, <code>checksum(state)</code>, <code>checkOutbound(delta)</code></td><td>Q0</td><td>M</td><td><code>node test/pg/snapshot.test.mjs</code>(네트워크 없음): fixture 두 빌드의 delta가 기대값, V8 키 안정, 비밀 주입 거부</td></tr><tr><td>Q3</td><td>publisher: attempt와 한 트랜잭션(R1–R2 · R7–R13 · R15)</td><td>delta, checksum, 기준 run</td><td><code>src/pg/publish.mjs</code>: <code>beginAttempt({url, gha, sourceSha}) → {attemptId, base}</code>, <code>publish({url, attemptId, base, delta, checksum, syncState, meta, mode})</code>, <code>failAttempt</code>, <code>resolveAttempt</code></td><td>Q0, Q1, Q2, Q11</td><td>L</td><td>V3 · V5–V7 · V9–V13 · V19–V23 통과</td></tr><tr><td>Q4</td><td>mirror: 전부 받기 · delta · checksum · 원자적 교체</td><td>서버 스키마, golden seed</td><td><code>src/pg/mirror.mjs</code>: <code>pullMirror({url, dir, run, shapes}) → {codeDb, githubDb, run, bytes}</code></td><td>Q0, Q1, Q11</td><td>M</td><td>V17 · V18 통과(seed로 만든 r1 · r2)</td></tr><tr><td>Q5</td><td>store: 인터페이스와 두 구현, Phase 1 <code>read.mjs</code>를 store 호출로, 포인터 <code>@r&lt;n&gt;</code></td><td>Phase 1 <code>read.mjs</code> · <code>ctx</code>, 서버 스키마</td><td><code>src/store/sqlite.mjs</code>, <code>src/store/pg.mjs</code>, <code>src/read.mjs</code>(store 호출 부분만), <code>src/ptr.mjs</code>(<code>@r&lt;n&gt;</code> 접미사: 지금은 <code>PtrError</code>)</td><td>Q0, Q1, Q11</td><td>M</td><td>Phase 1 읽기 테스트 무변경 통과, V4 · V15 · V16 통과</td></tr><tr><td>Q6</td><td>CLI 서버 모드: 모드 선택, reader 확인, <code>--as-of</code>, mirror 관리, footer · 가드를 store <code>view</code>로, 서버 모드에서 build · sync 막기</td><td><code>pgStore</code>, <code>pullMirror</code>, Phase 1 CLI</td><td><code>src/cli.mjs</code>, <code>src/render.mjs</code>, <code>src/answer.mjs</code>(footer · 가드), <code>src/context.mjs</code></td><td>Q4, Q5</td><td>M</td><td>Phase 0 · Phase 1 테스트 전부 + <code>node test/pg/cli.test.mjs</code></td></tr><tr><td>Q7</td><td><code>brain-publish</code> workflow(운영 repo 방식)와 설치 문서(직접 설치 방식 포함). CI의 build · sync는 kit의 TypeScript만 쓰고(<code>BRAIN_TYPESCRIPT=kit</code>), writer 비밀이 없는 자식 프로세스에서 돈다</td><td><code>publish</code>, <code>pullMirror</code>, Phase 1 <code>brain sync</code></td><td><code>ci/brain-publish.yml</code>, <code>README.md</code> 절, <code>src/index-ts.mjs</code>(<code>BRAIN_TYPESCRIPT=kit</code>이면 repo의 <code>typescript</code>를 부르지 않음)</td><td>Q3, Q4</td><td>M</td><td>sandbox 두 repo에서 Neon test branch로 수동 실행 1회 성공, actionlint 통과, V22</td></tr><tr><td>Q8</td><td>eval 세트: E1–E5 케이스·정답, PREREG (비공개 쪽)</td><td>Phase 1 suite 형식</td><td>비공개 eval 폴더의 <code>suites/codebase-brain-team/**</code></td><td>Q0</td><td>M</td><td>정답 동결, 구현 결과를 보기 전</td></tr><tr><td>Q9</td><td>통합: sandbox 첫 publish(R13), 동등성(§7.2), 도구 지표, 전송량 측정, Codex 리뷰</td><td>Q3–Q8</td><td><code>runs/</code> 기록, 보고서</td><td>Q6, Q7, Q8</td><td>M</td><td>§2 성공 기준 1–6</td></tr><tr><td>Q10</td><td>agent eval 실행과 보고. 서비스 repo 데이터의 production publish가 먼저다(§9-4)</td><td>Q8, Q9</td><td><code>runs/</code></td><td>Q9</td><td>M</td><td>사전 등록대로 보고</td></tr></tbody></table></div>
+</div>
+<div id="s8-2" class="sub"><h3>8.2 의존 그래프와 병렬 레인</h3>
+<figure class="diagram" tabindex="0" title="클릭하면 크게 봅니다"><pre class="mermaid">flowchart LR
+  Q0[&quot;Q0 계약&quot;]
+  Q11[&quot;Q11 테스트 하네스&quot;]
+  Q1[&quot;Q1 migration · role&quot;]
+  Q2[&quot;Q2 snapshot&quot;]
+  Q8[&quot;Q8 eval 세트&quot;]
+  Q3[&quot;Q3 publisher&quot;]
+  Q4[&quot;Q4 mirror&quot;]
+  Q5[&quot;Q5 store&quot;]
+  Q6[&quot;Q6 CLI 서버 모드&quot;]
+  Q7[&quot;Q7 publish workflow&quot;]
+  Q9[&quot;Q9 통합&quot;]
+  Q10[&quot;Q10 agent eval&quot;]
+  Q0 --&gt; Q11 &amp; Q2 &amp; Q8
+  Q0 --&gt; Q1
+  Q11 --&gt; Q1
+  Q1 --&gt; Q3 &amp; Q4 &amp; Q5
+  Q11 --&gt; Q3 &amp; Q4 &amp; Q5
+  Q2 --&gt; Q3
+  Q4 --&gt; Q6
+  Q5 --&gt; Q6
+  Q3 --&gt; Q7
+  Q4 --&gt; Q7
+  Q6 --&gt; Q9
+  Q7 --&gt; Q9
+  Q8 --&gt; Q9
+  Q9 --&gt; Q10</pre><figcaption>클릭하면 크게 봅니다</figcaption></figure>
+<div class="table-wrap"><table><thead><tr><th>레인</th><th>맡는 작업</th><th>소유 파일</th><th>동시에 도는 것</th></tr></thead><tbody><tr><td>lead</td><td>Q0, Q9</td><td><code>src/pg/contract.mjs</code>, <code>sql/001_init.sql</code> 초안, <code>test/pg/golden/*</code></td><td>—</td></tr><tr><td>A</td><td>Q11 → Q1 → Q4</td><td><code>test/pg/harness.mjs</code>, <code>test/pg/proxy.mjs</code>, <code>ci/brain-test.yml</code>, <code>sql/*</code>, <code>src/pg/migrate.mjs</code>, <code>src/pg/mirror.mjs</code></td><td>B, E (C는 Q1 뒤)</td></tr><tr><td>B</td><td>Q2 → Q3 → Q7</td><td><code>src/pg/snapshot.mjs</code>, <code>src/pg/publish.mjs</code>, <code>ci/brain-publish.yml</code>, <code>src/index-ts.mjs</code>(<code>BRAIN_TYPESCRIPT</code> 한 곳)</td><td>A, C, E</td></tr><tr><td>C</td><td>Q5 → Q6</td><td><code>src/store/*</code>, <code>src/read.mjs</code>, <code>src/ptr.mjs</code>, <code>src/cli.mjs</code>, <code>src/render.mjs</code>, <code>src/answer.mjs</code>, <code>src/context.mjs</code></td><td>A, B, E</td></tr><tr><td>E</td><td>Q8 → Q10</td><td>비공개 eval 폴더만</td><td>전부. 구현 코드를 보지 않는다</td></tr></tbody></table></div>
+<ul><li>critical path(크기 S=1 · M=2 · L=3): Q0 → Q11 → Q1 → Q3 → Q7 → Q9 → Q10. Q2는 Q11 · Q1과 나란히 돈다.</li><li>동시 에이전트: 최대 4(A · B · C · E). Neon branch는 레인마다 하나. 테스트가 끝나면 지운다.</li><li><code>src/read.mjs</code> · <code>src/cli.mjs</code> · <code>src/fmt.mjs</code> · <code>src/context.mjs</code>는 C 혼자 고친다. Phase 1 구현에서 같은 파일을 가진 레인이 끝난 뒤에 시작한다.</li><li>writer 비밀은 CI(운영 repo)와 테스트 branch에만 쓴다. 레인의 테스트는 branch마다 만든 writer URL을 쓴다.</li></ul>
+<div class="widget" id="w-plan">
+  <div class="w-head"><b>직접 눌러 보기 · 작업과 의존</b><small>§8 작업 표에서 읽어 온 작업 12개 · 웨이브는 의존 깊이</small></div>
+  <div class="controls"><label><input type="checkbox" id="planCrit"> critical path 표시 (Q0 → Q11 → Q1 → Q3 → Q7 → Q9 → Q10, 크기 S=1 · M=2 · L=3)</label></div>
+  <div class="waves" style="--waves:7"></div>
+  <div class="legend">
+    <span><i style="border-color:var(--accent);background:var(--accent-soft)"></i>고른 작업</span>
+    <span><i style="border-color:var(--amber)"></i>먼저 끝나야 함</span>
+    <span><i style="border-color:var(--ok)"></i>이 작업을 기다림</span>
+    <span><i style="border-color:var(--bad);border-width:0 0 0 3px"></i>critical path</span>
+  </div>
+  <div class="detail"></div>
+</div>
+</div>
+</section>
+<section id="s9" class="sec"><h2>9. 열린 질문 (리뷰에서 정해 주세요)</h2>
+<ol><li><strong>Launch로 옮길 때.</strong> Free로 정했습니다. 저장 · 월 CU-hour · 월 전송량 중 하나가 70%에 닿으면 Launch로 옮기는 것이 기본안입니다. production branch 보호(protected branch)도 Launch부터입니다.</li><li><strong>reader 계정.</strong> 기본안은 팀 공용 reader role 하나입니다. 사람마다 reader role을 주면 퇴사자만 끊을 수 있지만 관리할 것이 늘어납니다.</li><li><strong>운영 repo.</strong> 기본안은 관리자만 쓰기 권한을 가진 운영 repo입니다. 서비스 repo 관리자가 직접 설치하길 원하면, environment secret(<code>main</code>에서만)과 <code>main</code> 보호 규칙이 되는 GitHub 플랜인지 먼저 봐야 합니다.</li><li><strong>소스 읽기 토큰.</strong> 운영 repo가 서비스 repo를 읽으려면 토큰이 필요합니다(checkout과 API 수집 둘 다). 운영 repo의 <code>GITHUB_TOKEN</code>은 다른 비공개 repo를 읽지 못합니다(<a href="https://docs.github.com/en/actions/concepts/security/github_token">GitHub token</a>). 선택지: GitHub App(서비스 repo 소유자가 설치, 읽기만), 또는 사람의 PAT(읽기 권한만 주는 fine-grained는 소유자가 개인 계정인 repo에 쓸 수 있는지 확인 필요, classic은 <code>repo</code> 전체라 범위가 넓음). 둘은 secret 모양이 다릅니다. PAT는 <code>BRAIN_SOURCE_TOKEN</code>에 그대로 둡니다. App은 App id와 private key를 secret에 두고 job마다 설치 토큰을 만듭니다(<code>actions/create-github-app-token</code>). 설치 토큰은 1시간 뒤 끝나므로(<a href="https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app">GitHub App token</a>) 1시간을 넘는 bootstrap은 중간에 새로 만들어야 합니다. 첫 수집 약 2,700 호출은 PAT · App 한도(시간당 5,000) 안이라 한 job에 끝납니다. 정해지기 전에는 sandbox로만 검증합니다.</li><li><strong>회사망에서 5432가 막히는 사람.</strong> 있으면 Neon serverless driver(HTTPS)를 읽기 전용 대체 경로로 넣습니다. 없으면 넣지 않습니다.</li></ol>
+</section>
+<section id="s10" class="sec"><h2>10. 한계</h2>
+<ul><li>reader 비밀이 새면 brain 내용(마스킹된 글과 지도)을 누구든 읽을 수 있다. IP 제한은 Neon Scale 플랜에만 있다. 비밀 교체로 대응한다.</li><li>운영 repo에 쓰기 권한이 있는 사람은 workflow를 고쳐 writer 비밀을 꺼낼 수 있다. 이 설계가 막는 것은 에이전트와 노트북, 서비스 repo 쪽의 쓰기다.</li><li>마스킹이 놓친 비밀은 revision에 영원히 남는다. 지우려면 owner의 비상 migration(R15)이 필요하다. &quot;덮어쓰지 않음&quot;의 예외는 이것 하나다.</li><li>첫 지도 명령은 mirror를 전부 받느라 느린 망에서 몇 초 걸린다. 그 뒤는 delta만 받는다.</li><li>Postgres FTS와 SQLite FTS5는 순위가 다르다. 기억 검색 결과 순서가 로컬과 다를 수 있다. eval로 재고, 지도 명령은 mirror라 같다.</li><li>Neon compute가 잠들어 있으면(Free는 5분 쉬면 잠들고 끌 수 없다) 첫 질의가 늦다. Neon은 깨는 데 보통 수백 ms라고 적는다(<a href="https://neon.com/docs/connect/connection-latency">Neon connection latency</a>). 연결 수립을 더한 실제 값은 잰다.</li><li><code>idle_in_transaction_session_timeout</code>(5분)은 트랜잭션을 연 채 쉬는 세션만 끊는다. 트랜잭션 전체 시간은 <code>transaction_timeout</code>(R9)이 막는다. CI는 쓰기 직전에 새로 연결한다(R2).</li><li>전송 한도(월 5 GB)를 넘으면 다음 주기까지 서버 읽기가 멈춘다. 그동안은 로컬 모드로 쓴다.</li><li>vault는 서버에 없다. 개인 노트는 로컬 모드에서만 본다.</li><li>파일 이름이 바뀌면 identity가 끊긴다. 옛 경로의 기억은 <code>--path 옛경로</code>와 as-of로 찾는다.</li></ul>
+</section>
+<section id="s-부록-리뷰-반영-기록" class="sec"><h2>부록: 리뷰 반영 기록</h2>
+<p><strong>1차 (Codex gpt-6.1-sol, xhigh, 전체 리뷰).</strong> 판정 &quot;not ready&quot;. 지적 23건: blocker 6 · major 15 · minor 2. Over-engineering 6건.</p>
+<div class="table-wrap"><table><thead><tr><th>지적</th><th>처리</th></tr></thead><tbody><tr><td>[blocker] COMMIT 응답 유실 때 새 연결이 <code>running</code>을 보고 롤백으로 오판, 뒤이어 <code>ok</code>를 <code>failed</code>로 덮음</td><td>반영. 복구와 실패 기록 모두 같은 잠금을 쥔 뒤 판단(R11–R12). <code>ok</code>는 덮을 수 없음(trigger). V12 추가</td></tr><tr><td>[blocker] <code>nodes.key</code>는 유일하지만 선언 순서에 따라 바뀜</td><td>반영. 정규 키 <code>path#Name@kind</code>(§5.3), V8</td></tr><tr><td>[blocker] 여러 질의가 서로 다른 run을 볼 수 있음</td><td>반영. 명령마다 SQL 한 문장으로 run을 고르고 거른다(§5.3, §6.1). V16</td></tr><tr><td>[blocker] 서버만으로 <code>github.db</code> 상태(repo id, 전체 sync 시각 등)를 되살릴 수 없음</td><td>반영. <code>sync_state</code>를 run마다 출처별 jsonb로 통째로 남김. <code>binding</code> 표(R1)</td></tr><tr><td>[blocker] PUBLIC의 <code>TEMPORARY</code>가 남고, writer의 schema <code>USAGE</code>가 빠짐</td><td>반영(§6.2). V2를 직접 SQL로</td></tr><tr><td>[blocker] Phase 0의 키 · 경로 · import 문자열 · meta가 마스킹 경계 밖</td><td>반영. 업로드 전 검사 R16, meta 로컬 경로 제거. V19</td></tr><tr><td>[major] 해시 열과 sanitize 버전 미정</td><td>반영(R6, R15, V20)</td></tr><tr><td>[major] link · ref_link PK, 구간 겹침, 중복 간선</td><td>반영: 사실 키 · partial unique · CHECK, snapshot 중복 합치기. 배제 제약(<code>btree_gist</code>)은 넣지 않음: 구간이 겹칠 수 없는 이유를 §6.1에 적음</td></tr><tr><td>[major] 삭제 · 재등장 규칙과 full sync 표시 없음</td><td>반영. manifest(R7), identity 재사용, V7 · V21</td></tr><tr><td>[major] 창 밖으로 빠진 커밋의 청크 · 링크가 닫힘</td><td>반영(R8). 동등성은 창 안만 비교(§7.2)</td></tr><tr><td>[major] export 매핑 계약 없음</td><td>반영. 표 단위 매핑(§6.7), 열 단위 표와 golden fixture는 Q0 산출물</td></tr><tr><td>[major] 코드가 같아도 출력이 같다는 보장 없음 (freshness, <code>ms</code>, 순서)</td><td>반영. 의미 비교 규칙(§7.2)</td></tr><tr><td>[major] Phase 0 테스트 러너는 직접 빌드함</td><td>반영. 질의만 도는 하네스(§7.2)</td></tr><tr><td>[major] 첫 수집을 세 run으로 나누면 이어 받을 수 없음</td><td>반영. 그 대안을 지우고 PAT · App 한 job으로(§9-4)</td></tr><tr><td>[major] 운영 repo의 토큰과 SHA</td><td>반영. 소스 읽기 토큰을 checkout과 수집에 같이 쓰고, 소스 커밋을 attempt에 기록. 운영 repo 방식을 기본으로</td></tr><tr><td>[major] Phase 1에 <code>ReadStore</code>가 없음</td><td>반영. Q5가 store 인터페이스와 <code>read.mjs</code> 변경을 소유</td></tr><tr><td>[major] run 시작 · 기준 상태를 넘기는 계약 없음</td><td>반영. <code>beginAttempt</code> · <code>publish</code> · <code>failAttempt</code> · <code>resolveAttempt</code> 서명(Q3)</td></tr><tr><td>[major] 의존 · critical path 누락</td><td>반영. Q11(하네스) 추가, Q9 ← Q8, probe는 측정 완료로 대체</td></tr><tr><td>[major] 테스트가 기준을 증명하지 못함</td><td>반영. V7 · V8 · V12 · V13 · V16–V22, 지연 측정 방법, A/A 판정 규칙(§2-7)</td></tr><tr><td>[major] Free 전송 한도(월 5 GB) 누락</td><td>반영. 이것 때문에 mirror를 delta로 바꿈(§5.3, §6.9), 기준 6</td></tr><tr><td>[major] 통합 범위가 sandbox 검증과 어긋남</td><td>반영. Q9는 sandbox, production publish는 §9-4 뒤</td></tr><tr><td>[minor] ICU 대안이 불완전</td><td>해당 없음. 같은 locale에서 한국어 trigram을 확인해 ICU 대안을 지움</td></tr><tr><td>[minor] 시간 제한 설명이 섞임</td><td>반영(§10). 실측 5분, <code>transaction_timeout</code> 추가</td></tr><tr><td>Over-engineering: 청크 유효 구간 · 현재 전용 GIN · 열 때마다 행 수 대조 · 테스트마다 branch</td><td>반영(모두 뺌: 청크는 revision을 따름, GIN은 하나, checksum으로 대체, suite마다 branch)</td></tr><tr><td>Over-engineering: 운영 repo 방식 먼저</td><td>반영</td></tr></tbody></table></div>
+<p>리뷰 뒤 사용자 측 사실 추가: production project(PostgreSQL 18.7, 기본 branch <code>production</code>), 같은 locale에서 한국어 trigram 동작, 연결 변수 이름(<code>DATABASE_URL</code> · <code>DATABASE_URL_UNPOOLED</code>, <code>.env.local</code>). 맨 <code>DATABASE_URL</code>을 프로세스 환경에서 읽지 않는 규칙은 서비스 앱과 이름이 겹치는 위험 때문에 더했다(§6.2).</p>
+<p><strong>2차 (Codex gpt-6.1-sol, xhigh, 확인 라운드).</strong> 판정 &quot;not ready&quot;. 1차 항목 24개(Codex 묶음 기준, ICU 항목 제외): 해결 23 · 일부 1(정규 키) · 미해결 0. 새 지적 4건: major 1 · minor 3. 모두 고쳤다. 지침대로 3차는 돌리지 않았다.</p>
+<div class="table-wrap"><table><thead><tr><th>지적</th><th>처리</th></tr></thead><tbody><tr><td>[major] 정규 키가 다른 클래스의 같은 이름 멤버를 합칠 수 있음 (1차 &quot;일부&quot;의 남은 부분)</td><td>반영. <code>src/index-ts.mjs</code>에서 멤버 <code>keyName</code>이 <code>클래스.멤버</code>임을 확인. <code>Name</code> = <code>keyName</code>(§5.3). V8에 <code>A.run</code> · <code>B.run</code></td></tr><tr><td>[minor] delta 적용 순서가 모호</td><td>반영. 지우기 먼저, 넣기 다음(§6.7). V17에 r1 → r4 한 번에 받기</td></tr><tr><td>[minor] GitHub App 자격 증명은 정적 토큰이 아님</td><td>반영. PAT와 App의 secret 모양, 설치 토큰 1시간(§9-4)</td></tr><tr><td>[minor] 전송 예산에 CI 평소 delta가 빠짐</td><td>반영. CI delta 90 MB, 30일 · cache 없음 월 8번을 적음. 합 1.74 GB(§6.9)</td></tr><tr><td>확인 안 됨: mirror checksum의 정확한 정의</td><td>그대로 Q0 산출물</td></tr><tr><td>Phase 3 2차에서 온 변경</td><td>R9 bootstrap 예외, <code>run.mode</code>, V23, <code>publish</code>의 <code>mode</code> 인자</td></tr></tbody></table></div>
+<p><strong>3차 (lead 검토 + Codex gpt-6.1-sol, xhigh, 구현 전 마지막 확인).</strong> 판정 &quot;not ready&quot;. 지적 6건(Phase 2 몫): blocker 1 · major 5. 모두 코드와 문서로 확인한 뒤 반영했다. 이 판 그대로 구현한다(사용자 지시: 리뷰 뒤 승인 없이 구현).</p>
+<div class="table-wrap"><table><thead><tr><th>지적</th><th>처리</th></tr></thead><tbody><tr><td>[blocker] 서버 모드가 <code>.env.local</code>의 <code>DATABASE_URL</code>(관리자 노트북에서는 owner URL)을 읽어 SELECT 전용 경계가 깨진다</td><td>반영. <code>BRAIN_READER_URL</code>만 읽고, 연결 직후 <code>current_user</code>와 INSERT 권한으로 reader인지 확인(§6.2, V2)</td></tr><tr><td>[major] 매핑이 <code>lang</code> · <code>flags</code> · <code>body_line</code> · refs의 <code>pending</code> · <code>reason</code> · <code>resolved_build</code>를 잃는다</td><td>반영. 매핑 표와 &quot;손실 없음&quot; 규칙, 바이트 단위 왕복 fixture(§6.7)</td></tr><tr><td>[major] as-of footer · 가드가 고른 run과 다른 상태를 볼 수 있다</td><td>반영. store 결과에 같은 SQL 문장에서 읽은 <code>view</code>(§6.4)</td></tr><tr><td>[major] 빌드 창 밖 커밋 청크는 <code>--full</code>로도 다시 정리되지 않는다</td><td>반영. CI가 mirror에서 읽어 다시 정리(R15)</td></tr><tr><td>[major] <code>@r&lt;n&gt;</code> 포인터와 <code>answer.mjs</code> 변경의 주인이 없다</td><td>반영. <code>src/ptr.mjs</code>는 Q5, <code>src/answer.mjs</code> · <code>src/render.mjs</code>는 Q6(레인 C)</td></tr><tr><td>[blocker, Phase 3와 공통] CI가 소스 repo의 <code>typescript</code>를 부른다</td><td>반영. Q7이 <code>src/index-ts.mjs</code>에 <code>BRAIN_TYPESCRIPT=kit</code></td></tr></tbody></table></div>
+</section>
+  </main>
+</div>
+<div class="zoom" id="zoom" hidden><div class="bar"><button class="btn" id="zoomIn" type="button">확대</button><button class="btn" id="zoomOut" type="button">축소</button><button class="btn primary" id="zoomClose" type="button">닫기 (Esc)</button></div><div class="stage" id="zoomStage"></div></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+<script>
+const PLAN = {"tasks":[{"id":"Q0","work":"계약 고정: DDL 초안, 정규 키 · 사실 키 · 해시 열 목록(R5–R6), manifest, checksum 정의, 열 단위 매핑 표(§6.7), 포인터 `@r\u003cn>` 문법, async store 인터페이스, attempt · publish 함수 서명","recv":"Phase 0 `code.db` 스키마, Phase 1 `github.db` 스키마와 `ctx`","out":"`sql/001_init.sql`(초안), `src/pg/contract.mjs`(타입 · 키 함수 · 서명), `test/pg/golden/*`(매핑 왕복 fixture, seed SQL)","depsText":"—","deps":[],"size":"M","done":"다른 레인이 이것만 보고 시작한다. golden fixture가 매핑 표와 맞는다","wave":0},{"id":"Q11","work":"테스트 하네스: suite마다 Neon branch 만들기 · 지우기, 도메인 dump 비교, 테스트용 TCP proxy(COMMIT 응답 버리기 · 늦추기), 실패 주입 훅","recv":"Neon API 키(테스트 전용), Q0 서명","out":"`test/pg/harness.mjs`, `test/pg/proxy.mjs`, `ci/brain-test.yml`","depsText":"Q0","deps":["Q0"],"size":"M","done":"빈 suite로 branch 왕복, proxy로 응답 버리기 확인","wave":1},{"id":"Q1","work":"migration 실행기, role, 덮어쓰기 금지 trigger, `pg_trgm`","recv":"`sql/001_init.sql`","out":"`sql/*.sql`, `src/pg/migrate.mjs`: `migrate(ownerUrl)`","depsText":"Q0, Q11","deps":["Q0","Q11"],"size":"M","done":"V1 · V2 · V14 통과 (branch)","wave":2},{"id":"Q2","work":"snapshot · delta · checksum · 업로드 전 검사","recv":"`code.db` · `github.db` 경로, manifest","out":"`src/pg/snapshot.mjs`: `snapshot({codeDb, githubDb, manifest})`, `diff(base, next) → delta`, `checksum(state)`, `checkOutbound(delta)`","depsText":"Q0","deps":["Q0"],"size":"M","done":"`node test/pg/snapshot.test.mjs`(네트워크 없음): fixture 두 빌드의 delta가 기대값, V8 키 안정, 비밀 주입 거부","wave":1},{"id":"Q3","work":"publisher: attempt와 한 트랜잭션(R1–R2 · R7–R13 · R15)","recv":"delta, checksum, 기준 run","out":"`src/pg/publish.mjs`: `beginAttempt({url, gha, sourceSha}) → {attemptId, base}`, `publish({url, attemptId, base, delta, checksum, syncState, meta, mode})`, `failAttempt`, `resolveAttempt`","depsText":"Q0, Q1, Q2, Q11","deps":["Q0","Q1","Q2","Q11"],"size":"L","done":"V3 · V5–V7 · V9–V13 · V19–V23 통과","wave":3},{"id":"Q4","work":"mirror: 전부 받기 · delta · checksum · 원자적 교체","recv":"서버 스키마, golden seed","out":"`src/pg/mirror.mjs`: `pullMirror({url, dir, run, shapes}) → {codeDb, githubDb, run, bytes}`","depsText":"Q0, Q1, Q11","deps":["Q0","Q1","Q11"],"size":"M","done":"V17 · V18 통과(seed로 만든 r1 · r2)","wave":3},{"id":"Q5","work":"store: 인터페이스와 두 구현, Phase 1 `read.mjs`를 store 호출로, 포인터 `@r\u003cn>`","recv":"Phase 1 `read.mjs` · `ctx`, 서버 스키마","out":"`src/store/sqlite.mjs`, `src/store/pg.mjs`, `src/read.mjs`(store 호출 부분만), `src/ptr.mjs`(`@r\u003cn>` 접미사: 지금은 `PtrError`)","depsText":"Q0, Q1, Q11","deps":["Q0","Q1","Q11"],"size":"M","done":"Phase 1 읽기 테스트 무변경 통과, V4 · V15 · V16 통과","wave":3},{"id":"Q6","work":"CLI 서버 모드: 모드 선택, reader 확인, `--as-of`, mirror 관리, footer · 가드를 store `view`로, 서버 모드에서 build · sync 막기","recv":"`pgStore`, `pullMirror`, Phase 1 CLI","out":"`src/cli.mjs`, `src/render.mjs`, `src/answer.mjs`(footer · 가드), `src/context.mjs`","depsText":"Q4, Q5","deps":["Q4","Q5"],"size":"M","done":"Phase 0 · Phase 1 테스트 전부 + `node test/pg/cli.test.mjs`","wave":4},{"id":"Q7","work":"`brain-publish` workflow(운영 repo 방식)와 설치 문서(직접 설치 방식 포함). CI의 build · sync는 kit의 TypeScript만 쓰고(`BRAIN_TYPESCRIPT=kit`), writer 비밀이 없는 자식 프로세스에서 돈다","recv":"`publish`, `pullMirror`, Phase 1 `brain sync`","out":"`ci/brain-publish.yml`, `README.md` 절, `src/index-ts.mjs`(`BRAIN_TYPESCRIPT=kit`이면 repo의 `typescript`를 부르지 않음)","depsText":"Q3, Q4","deps":["Q3","Q4"],"size":"M","done":"sandbox 두 repo에서 Neon test branch로 수동 실행 1회 성공, actionlint 통과, V22","wave":4},{"id":"Q8","work":"eval 세트: E1–E5 케이스·정답, PREREG (비공개 쪽)","recv":"Phase 1 suite 형식","out":"비공개 eval 폴더의 `suites/codebase-brain-team/**`","depsText":"Q0","deps":["Q0"],"size":"M","done":"정답 동결, 구현 결과를 보기 전","wave":1},{"id":"Q9","work":"통합: sandbox 첫 publish(R13), 동등성(§7.2), 도구 지표, 전송량 측정, Codex 리뷰","recv":"Q3–Q8","out":"`runs/` 기록, 보고서","depsText":"Q6, Q7, Q8","deps":["Q6","Q7","Q8"],"size":"M","done":"§2 성공 기준 1–6","wave":5},{"id":"Q10","work":"agent eval 실행과 보고. 서비스 repo 데이터의 production publish가 먼저다(§9-4)","recv":"Q8, Q9","out":"`runs/`","depsText":"Q9","deps":["Q9"],"size":"M","done":"사전 등록대로 보고","wave":6}],"crit":["Q0","Q11","Q1","Q3","Q7","Q9","Q10"],"waves":7};
+const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// ---------- theme ----------
+const isDark = () => { const t = document.documentElement.dataset.theme; return t ? t === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches; };
+$('#themeBtn').onclick = () => { document.documentElement.dataset.theme = isDark() ? 'light' : 'dark'; renderDiagrams(); };
+
+// ---------- mermaid ----------
+const sources = $$('pre.mermaid').map((el) => el.textContent);
+async function renderDiagrams() {
+  if (!window.mermaid) { $$('pre.mermaid').forEach((el) => el.textContent = '다이어그램을 그리려면 인터넷 연결이 필요합니다 (mermaid CDN).\n\n' + el.textContent); return; }
+  const cs = getComputedStyle(document.documentElement);
+  mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'base', fontFamily: 'IBM Plex Sans KR, sans-serif',
+    themeVariables: { darkMode: isDark(), background: cs.getPropertyValue('--surface').trim(), primaryColor: cs.getPropertyValue('--accent-soft').trim(),
+      primaryTextColor: cs.getPropertyValue('--fg').trim(), primaryBorderColor: cs.getPropertyValue('--accent').trim(), lineColor: cs.getPropertyValue('--muted').trim(),
+      secondaryColor: cs.getPropertyValue('--sunk').trim(), tertiaryColor: cs.getPropertyValue('--surface').trim(), textColor: cs.getPropertyValue('--fg').trim(),
+      noteBkgColor: cs.getPropertyValue('--amber-soft').trim(), noteTextColor: cs.getPropertyValue('--fg').trim(), noteBorderColor: cs.getPropertyValue('--amber').trim(),
+      actorBkg: cs.getPropertyValue('--accent-soft').trim(), actorBorder: cs.getPropertyValue('--accent').trim(), actorTextColor: cs.getPropertyValue('--fg').trim(),
+      signalColor: cs.getPropertyValue('--fg').trim(), signalTextColor: cs.getPropertyValue('--fg').trim(), labelBoxBkgColor: cs.getPropertyValue('--sunk').trim(),
+      clusterBkg: cs.getPropertyValue('--sunk').trim(), clusterBorder: cs.getPropertyValue('--line').trim(), edgeLabelBackground: cs.getPropertyValue('--surface').trim(),
+      fontSize: '13px' } });
+  const els = $$('pre.mermaid');
+  els.forEach((el, k) => { el.removeAttribute('data-processed'); el.textContent = sources[k]; });
+  try { await mermaid.run({ nodes: els }); } catch (e) { console.error(e); }
+}
+renderDiagrams();
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (!document.documentElement.dataset.theme) renderDiagrams(); });
+
+// zoom
+let zoomScale = 1;
+const openZoom = (fig) => { const svg = $('svg', fig); if (!svg) return; const stage = $('#zoomStage'); stage.innerHTML = ''; const c = svg.cloneNode(true);
+  const vb = svg.viewBox.baseVal; zoomScale = 1; c.dataset.w = vb && vb.width ? vb.width : svg.getBoundingClientRect().width; c.style.width = (c.dataset.w * 1.4) + 'px'; stage.append(c); $('#zoom').hidden = false; $('#zoomClose').focus(); };
+const scaleZoom = (f) => { const c = $('#zoomStage svg'); if (!c) return; zoomScale *= f; c.style.width = (c.dataset.w * 1.4 * zoomScale) + 'px'; };
+$$('figure.diagram').forEach((fig) => { fig.onclick = () => openZoom(fig); fig.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openZoom(fig); } }; });
+$('#zoomClose').onclick = () => { $('#zoom').hidden = true; };
+$('#zoomIn').onclick = () => scaleZoom(1.25); $('#zoomOut').onclick = () => scaleZoom(0.8);
+addEventListener('keydown', (e) => { if (e.key === 'Escape') $('#zoom').hidden = true; });
+
+// ---------- toc scrollspy ----------
+const links = $$('nav.toc a');
+const targets = links.map((a) => document.getElementById(a.dataset.id)).filter(Boolean);
+const spy = () => { let cur = targets[0]; for (const t of targets) if (t.getBoundingClientRect().top < 120) cur = t;
+  links.forEach((a) => a.classList.toggle('on', a.dataset.id === cur?.id)); };
+addEventListener('scroll', spy, { passive: true }); spy();
+
+// ---------- built-in widget: task explorer (from the §8 task table) ----------
+(function () {
+  const root = $('#w-plan'); if (!root) return;
+  const TASKS = PLAN.tasks, byId = Object.fromEntries(TASKS.map((t) => [t.id, t])), CRIT = new Set(PLAN.crit);
+  const grid = $('.waves', root), detail = $('.detail', root), crit = $('#planCrit', root);
+  const md = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  const short = (s) => s.replace(/`/g, '').replace(/\*\*/g, '').split(/[.:(]/)[0].slice(0, 46);
+  grid.innerHTML = Array.from({ length: PLAN.waves }, (_, k) => `<div class="wave"><h5>웨이브 ${k}${k === 0 ? ' · 시작' : ''}</h5>${TASKS.filter((t) => t.wave === k).map((t) =>
+    `<button type="button" class="task" data-id="${t.id}"><b>${t.id}</b><span class="sz">${md(t.size)}</span>${md(short(t.work))}</button>`).join('')}</div>`).join('');
+  const up = (id, acc = new Set()) => { for (const d of byId[id]?.deps || []) if (!acc.has(d)) { acc.add(d); up(d, acc); } return acc; };
+  const down = (id, acc = new Set()) => { for (const t of TASKS) if (t.deps.includes(id) && !acc.has(t.id)) { acc.add(t.id); down(t.id, acc); } return acc; };
+  let sel = null;
+  const row = (k, v) => (v ? `<dt>${k}</dt><dd>${v}</dd>` : '');
+  const paint = () => {
+    const u = sel ? up(sel) : new Set(), d = sel ? down(sel) : new Set();
+    $$('.task', grid).forEach((b) => { const id = b.dataset.id;
+      b.classList.toggle('sel', id === sel); b.classList.toggle('up', u.has(id)); b.classList.toggle('down', d.has(id));
+      b.classList.toggle('dim', !!sel && id !== sel && !u.has(id) && !d.has(id)); b.classList.toggle('crit', crit.checked && CRIT.has(id)); });
+    if (!sel) { detail.innerHTML = '<span style="color:var(--muted)">작업을 누르면 먼저 끝나야 하는 작업(주황)과 이 작업을 기다리는 작업(초록), 받는 것·내놓는 것·완료 기준이 나옵니다.</span>'; return; }
+    const t = byId[sel];
+    detail.innerHTML = `<dl>${row('작업', `<b>${t.id}</b> · ${md(t.work)}`)}${row('받는 것', md(t.recv))}${row('내놓는 것', md(t.out))}${row('의존 (표)', md(t.depsText))}
+      ${row('먼저 끝날 것', [...u].join(', ') || '없음')}${row('기다리는 작업', [...d].join(', ') || '없음')}${row('크기', md(t.size))}${row('완료 기준', md(t.done))}</dl>`;
+  };
+  grid.onclick = (e) => { const b = e.target.closest('.task'); if (!b) return; sel = sel === b.dataset.id ? null : b.dataset.id; paint(); };
+  crit.onchange = paint; paint();
+})();
+
+// ---- widget: asof ----
+(function () {
+const root = $('#w-asof'); if (!root) return;
+const RUNS = [null, '1a2b3c4d', '5e6f7a8b', '9c0d1e2f', '3a4b5c6d', '7e8f9a0b', 'c1d2e3f4'];
+const DATES = [null, '10-01', '10-03', '10-08', '10-15', '10-22', '10-29'];
+const LATEST = 6;
+// each row: versions [from, to) in run ids, to = null means current. label = what the version holds
+const ROWS = [
+  { key: 'doc:docs/billing.md', kind: '기억 revision', vers: [[1, 2, 'r1 초안'], [2, 5, 'r2 수정'], [5, 6, 'r3 수정']], note: 'run 6에서 문서 삭제 → 현재 행 없음' },
+  { key: 'pr:120', kind: '기억 revision', vers: [[1, 3, 'r1 open'], [3, null, 'r2 merged']] },
+  { key: 'lib/charge.ts#settle@function', kind: '노드 revision', vers: [[1, 4, 'r1 줄 40'], [4, null, 'r2 줄 52']] },
+  { key: 'run.ts → settle (calls, 줄 12)', kind: '간선 사실', vers: [[1, 4, '사실']] },
+  { key: 'run.ts → settle (calls, 줄 14)', kind: '간선 사실', vers: [[4, null, '사실']] },
+  { key: 'billing.md 청크 → settle', kind: '링크 사실', vers: [[2, 6, '사실']] },
+];
+const el = { grid: $('.asof-grid', root), latest: $('#asofLatest', root), run: $('#asofRun', root), out: $('#asofRunOut', root),
+  mirror: $('#asofMirror', root), res: $('#asofRes', root), sql: $('#asofSql', root) };
+const visible = (v, R) => v[0] <= R && (v[1] == null || v[1] > R);
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+function render() {
+  const R = el.latest.checked ? LATEST : +el.run.value;
+  el.run.disabled = el.latest.checked; el.out.textContent = R;
+  let h = '<div></div>' + [1, 2, 3, 4, 5, 6].map((r) => `<div class="h${r === R ? ' on' : ''}">r${r}</div>`).join('');
+  for (const row of ROWS) {
+    h += `<div class="lab" title="${esc(row.kind)}">${esc(row.key)}</div>`;
+    for (let r = 1; r <= 6; r++) {
+      const k = row.vers.findIndex((v) => visible(v, r));
+      if (k < 0) { h += '<div class="gap"></div>'; continue; }
+      const v = row.vers[k], start = v[0] === r;
+      h += `<div class="seg v${k % 3}${r === R ? ' hit' : ''}" title="${esc(v[2])} · valid_from ${v[0]}, valid_to ${v[1] ?? 'null'}">${start ? esc(v[2]) : ''}</div>`;
+    }
+  }
+  el.grid.innerHTML = h;
+  const vis = ROWS.map((row) => ({ row, v: row.vers.find((v) => visible(v, R)) }));
+  const ptr = (row, v) => (/^(doc|pr):/.test(row.key) ? `${row.key}@${v[2].split(' ')[0]}` : row.key);
+  el.res.innerHTML = `<div class="big">${el.latest.checked ? '<span class="pill ok">최신</span>' : `<span class="pill info">as-of run ${R}</span>`} 보이는 행 ${vis.filter((x) => x.v).length}개 / ${ROWS.length}</div>
+    <dl>${vis.map(({ row, v }) => `<dt>${esc(row.kind)}</dt><dd>${v ? esc(ptr(row, v)) + ' · ' + esc(v[2]) : '<span style="color:var(--muted)">안 보임' + (row.note && R === 6 ? ' (' + esc(row.note) + ')' : '') + '</span>'}</dd>`).join('')}</dl>
+    <p style="margin:8px 0 0;color:var(--muted)">옛 행은 지우지 않는다. 바뀌는 것은 <code>valid_to</code>를 한 번 닫는 것뿐이다. <code>@r2</code> 포인터는 언제 읽어도 같은 글이다.</p>`;
+  const A = +el.mirror.value, B = LATEST;
+  const ins = [], del = [];
+  if (A === 0) ROWS.forEach((row) => row.vers.forEach((v) => { if (visible(v, B)) ins.push(row.key + ' ' + v[2]); }));
+  const skip = [];
+  if (A !== 0) ROWS.forEach((row) => row.vers.forEach((v) => {
+    const born = v[0] > A && v[0] <= B, closed = v[1] != null && v[1] > A && v[1] <= B;
+    if (born && closed) skip.push(row.key + ' ' + v[2]);          // appeared and closed between A and B: nothing to do
+    else if (born) ins.push(row.key + ' ' + v[2]);
+    else if (closed) del.push(row.key + ' ' + v[2]);
+  }));
+  el.sql.innerHTML = `<span class="d">-- 이 run에서 보이는 행 (모든 revision · 사실 표에 같은 식)</span>
+<span class="h">WHERE</span> valid_from &lt;= <span class="q">${R}</span>
+  <span class="h">AND</span> (valid_to <span class="h">IS NULL OR</span> valid_to &gt; <span class="q">${R}</span>)
+
+<span class="d">-- mirror를 run ${A || '없음'}에서 run ${B}로: ${A === 0 ? '처음이라 전부 받는다' : `valid_from ∈ (${A}, ${B}] 넣기, valid_to ∈ (${A}, ${B}] 지우기`}</span>
+${A === B ? '<span class="f">이미 최신. 받을 행 없음</span>' : `<span class="f">넣기 ${ins.length}</span>  ${ins.map(esc).join(' · ') || '—'}
+<span class="x">지우기 ${del.length}</span>  ${del.map(esc).join(' · ') || '—'}${skip.length ? `
+<span class="d">건너뜀 ${skip.length}  ${skip.map(esc).join(' · ')} (그 사이에 생겼다 닫힘)</span>` : ''}`}
+<span class="d">  footer: brain data as of run ${R} @${RUNS[R]} (2026-${DATES[R]}${el.latest.checked ? '' : ', as-of'}) · latest run ${LATEST}</span>`;
+}
+[el.latest, el.mirror].forEach((e) => (e.onchange = render));
+el.run.oninput = render;
+render();
+
+})();
+</script>
+</body>
+</html>
