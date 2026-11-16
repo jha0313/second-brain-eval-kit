@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import checks, judge, report, stats
 from .stats import EXCLUDED, SCORED
-from .isolation import TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact, trial_settings
+from .isolation import TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact, register_secret, trial_settings
 from .trajectory import parse_stream
 
 # Rough $ per trial before any calibration. `--calibrate` replaces these with measured means.
@@ -139,7 +139,7 @@ def build_index(suite, root: Path, templates: dict[str, Path]) -> dict:
         return {}
     idx = _checkout(suite, root / f"idx-{secrets.token_hex(6)}")
     copies = {a: templates[a] / ".claude" / "skills" / suite.skill for a in skill_arms}
-    env = {**clean_env(), **skill_env(suite, idx), "REPO_DIR": str(idx)}
+    env = {**clean_env(), **skill_env(suite, idx), **secret_env(suite), "REPO_DIR": str(idx)}
     env.update({f"SKILL_DIR_{a.upper()}": str(p) for a, p in copies.items()})
     if skill_arms:
         env["SKILL_DIR"] = str(copies[skill_arms[0]])
@@ -147,7 +147,7 @@ def build_index(suite, root: Path, templates: dict[str, Path]) -> dict:
     r = subprocess.run(suite.prepare, shell=True, cwd=idx, env=env, capture_output=True, text=True)
     seconds = time.time() - start
     if r.returncode != 0:
-        raise RuntimeError(f"prepare failed ({r.returncode}):\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+        raise RuntimeError(redact(f"prepare failed ({r.returncode}):\n{r.stdout[-2000:]}{r.stderr[-2000:]}"))
     files, arm_files = {}, {}
     for rel in suite.prepare_outputs:
         src = idx / rel
@@ -192,6 +192,19 @@ def skill_env(suite, ws: Path, arm: str | None = None) -> dict:
     env = dict(suite.skill_env) if arm is None or suite.arms[arm] else {}
     env.update(suite.arm_env.get(arm, {}) if arm else {})
     return {k: v.format(ws=ws) for k, v in env.items()}
+
+
+def secret_env(suite, arm: str | None = None) -> dict:
+    """The values of the arm's `secret_env` names (arm None: every arm's, for prepare on the host), read from the host
+    environment and registered for redaction. A name that is not set stops the run before anything starts."""
+    names = suite.arm_secret_env.get(arm, []) if arm else sorted({n for ns in suite.arm_secret_env.values() for n in ns})
+    missing = [n for n in names if not os.environ.get(n)]
+    if missing:
+        raise RuntimeError(f"secret_env {missing} is not set on the host (the arm needs it; the suite holds only the name)")
+    vals = {n: os.environ[n] for n in names}
+    for v in vals.values():
+        register_secret(v)
+    return vals
 
 
 def leak_guard(skill_copy: Path, suite) -> None:
@@ -311,7 +324,7 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
     tdir = out / "trials" / tid
     tdir.mkdir(parents=True, exist_ok=True)
     arm_skill = suite.skill if suite.arms[arm] else None
-    settings = trial_settings(arm_skill, deny)
+    settings = trial_settings(arm_skill, deny, network=suite.arm_network.get(arm))
     lim = case.limits
     cmd = claude_cmd(case.prompt, model=suite.model, settings=settings, tools=suite.tools,
                      max_turns=lim["max_turns"], max_usd=lim["max_usd"], effort=suite.effort)
@@ -319,7 +332,7 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
     for attempt in range(3):                      # infra errors: retry up to 2 times
         ws = make_workspace(templates[arm], ws_root)
         start, timed_out = time.time(), False
-        te = TrialEnv(extra=skill_env(suite, ws, arm) or None)
+        te = TrialEnv(extra={**skill_env(suite, ws, arm), **secret_env(suite, arm)} or None)
         with open(tdir / "trajectory.jsonl", "w") as so, open(tdir / "stderr.txt", "w") as se, te as env:
             p = subprocess.Popen(cmd, cwd=ws, env=env, stdin=subprocess.DEVNULL, stdout=so, stderr=se)
             try:

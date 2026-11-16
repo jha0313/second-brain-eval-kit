@@ -76,6 +76,8 @@ def manifest(suite) -> dict:
         "rules": {"model": suite.model, "effort": suite.effort, "tools": suite.tools, "limits": suite.limits,
                   "judge_model": suite.judge_model, "votes": suite.votes, "k": suite.k,
                   "pass_threshold": suite.pass_threshold, "compare": suite.compare, "strip": suite.strip,
+                  "arm_network": suite.arm_network, "arm_secret_env": suite.arm_secret_env,   # names only, never values
+                  "format_slots": suite.format_slots,
                   "prepare": suite.prepare, "prepare_outputs": suite.prepare_outputs,
                   "find_all_pass": {**suite.find_all_pass, "rule": "pass = recall >= min_recall and precision >= "
                                     "min_precision; exact set recorded as a secondary metric"},
