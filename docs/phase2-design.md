@@ -703,6 +703,7 @@ flowchart LR
 
 - reader 비밀이 새면 brain 내용(마스킹된 글과 지도)을 누구든 읽을 수 있다. IP 제한은 Neon Scale 플랜에만 있다. 비밀 교체로 대응한다.
 - reader URL을 가진 사람은 Postgres 기본 권한으로 두 가지를 할 수 있다(Q0에서 Neon으로 확인). (1) `ALTER ROLE` 자기 자신: `default_transaction_read_only`를 끄거나 비밀번호를 바꿀 수 있다. 끄더라도 brain 표에는 쓰기 권한이 없어 쓰지 못한다. 비밀번호를 바꾸면 팀 전체 읽기가 막힌다(owner가 비밀 교체로 복구). (2) large object(`lo_from_bytea`): `pg_catalog`의 `lo_*` 권한은 `neondb_owner`가 거둘 수 없다. 저장 용량을 쓰는 것뿐 brain 표는 바뀌지 않는다. 사람마다 reader role을 주면(§9-2) 누가 했는지 보이고 그 사람만 끊을 수 있다.
+- reader URL을 가진 사람은 publish advisory lock(`PUBLISH_LOCK_KEY`)을 세션 잠금으로 쥐고 있을 수 있다(Q1에서 확인). 그동안 CI publish는 `lock_timeout`(15초)에 걸려 실패하고 다음 주기에 다시 돈다. 데이터는 바뀌지 않는다. owner가 `pg_terminate_backend`로 끊는다. `idle_session_timeout`은 그 세션이 스스로 바꿀 수 있어 막는 장치가 되지 못한다.
 - 운영 repo에 쓰기 권한이 있는 사람은 workflow를 고쳐 writer 비밀을 꺼낼 수 있다. 이 설계가 막는 것은 에이전트와 노트북, 서비스 repo 쪽의 쓰기다.
 - 마스킹이 놓친 비밀은 revision에 영원히 남는다. 지우려면 owner의 비상 migration(R15)이 필요하다. "덮어쓰지 않음"의 예외는 이것 하나다.
 - 첫 지도 명령은 mirror를 전부 받느라 느린 망에서 몇 초 걸린다. 그 뒤는 delta만 받는다.
