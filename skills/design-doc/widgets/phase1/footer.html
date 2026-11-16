@@ -1,0 +1,12 @@
+<style>.foot-out { margin-top: 6px; }</style>
+<div class="widget" id="w-footer">
+  <div class="w-head"><b>직접 골라 보기 · footer 두 줄</b><small>상태를 바꾸면 모든 답 끝에 붙는 두 줄이 바뀐다</small></div>
+  <div class="controls">
+    <label for="fCode">코드 인덱스
+      <select id="fCode"><option value="up">HEAD와 같음</option><option value="behind">커밋 14개 뒤</option><option value="div">갈라짐</option></select></label>
+    <label for="fGh">GitHub
+      <select id="fGh"><option value="ok">12분 전 성공</option><option value="stale">3일 전 성공</option><option value="never">수집 안 함</option><option value="failed">마지막 run 실패</option></select></label>
+    <label><input type="checkbox" id="fCut"> 결과가 상한에 걸림</label>
+  </div>
+  <div class="foot-out"><div class="term-wrap"><pre class="term"></pre></div></div>
+</div>
