@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -52,7 +53,11 @@ def gh_config_dirs(env=os.environ) -> tuple[Path, ...]:
 
 def credential_paths(env=os.environ) -> tuple[Path, ...]:
     git = [Path.home() / ".config/git/credentials", *([Path(env["XDG_CONFIG_HOME"]) / "git/credentials"] if env.get("XDG_CONFIG_HOME") else [])]
-    return tuple(dict.fromkeys([*gh_config_dirs(env), Path.home() / ".git-credentials", *git, Path.home() / ".netrc", Path.home() / ".ssh"]))
+    # macOS login keychain: gh falls back to its keyring entry even with an empty GH_CONFIG_DIR (`gh auth token`
+    # prints the host's token); the sandbox's read deny on the keychain files stops that lookup
+    keychain = [Path.home() / "Library/Keychains"] if sys.platform == "darwin" else []
+    return tuple(dict.fromkeys([*gh_config_dirs(env), Path.home() / ".git-credentials", *git, Path.home() / ".netrc", Path.home() / ".ssh",
+                                *keychain]))
 
 
 # GitHub token shapes. A trial or probe that printed one anyway must not leave it in a saved file.
