@@ -65,6 +65,12 @@ const extraFiles = {
   'src/jobs/queue.ts': "export const JOB_RUN_QUEUE = 'jobs.reserve';\n",
   'notes/odd.txt': '$(id) and -x-flag\n',
   ...Object.fromEntries(Array.from({ length: 11 }, (_, i) => [`notes/settle-${String(i + 1).padStart(2, '0')}.txt`, 'credits:settle\n'])),
+  // the token-search stress case (plan A31): 1,000 lines with one even token each, a name and a route in 15 files × 200
+  // lines, and a token only inside a binary blob
+  'notes/bulk.txt': Array.from({ length: 1000 }, (_, k) => `entry ${k + 1}: bulk-token-${String(2 * k).padStart(4, '0')}`).join('\n') + '\n',
+  ...Object.fromEntries(Array.from({ length: 15 }, (_, i) => [`notes/hot-${String(i + 1).padStart(2, '0')}.txt`,
+    Array.from({ length: 200 }, (_, k) => `HotToken at /api/hot/path ${k}`).join('\n') + '\n'])),
+  'notes/blob.bin': '\0BinaryOnlyToken\n',
 };
 const fx = fixtureRepo({ extraFiles });
 const head = execFileSync('git', ['-C', fx.repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
@@ -215,7 +221,25 @@ test('relink: over the grep budget -> pending/budget, retried by the next relink
   assert.deepEqual(verdict(r['name jobs.reserve text']), ['linked', null, ['src/jobs/queue.ts:1']]);
 });
 
-test('relink: targets shaped like options or shell never reach git grep as arguments', async () => {
+test('relink: 2,000 tokens, a name and a route with thousands of hits, all decided in one relink, none pending (plan A31)', async () => {
+  const bulk = Array.from({ length: 2000 }, (_, i) => `bulk-token-${String(i).padStart(4, '0')}`);
+  freshGh([...bulk.map((target) => ({ kind: 'name', target })), { kind: 'name', target: 'HotToken' },
+    { kind: 'route', target: '/api/hot/path' }, { kind: 'name', target: 'BinaryOnlyToken' }]);
+  const res = await run();
+  const r = rows();
+  assert.equal(res.pending, 0);
+  for (const [i, t] of bulk.entries()) {
+    assert.deepEqual(verdict(r[`name ${t} text`]), i % 2 ? ['unlinked', 'no-match', []] : ['linked', null, [`notes/bulk.txt:${i / 2 + 1}`]], t);
+  }
+  for (const key of ['name HotToken text', 'route /api/hot/path text']) {
+    const v = r[key];
+    assert.deepEqual([v.status, v.reason, v.resolved.length], ['ambiguous', 'too-many', 10], key);   // decided, never pending
+    assert.ok(v.resolved.every((x) => /^notes\/hot-\d\d\.txt:1$/.test(x)), key);             // first line per file
+  }
+  assert.deepEqual(verdict(r['name BinaryOnlyToken text']), ['unlinked', 'no-match', []]);    // binary blobs are skipped (-I)
+});
+
+test('relink: targets shaped like options or shell never reach a command line', async () => {
   const marker = join(mkdtempSync(join(tmpdir(), 'brain-link-')), 'pwned');
   freshGh([
     { kind: 'name', target: '-x' },
