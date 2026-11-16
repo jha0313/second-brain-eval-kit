@@ -787,3 +787,13 @@ flowchart LR
 | 추가 guard | 새 행은 같은 트랜잭션이 넣은 run에 속해야 함(GUC + `run.xmin` + 최신 run), `rev_no = 이전 + 1`, attempt는 `running`으로만 넣음, `ok`는 그 attempt의 run을 넣은 트랜잭션에서만, `TRUNCATE` 거부. run id에는 빈 번호가 있다 |
 | run guard | 공유 · 세션 advisory lock으로 우회되지 않게 guard가 직접 `pg_advisory_xact_lock(2026111601)`을 잡는다 |
 | 알려진 한계 | reader의 large object와 `ALTER ROLE` 자기 자신은 막을 수 없다(§10, V2) |
+
+**구현 중 계약 확정 (Q5 결과, lead 확인).**
+
+| 항목 | 정한 것 |
+|---|---|
+| store 메서드 | `candidates`, `rows`, `get`, `source`, `resolveAsOf`, `close`. thread와 refs는 `get` 안으로 들어갔다 |
+| search 문장 수 | §6.4의 "명령 하나 = SQL 문장 하나"에서 벗어나, search만 두 문장이다. 가벼운 `candidates`(키만)를 먼저 읽고, 보여 줄 그룹의 `rows`를 같은 run(`asOf = view.run`)에 고정해 읽는다. 후보 2,000개의 본문을 한 번에 옮기면 §6.9의 약 20 KB 예산을 넘기 때문이다. 커밋된 run의 보이는 행은 바뀌지 않으므로 V16은 그대로 성립한다 |
+| 옛 리비전의 마지막 run | `valid_to - 1`이 아니라 `valid_to`보다 작은 published run 중 가장 큰 것이다. run id에는 빈 번호가 있기 때문이다 |
+| 영어 검색 | PG `english`는 FTS5 porter가 남기는 불용어(further, more, same, up 등)를 버린다. 그래서 `003`에서 불용어가 없는 `brain_english` 설정을 만들고, `chunk.tsv`를 그 설정으로 다시 만든다 |
+| `resolveAsOf` | `latest`(가장 새 run)를 함께 돌려준다(footer "latest run N"). `commit:<접두>`가 두 커밋에 맞으면 `ambiguous`가 된다 |

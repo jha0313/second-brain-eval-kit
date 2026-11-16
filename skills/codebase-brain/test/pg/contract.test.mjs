@@ -204,7 +204,7 @@ test('golden: the fixture snapshots to the committed expected.json and seed.sql'
 test('the DDL checks the same publish lock key; no password in 002; store methods', () => {
   assert.ok(DDL.includes(`pg_advisory_xact_lock(${C.PUBLISH_LOCK_KEY})`), 'guard_run takes PUBLISH_LOCK_KEY');
   assert.ok(!/PASSWORD/i.test(readFileSync(join(here, '..', '..', 'sql', '002_roles.sql'), 'utf8').replace(/^--.*$/gm, '')), 'no password in 002');
-  assert.deepEqual([...C.STORE_METHODS], ['candidates', 'get', 'thread', 'refs', 'source', 'resolveAsOf', 'close']);
+  assert.deepEqual([...C.STORE_METHODS], ['candidates', 'rows', 'get', 'source', 'resolveAsOf', 'close']);
 });
 
 test('Phase 3 S0: staleness, footer phrases, attempt display, refresh and ci-publish constants, faults', async () => {
