@@ -368,7 +368,9 @@ export function checksum(state, shapes = ['code', 'github']) {
  * Postgres store, and returns `view` from that statement. A command that calls several methods passes the first
  * result's view.run as `asOf` to the others, so the whole command reads one run (§6.4, V16); a committed run's visible
  * rows never change, so a later statement at that run reads the same data. search = candidates, then rows of the shown
- * groups (read.mjs ranks between them): candidates stay light so a search moves keys, not bodies (§6.9).
+ * groups (read.mjs ranks between them): candidates stay light so a search moves keys, not bodies (§6.9). The Postgres
+ * store also takes candidates top (it ranks as read.mjs rank() does and returns `ranked`, the shown groups only, instead
+ * of lists); the SQLite store ignores it.
  * @typedef {{ key: string, grp: string, d: string|null, ptr?: string|null, flags?: string|null }} Candidate
  *   key / grp opaque ('c' + chunk id, 'g' + GitHub item id; the mirror's ids): equal keys = the same row; grp = the row
  *   it ranks as (a review / comment ranks as its PR, else issue). d: the group's date (tie-break). GitHub rows carry ptr
@@ -378,8 +380,11 @@ export function checksum(state, shapes = ['code', 'github']) {
  *   revision, repo memory `<source>:<path>:<a>-<b>@r<n>` (server) or `@<build>` (local), commits `commit:<sha8>`.
  *   rev: the revision number (null in the SQLite store). parentPtr: the PR / issue a review or comment rolls up to
  * @typedef {{
- *   candidates(q: string, opts: import('../read.mjs').SearchOpts & AtRun): Promise<{
- *     lists: { name: string, rows: Candidate[], truncated: boolean }[],   // in rank order, max 2,000 per list
+ *   candidates(q: string, opts: import('../read.mjs').SearchOpts & AtRun & { top?: { cursor: number, limit: number } }): Promise<{
+ *     lists?: { name: string, rows: Candidate[], truncated: boolean }[],   // in rank order, max 2,000 per list
+ *     ranked?: { shown: { key: string, d: string|null, kids: { ptr: string, flags: string|null }[] }[],   // top: instead of lists
+ *       // (lists still, when a group's d is not ASCII: Postgres orders text by bytes, read.mjs by UTF-16 code units)
+ *       total: number, groups: number, truncated: string[] },   // candidates, groups before paging, the lists that hit the cap
  *     facts: { pathRefsPending: number, filesTruncated: number, githubPresent: boolean }, view: View }>,
  *   rows(keys: string[], opts?: AtRun): Promise<{ rows: StoreRow[], view: View }>,   // unknown keys left out
  *   get(ptrs: string[], opts?: AtRun): Promise<{ items: (StoreRow & {

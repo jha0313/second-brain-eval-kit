@@ -3,6 +3,7 @@
 import { terms } from '../why.mjs';
 
 export const CAP = 2000;     // candidates per list (design §6.7); a list that reaches it is marked truncated
+export const RRF_K = 60;     // a candidate at rank r (0-based) of a list scores 1 / (RRF_K + r + 1) for it
 export const MAX_GET = 5;
 const GH_KINDS = { pr: ['pr'], issue: ['issue'], review: ['review', 'review_comment'], comment: ['review_comment', 'issue_comment'] };
 const MEMORY_SOURCES = ['doc', 'change', 'changelog', 'commit', 'vault'];

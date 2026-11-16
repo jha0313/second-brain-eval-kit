@@ -16,7 +16,7 @@ import { parseRevPtr, formatRevPtr, GH_TYPES, TYPE_OF_KIND } from './ptr.mjs';
 import { safe, plural } from './fmt.mjs';
 import { flagSuspicious } from './sanitize.mjs';
 import { core } from './store/sqlite.mjs';
-import { MAX_GET, LINK_STATUS, filterOf, listOf } from './store/common.mjs';
+import { MAX_GET, LINK_STATUS, RRF_K, filterOf, listOf } from './store/common.mjs';
 
 /**
  * @typedef {import('./context.mjs').Ctx} Ctx
@@ -85,7 +85,6 @@ import { MAX_GET, LINK_STATUS, filterOf, listOf } from './store/common.mjs';
  * }} SourceResult
  */
 
-const RRF_K = 60;
 const SHORT = 160;           // search snippet and get first line, in characters
 const LINK_GROUPS = { file: 'files', dir: 'dirs', symbol: 'symbols', commit: 'commits', item: 'items', route: 'routes', name: 'names' };
 const FLAGS = ['suspicious', 'files-truncated'];
@@ -116,10 +115,16 @@ const revsOf = (revs) => (Array.isArray(revs) ? { revs: revs.map((r) => ({ rev: 
 
 // ---------- search: RRF over the store's candidate lists, roll-up into parents, then the shown groups hydrated ----------
 
-function rank(c, opts) {
-  const limit = Math.max(1, Math.floor(Number(opts.limit) || 10)), cursor = Math.max(0, Math.floor(Number(opts.cursor) || 0));
+const pageOf = (opts) => ({ cursor: Math.max(0, Math.floor(Number(opts.cursor) || 0)), limit: Math.max(1, Math.floor(Number(opts.limit) || 10)) });
+function searchFacts(c, opts, truncated) {
   const out = factsOf(c.facts.githubPresent, { pathQuery: !!filterOf(opts).path, pathRefsPending: c.facts.pathRefsPending, filesTruncated: c.facts.filesTruncated });
-  for (const l of c.lists) if (l.truncated && !out.truncatedLists.includes(l.name)) out.truncatedLists.push(l.name);
+  for (const name of truncated) if (!out.truncatedLists.includes(name)) out.truncatedLists.push(name);
+  return out;
+}
+// shown: { key, d, kids }; kids: the best three matched children ({ ptr, flags }), by score then key
+function rank(c, opts) {
+  const { cursor, limit } = pageOf(opts);
+  const out = searchFacts(c, opts, c.lists.filter((l) => l.truncated).map((l) => l.name));
   // RRF over every list, then roll children up into their parent row; total counts candidates before the roll-up
   const fused = new Map();
   for (const l of c.lists) l.rows.forEach((x, rank) => {
@@ -135,7 +140,14 @@ function rank(c, opts) {
     groups.set(x.grp, g);
   }
   const ordered = [...groups.values()].sort((a, b) => b.score - a.score || cmp(b.d, a.d) || cmp(a.key, b.key));
-  return { shown: ordered.slice(cursor, cursor + limit), total: fused.size, next: cursor + limit < ordered.length ? cursor + limit : null, facts: out };
+  const kidsOf = (g) => g.children.sort((a, b) => b.score - a.score || cmp(a.key, b.key)).slice(0, 3).map((k) => ({ ptr: k.ptr, flags: k.flags }));
+  return { shown: ordered.slice(cursor, cursor + limit).map((g) => ({ key: g.key, d: g.d, kids: kidsOf(g) })), total: fused.size,
+    next: cursor + limit < ordered.length ? cursor + limit : null, facts: out };
+}
+// the same from a store that ranked (candidates with top: the server)
+function ranked(c, opts) {
+  const { cursor, limit } = pageOf(opts), k = c.ranked;
+  return { shown: k.shown, total: k.total, next: cursor + limit < k.groups ? cursor + limit : null, facts: searchFacts(c, opts, k.truncated) };
 }
 
 function searchRow(g, r) {
@@ -144,11 +156,10 @@ function searchRow(g, r) {
     return { ptr: r.ptr, type: r.source, origin: r.origin, state: null, date: dateOf(r.date), assoc: null, matched: [], flags: marksOf(textOf(r)).flags,
       untrusted: { title: String(r.title ?? ''), snippet: snippet(textOf(r)), author: null } };
   }
-  const kids = g.children.sort((a, b) => b.score - a.score || cmp(a.key, b.key)).slice(0, 3);
   const flags = flagsOf(r.flags);
-  if (!flags.includes('suspicious') && kids.some((k) => flagsOf(k.flags).includes('suspicious'))) flags.unshift('suspicious');
+  if (!flags.includes('suspicious') && g.kids.some((k) => flagsOf(k.flags).includes('suspicious'))) flags.unshift('suspicious');
   return { ptr: r.ptr, type: TYPE_OF_KIND[r.kind], origin: 'github', state: stateOf(r.state), date: dateOf(g.d), assoc: enumOf(r.author_assoc),
-    matched: kids.map((k) => k.ptr), flags, untrusted: { title: String(r.title ?? ''), snippet: snippet(r.body), author: strOr(r.author) } };
+    matched: g.kids.map((k) => k.ptr), flags, untrusted: { title: String(r.title ?? ''), snippet: snippet(r.body), author: strOr(r.author) } };
 }
 
 function searchResult(q, rk, rows) {
@@ -167,8 +178,9 @@ export function search(ctx, q, opts = {}) {
  * @returns {Promise<SearchResult & { view: import('./pg/contract.mjs').View }>}
  */
 export async function searchIn(store, q, opts = {}) {
-  const c = await store.candidates(q, opts);
-  const rk = rank(c, opts);
+  // the server ranks (top): only the shown groups come back
+  const c = await store.candidates(q, { ...opts, top: pageOf(opts) });
+  const rk = c.ranked ? ranked(c, opts) : rank(c, opts);
   const { rows } = rk.shown.length ? await store.rows(rk.shown.map((g) => g.key), { asOf: c.view.run }) : { rows: [] };
   return { ...searchResult(q, rk, rows), view: c.view };
 }

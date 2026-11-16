@@ -4,6 +4,8 @@
 // run / commit / date in UTC and with an offset, against the table below), parity with a mirror of the same run read
 // by the SQLite store, V16 (a publish between two statements of one command; it publishes r6 after a rolled-back run 5),
 // then an old revision's refs across that run-id gap.
+// Search payload (§6.9): on Neon, the search the server ranks equals rank() over its lists, and a group date that is not
+// ASCII gets the lists; offline, searchIn ranks such lists with rank().
 // The Neon tests need NEON_PROJECT_ID; they are skipped without it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -142,6 +144,23 @@ test('SQLite store: the Phase 1 results plus view; revisions and --as-of are ser
   } finally { ctx.close(); }
 });
 
+test('searchIn: lists from a store asked to rank (the server, when a group d is not ASCII) are ranked by rank(), in JS string order', async () => {
+  // two groups with one score; descending d is U+E000, U+10000 in JS (UTF-16 code units), the other way in bytes
+  const a = { key: 'c1', grp: 'c1', d: '\u{10000}', ptr: null, flags: null }, z = { key: 'c2', grp: 'c2', d: '\ue000', ptr: null, flags: null };
+  const asked = [];
+  const store = {
+    async candidates(q, o) {
+      asked.push(o.top);
+      return { lists: [{ name: 'x', rows: [a, z], truncated: false }, { name: 'y', rows: [z, a], truncated: false }],
+        facts: { pathRefsPending: 0, filesTruncated: 0, githubPresent: false }, view: { run: 1 } };
+    },
+    async rows(keys) { return { rows: keys.map((key) => ({ key, ptr: `doc:${key}.md:1-1@r1`, source: 'doc', origin: 'repo', title: key, body: key, date: null })), view: { run: 1 } }; },
+  };
+  const r = await searchIn(store, 'q', { limit: 5, cursor: 0 });
+  assert.deepEqual(asked, [{ cursor: 0, limit: 5 }]);
+  assert.deepEqual([r.rows.map((x) => x.untrusted.title), r.total, r.next], [['c2', 'c1'], 2, null]);
+});
+
 // ---------- Neon ----------
 
 test('V4: a doc edit gives that doc alone a new revision; @r1 keeps its text', { skip }, () => withStore(async (store) => {
@@ -251,4 +270,31 @@ test('an old revision shows its refs as of the last run it was visible in, acros
   assert.deepEqual(await files('pr:1121'), ['src/lib/credits.ts linked']);
   assert.deepEqual(await files('pr:1121@r1'), ['src/lib/credits.ts linked']);              // run 4's link and build, not "run 5"
   assert.deepEqual((await getIn(store, ['pr:1121@r1'])).items[0].revs.map((x) => `r${x.rev}@${x.run}`), ['r1@1', 'r2@6']);
+}));
+
+// the store as searchIn read it before the search payload change: every list, ranked by read.mjs rank()
+const plainOf = (store) => ({ ...store, candidates: (q, { top, ...o }) => store.candidates(q, o) });
+
+test('search payload: the server ranks, and the results are rank() over its lists', { skip }, () => withStore(async (store) => {
+  const plain = plainOf(store);
+  const c = await store.candidates('credits', { top: { cursor: 0, limit: 10 } });
+  assert.ok(!c.lists && c.ranked.shown.length > 0);
+  const OPTS = [{}, { limit: 1 }, { limit: 2, cursor: 1 }, { cursor: 3 }, { cursor: 1000 }, { limit: 50 }, { kind: ['pr', 'review'] }, { kind: ['doc', 'commit'] },
+    { path: 'src/lib' }, { limit: 2.7, cursor: 0.5 }, { limit: Infinity }, { cursor: 1e308, limit: 1e308 }];
+  for (const q of ['credits reserve', '크레딧 예약', '예약', '#12', 'b070cb7', 'src/lib/credits.ts', 'InsufficientCredits', 'reserve', 'credits', '', 'zzzz none']) {
+    for (const o of OPTS) assert.deepEqual(await searchIn(store, q, o), await searchIn(plain, q, o), `${q} ${JSON.stringify(o)}`);
+  }
+}));
+
+test('search payload: a group date that is not ASCII gets the lists, and rank() orders them', { skip }, () => withStore(async (store) => {
+  // JS compares UTF-16 code units and Postgres "C" bytes: U+10000 sorts below U+E000 in JS, above it in Postgres
+  const last = Number((await b.query('reader', 'SELECT max(run_id) AS m FROM brain.run')).rows[0].m);
+  await publish({ n: last + 1, base: last, at: '2099-11-25T00:00:00.000Z', gh: '',
+    code: `UPDATE chunks SET date = char(65536) WHERE source = 'doc'; UPDATE chunks SET date = char(57344) WHERE source = 'change'; ${meta('golden07', SHA(4))}` });
+  const plain = plainOf(store);
+  for (const q of ['credits', 'reserve', 'credits reserve']) {
+    const c = await store.candidates(q, { kind: ['doc', 'change'], top: { cursor: 0, limit: 10 } });
+    assert.ok(c.lists && !c.ranked, q);
+    for (const o of [{}, { kind: ['doc', 'change'] }]) assert.deepEqual(await searchIn(store, q, o), await searchIn(plain, q, o), `${q} ${JSON.stringify(o)}`);
+  }
 }));

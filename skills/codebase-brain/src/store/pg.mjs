@@ -9,13 +9,14 @@
 //   tokens and stems as FTS5's, sql/003) ranked by ts_rank instead of FTS5 bm25, and the trigram lists are ILIKE
 //   for every length: a term of 3+ characters one list part each (the pg_trgm indexes when it has a trigram and the
 //   planner takes them), a shorter one (never a trigram) in one shared scan (tr in candidates).
+// - Search payload (§6.9): candidates with top ranks the lists in SQL and returns only the shown groups.
 // - Repo memory pointers: <source>:<path>:<a>-<b>@r<n> (rev n of item <source>:<path>). A Phase 1 @<build> pointer
 //   reads the view run when its build is that run's build, else it is stale. Vault notes are never on the server.
 import { BrainError, NotFoundError, StalePtrError } from '../errors.mjs';
 import { parseRevPtr, formatPtr, formatRevPtr, GH_TYPES, MEMORY_TYPES } from '../ptr.mjs';
 import { ITEM_META_COLUMNS } from '../pg/contract.mjs';
 import { MAX_NAME_OWNERS } from '../index-knowledge.mjs';
-import { CAP, filterOf, termsOf } from './common.mjs';
+import { CAP, RRF_K, filterOf, termsOf } from './common.mjs';
 
 const R = '(SELECT run_id FROM v)';
 const vis = (t, run = R) => `(${t}.valid_from <= ${run} AND (${t}.valid_to IS NULL OR ${t}.valid_to > ${run}))`;
@@ -111,11 +112,12 @@ const HIT = `SELECT h.* FROM sq CROSS JOIN LATERAL (
 async function candidates(client, q, opts = {}) {
   const t = termsOf(q), f = filterOf(opts);
   const { params, p } = statement();
-  const ctes = [head(atRun(p, opts.asOf))], lists = [];
+  const ctes = [head(atRun(p, opts.asOf))], lists = [], names = [];
   const add = (name, select, order) => {
     const c = `l${lists.length}`;
     ctes.push(`${c} AS (SELECT x.*, row_number() OVER (ORDER BY ${order}) AS o FROM (${select}) x ORDER BY o LIMIT ${CAP + 1})`);
     lists.push(`(SELECT jsonb_build_object('name', '${name}', 'rows', coalesce(jsonb_agg(jsonb_build_array(key, grp, d, ptr, flags) ORDER BY o), '[]'::jsonb)) FROM ${c})`);
+    names.push(name);
   };
   // each term through brain.fts_text as the indexed text (sql/003), then "t1" OR "t2" …; terms are [A-Za-z0-9_] only.
   // Made once (MATERIALIZED): the lists read it as tq
@@ -221,16 +223,47 @@ async function candidates(client, q, opts = {}) {
     }
   }
 
+  // top { cursor, limit } (read.mjs searchIn): the lists are ranked here as read.mjs rank() ranks them, and only the
+  // shown groups leave the server (§6.9). A key scores 1 / (RRF_K + o) in each list, summed in list order (the same
+  // float8 additions as rank()), and keeps the grp / d / ptr / flags of its first list; a group scores as its best key
+  // and takes the d of its first key. Keys are ASCII, and so is d as the kit writes it (an ISO date or null), where byte
+  // order is JS string order; a group with any other d gets the lists instead (JS compares UTF-16 code units). kids: the
+  // group's best three other keys (rank() kids). The page end is added in JS (cursor + limit may be Infinity there)
+  const all = `jsonb_build_array(${lists.join(', ')})`;
+  let out = `${all} AS lists`;
+  if (opts.top && !names.length) out = `'{"shown": [], "total": 0, "groups": 0, "truncated": []}'::jsonb AS ranked`;
+  else if (opts.top) {
+    ctes.push(`c AS (${names.map((_, n) => `SELECT ${n} AS n, key, grp, d, ptr, flags, o FROM l${n} WHERE o <= ${CAP}`).join(' UNION ALL ')})`,
+      `fu AS (SELECT key, (array_agg(grp ORDER BY n, o))[1] AS grp, (array_agg(d ORDER BY n, o))[1] AS d, (array_agg(ptr ORDER BY n, o))[1] AS ptr,
+          (array_agg(flags ORDER BY n, o))[1] AS flags, sum(1::float8 / (${RRF_K} + o)::float8 ORDER BY n, o) AS score, min(n * ${CAP + 2} + o) AS first
+        FROM c GROUP BY key)`,
+      `gr AS (SELECT grp AS key, max(score) AS score, (array_agg(d ORDER BY first))[1] AS d FROM fu GROUP BY grp)`,
+      `od AS (SELECT key, d, row_number() OVER (ORDER BY score DESC, coalesce(d, '') ${BYTES} DESC, key ${BYTES}) AS rn FROM gr)`);
+    const from = p(opts.top.cursor), to = p(opts.top.cursor + opts.top.limit);
+    const ascii = `NOT EXISTS (SELECT 1 FROM gr WHERE octet_length(d) <> char_length(d))`;
+    out = `CASE WHEN ${ascii} THEN jsonb_build_object('total', (SELECT count(*) FROM fu), 'groups', (SELECT count(*) FROM gr),
+        'truncated', jsonb_build_array(${names.map((_, n) => `(SELECT count(*) > ${CAP} FROM l${n})`).join(', ')}),
+        'shown', (SELECT coalesce(jsonb_agg(jsonb_build_array(od.key, od.d, (SELECT coalesce(jsonb_agg(jsonb_build_array(k.ptr, k.flags) ORDER BY k.score DESC, k.key ${BYTES}), '[]'::jsonb)
+            FROM (SELECT ptr, flags, score, key FROM fu WHERE fu.grp = od.key AND fu.key <> fu.grp ORDER BY score DESC, key ${BYTES} LIMIT 3) k)) ORDER BY od.rn), '[]'::jsonb)
+          FROM od WHERE od.rn > ${from}::float8 AND od.rn <= ${to}::float8)) END AS ranked,
+      CASE WHEN NOT ${ascii} THEN ${all} END AS lists`;
+  }
   const sql = `WITH ${ctes.join(',\n')}
     SELECT ${VIEW}, ${pending} AS pending,
       CASE WHEN EXISTS (SELECT 1 FROM s) THEN (SELECT count(*) FROM brain.item_rev r JOIN brain.item i USING (item_id)
         WHERE i.kind = 'pr' AND ${vis('r')} AND (' ' || (r.meta->>'flags') || ' ') LIKE '% files-truncated %') ELSE 0 END AS files_truncated,
-      jsonb_build_array(${lists.join(', ')}) AS lists`;
+      ${out}`;
   const r = (await client.query(sql, params)).rows[0];
   const view = viewOf(r, noRun(opts.asOf));
+  const facts = { pathRefsPending: Number(r.pending), filesTruncated: Number(r.files_truncated), githubPresent: view.sync !== null };
+  if (r.ranked) {
+    const k = r.ranked;
+    return { ranked: { shown: k.shown.map(([key, d, kids]) => ({ key, d, kids: kids.map(([ptr, flags]) => ({ ptr, flags })) })), total: k.total,
+      groups: k.groups, truncated: names.filter((_, n) => k.truncated[n]) }, facts, view };
+  }
   return {
     lists: r.lists.map((l) => ({ name: l.name, rows: l.rows.slice(0, CAP).map(([key, grp, d, ptr, flags]) => ({ key, grp, d, ptr, flags })), truncated: l.rows.length > CAP })),
-    facts: { pathRefsPending: Number(r.pending), filesTruncated: Number(r.files_truncated), githubPresent: view.sync !== null },
+    facts,
     view,
   };
 }
