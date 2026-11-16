@@ -220,6 +220,7 @@ function finish(fr, cov, write = out) {
 
 // write: where the notices go (viz keeps stdout for its file path only)
 function target(ctx, q, opt, write = out) {
+  if (q === undefined || !String(q).trim()) throw usage('give a target: a symbol, path#Name, file or folder (brain shared takes two)');
   const db = ctx.code;
   const r = resolveTarget(db, q);
   if (r.node) {
