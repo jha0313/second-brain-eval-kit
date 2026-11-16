@@ -4,6 +4,7 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { git } from './files.mjs';
+import { sanitize, sanitizeLine } from './sanitize.mjs';
 
 export const MD_EXT = /\.(md|mdx)$/i;
 export const PR_RE = /(?<![\w/#])#(\d{2,6})\b/g;
@@ -18,8 +19,8 @@ const MAX_LINES = 40;
 const BULK_FILES = 300;
 
 export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommits = 5000, log }) {
-  const insChunk = db.prepare(`INSERT INTO chunks(source, path, start_line, end_line, title, body, sha, date, prs)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const insChunk = db.prepare(`INSERT INTO chunks(source, path, start_line, end_line, title, body, sha, date, prs, body_line)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const insLink = db.prepare('INSERT INTO links(chunk, node, kind, evidence) VALUES (?, ?, ?, ?)');
   const nodeByKey = db.prepare('SELECT id FROM nodes WHERE key = ?');
   const symbolsByName = db.prepare(`SELECT id FROM nodes WHERE name = ? AND kind != 'file' AND exported = 1 LIMIT ${MAX_NAME_OWNERS + 1}`);
@@ -59,16 +60,20 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
     }
   };
 
+  // texts arrive sanitized whole (sanitize.mjs); a title can also come from a file name, so it is cleaned here too
   const addChunk = (c) => {
-    const r = insChunk.run(c.source, c.path ?? null, c.start ?? null, c.end ?? null, c.title, c.body, c.sha ?? null, c.date ?? null,
-      prsOf(`${c.title}\n${c.body}`));
+    const title = sanitizeLine(c.title);
+    const r = insChunk.run(c.source, c.path ?? null, c.start ?? null, c.end ?? null, title, c.body, c.sha ?? null, c.date ?? null,
+      prsOf(`${title}\n${c.body}`), c.bodyLine ?? null);
     stats.chunks++;
     return Number(r.lastInsertRowid);
   };
 
-  // 1. Markdown in the repo: one chunk per heading section (long sections split), CHANGELOG per entry
+  // 1. Markdown in the repo: one chunk per heading section (long sections split), CHANGELOG per entry.
+  //    Each file is sanitized whole before it is split, so a secret across a chunk boundary is still caught;
+  //    sanitizing keeps the line count, so chunk line numbers stay file line numbers
   for (const rel of tracked.filter((p) => MD_EXT.test(p))) {
-    const text = readFileSync(join(repo, rel), 'utf8');
+    const text = sanitize(readFileSync(join(repo, rel), 'utf8')).text;
     const source = rel === 'CHANGELOG.md' ? 'changelog' : rel.startsWith('changes/') ? 'change' : 'doc';
     const pieces = source === 'changelog' ? changelogEntries(text) : sections(text, rel);
     for (const s of pieces) {
@@ -87,12 +92,15 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
   const SEP = '\x1e';
   const out = git(repo, ['log', `-n${maxCommits}`, '--no-merges', '--name-only', `--format=${SEP}%H%x1f%cI%x1f%s%x1f%b%x1f`, 'HEAD']);
   for (const rec of out.split(SEP).slice(1)) {
-    const [sha, date, subject, body, files = ''] = rec.split('\x1f');
+    const [sha, date, rawSubject, rawBody, files = ''] = rec.split('\x1f');
+    const msg = sanitize(`${rawSubject}\n${rawBody}`).text;          // the whole message; git's subject is one line
+    const cut = msg.indexOf('\n');
+    const subject = msg.slice(0, cut), body = msg.slice(cut + 1);
     const cleanBody = body.split('\n').filter((l) => !/^(Co-authored-by|Signed-off-by|Claude-Session|Reviewed-by):/i.test(l.trim()) && !/^https?:\/\/claude\.ai\//.test(l.trim())).join('\n').trim();
     const touched = files.split('\n').map((f) => f.trim()).filter(Boolean);
     // a bulk commit (initial import, mass rename, the root of a shallow clone) says nothing about one file
     const bulk = touched.length > BULK_FILES;
-    const id = addChunk({ source: 'commit', title: subject, body: bulk ? cleanBody : `${cleanBody}\n\nfiles: ${touched.join(' ')}`, sha, date: date.slice(0, 10) });
+    const id = addChunk({ source: 'commit', title: subject, body: bulk ? cleanBody : `${cleanBody}\n\nfiles: ${sanitize(touched.join(' ')).text}`, sha, date: date.slice(0, 10) });
     if (bulk) stats.bulkCommits++;
     else for (const f of touched) { const n = nodeByKey.get(f); if (n) link(id, n.id, 'touches', sha.slice(0, 8)); }
     linkText(id, `${subject}\n${cleanBody}`);
@@ -105,7 +113,7 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
     for (const abs of walk(vault)) {
       if (!MD_EXT.test(abs)) continue;
       const rel = relative(vault, abs).split(sep).join('/');
-      const text = readFileSync(abs, 'utf8');
+      const text = sanitize(readFileSync(abs, 'utf8')).text;
       const born = text.match(/^born:\s*(\d{4}-\d{2}-\d{2})/m)?.[1];
       if (born && commitDate && born > commitDate) { stats.vaultSkippedNewer++; continue; }
       const sha = rel.match(/^Changes\/([0-9a-f]{7,40})\b/)?.[1];       // commit notes are named "<sha> <subject>.md"
@@ -170,7 +178,8 @@ export function sections(text, rel) {
   const flush = () => {
     for (let i = 0; i < cur.lines.length; i += MAX_LINES) {
       const part = cur.lines.slice(i, i + MAX_LINES);
-      out.push({ title: cur.title, body: part.join('\n').trim(), start: cur.start + i, end: cur.start + i + part.length - 1 });
+      const [a, b] = bodyRange(part);
+      out.push({ title: cur.title, body: part.slice(a, b).join('\n'), start: cur.start + i, end: cur.start + i + part.length - 1, bodyLine: cur.start + i + a });
     }
   };
   let inFence = false;
@@ -188,17 +197,26 @@ export function sections(text, rel) {
     }
   });
   flush();
-  return out.filter((s) => s.body.length >= 20);
+  return out.filter((s) => s.body.trim().length >= 20);
+}
+
+// [first, last + 1) of the non-blank lines. Blank lines at the ends are dropped; kept lines keep their indentation,
+// so a stored body line is byte-for-byte its file line (body_line = the file line of the first one)
+function bodyRange(lines) {
+  const a = lines.findIndex((l) => /\S/.test(l));
+  if (a < 0) return [0, 0];
+  return [a, lines.findLastIndex((l) => /\S/.test(l)) + 1];
 }
 
 // CHANGELOG.md: the preamble (how the file is kept), then one chunk per top-level "- " entry, titled with its version.
 function changelogEntries(text) {
   const lines = text.split('\n');
   const first = lines.findIndex((l) => /^##\s/.test(l));
-  const out = first > 0 ? [{ title: 'CHANGELOG', start: 1, end: first, body: lines.slice(0, first).join('\n').trim() }] : [];
+  const pre = bodyRange(lines.slice(0, first));
+  const out = first > 0 ? [{ title: 'CHANGELOG', start: 1, end: first, body: lines.slice(pre[0], pre[1]).join('\n'), bodyLine: 1 + pre[0] }] : [];
   let version = '';
   let cur = null;
-  const flush = () => { if (cur) out.push({ ...cur, body: cur.lines.join('\n'), end: cur.start + cur.lines.length - 1 }); cur = null; };
+  const flush = () => { if (cur) out.push({ ...cur, body: cur.lines.join('\n'), end: cur.start + cur.lines.length - 1, bodyLine: cur.start }); cur = null; };
   lines.forEach((line, i) => {
     const v = /^##\s+\[([^\]]+)\]/.exec(line);
     if (v) { flush(); version = v[1]; return; }
