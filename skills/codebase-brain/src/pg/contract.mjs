@@ -671,3 +671,11 @@ export const DUMP_NATURAL_KEYS = Object.freeze({
   ref_link: ['fact_key', 'valid_from'], run: ['run_id->ordinal'], sync_state: ['run_id->ordinal', 'source'], binding: ['id'],
 });
 export const DUMP_VOLATILE_COLUMNS = Object.freeze({ run: ['attempt_id', 'published_at'], binding: ['created_at'] });
+/**
+ * JSON values inside kept columns that a fresh build of the same commit changes (Phase 0 build stamps, the sync pid).
+ * A path is an array of keys ('sync.github' holds a dot); '*' = every key at that level (the keys themselves stay compared).
+ */
+export const DUMP_VOLATILE_PATHS = Object.freeze({
+  run: Object.freeze([['meta', 'built_at'], ['meta', 'build_id'], ['meta', 'timings'], ['checksum', 'meta'], ['checksum', 'sync.github']]),
+  sync_state: Object.freeze([['state', 'row', 'run_pid'], ['state', 'refs', 'build'], ['state', 'refs', 'other', '*']]),
+});
