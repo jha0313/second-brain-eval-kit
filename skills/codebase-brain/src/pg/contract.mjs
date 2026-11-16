@@ -532,6 +532,7 @@ export const REFRESH_TRIGGERS = Object.freeze(['behind main', 'differs from main
 export const FRESHNESS_UNKNOWN = '(freshness unknown)';
 export const FOOTER_PHRASES = Object.freeze({
   prefix: 'brain data:',
+  noRun: 'no published run',
   code: Object.freeze({ same: '= main', behind: (n) => `${n} commit${n === 1 ? '' : 's'} behind main`, differs: 'differs from main', unknown: FRESHNESS_UNKNOWN }),
   memory: Object.freeze({ fresh: (age) => `github as of ${age} ago`, old: (age) => `github as of ${age} ago (stale)`, never: 'github never synced', unknown: FRESHNESS_UNKNOWN }),
   activity: Object.freeze({ idle: null, queued: 'refresh queued', running: (stage) => `refresh running${stage ? ` (${stage})` : ''}` }),
@@ -582,13 +583,15 @@ export const REFRESH_LIMITS = Object.freeze({
 export const REFRESH_MESSAGES = Object.freeze({
   fresh: 'fresh',
   refreshed: (runId) => `refreshed (run ${runId})`,
-  running: (runId, elapsed, stage) => `still running (run ${runId ?? '?'}, ${elapsed}${stage ? `, stage: ${stage}` : ''})`,
+  // running shows the ACTIONS run id (no brain run exists yet); refreshed shows the BRAIN run id, as in the footer
+  running: (actionsRunId, elapsed, stage) => `still running (actions run ${actionsRunId ?? '?'}, ${elapsed}${stage ? `, stage: ${stage}` : ''})`,
   cooldown: (ago, stage) => `refresh FAILED (cooldown: last attempt failed ${ago} ago${stage ? ` in ${stage}` : ''}; data is stale)`,
   failed: (reason) => `refresh FAILED (${reason})`,
   mainMoved: 'refresh FAILED (main moved)',
   deadline: 'refresh FAILED (deadline: 15m since the first call)',
   noPermission: 'refresh unavailable: no dispatch permission',
   noGithub: 'refresh unavailable: GitHub not reachable',
+  noServer: 'refresh unavailable: brain server not reachable',   // a NEW refresh cannot reach the reader DB (P25)
 });
 /**
  * State file ~/.cache/brain/refresh/<binding id>.json (F11), mode 0600, locked with withWriteLock(<file>).
