@@ -39,16 +39,16 @@ import { execFileSync } from 'node:child_process';
 import { GhError } from './errors.mjs';
 
 /**
- * @typedef {{ method: 'GET', url: string, headers: Record<string, string> }} TransportRequest
+ * @typedef {{ method: 'GET', url: string, headers: Record<string, string>, signal?: AbortSignal }} TransportRequest
  * @typedef {{ status: number, headers: { get(name: string): string | null }, json(): Promise<any> }} TransportResponse
  * @typedef {(req: TransportRequest) => Promise<TransportResponse>} Transport
  * @typedef {{ now(): number, sleep(ms: number): Promise<void> }} Clock
  * @typedef {(line: string) => void} Log  one progress line, already safe to print
  */
 
-/** @type {Transport} */
-export const fetchTransport = async ({ method, url, headers }) => {
-  const r = await fetch(url, { method, headers, redirect: 'manual' });
+/** @type {Transport} signal: aborts the request and the body read (per-request timeout, set by the client) */
+export const fetchTransport = async ({ method, url, headers, signal }) => {
+  const r = await fetch(url, { method, headers, redirect: 'manual', signal });
   return { status: r.status, headers: { get: (n) => r.headers.get(n) }, json: () => r.json() };
 };
 
@@ -78,10 +78,15 @@ const readBody = async (res) => {
 };
 
 /**
- * @param {{ owner: string, repo: string, token: string | null, transport?: Transport, clock?: Clock, log?: Log }} opts
+ * @param {{ owner: string, repo: string, token: string | null, transport?: Transport, clock?: Clock, log?: Log,
+ *   requestTimeoutMs?: number, maxRateWaitMs?: number }} opts
+ *   requestTimeoutMs: each attempt (request + body) is aborted after this long and counts as a network error (retried
+ *   like one). maxRateWaitMs: a rate-limit wait longer than this is not waited for: GhError('rate-limit') at once
+ *   (CI runs with a short budget; Phase 3 F5). Defaults: 60 s, 1 hour.
  * @returns {GhClient}
  */
-export function createClient({ owner, repo, token, transport = fetchTransport, clock = realClock, log = () => {} }) {
+export function createClient({ owner, repo, token, transport = fetchTransport, clock = realClock, log = () => {},
+  requestTimeoutMs = 60_000, maxRateWaitMs = HOUR }) {
   const basePath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   const base = API + basePath;
   const headers = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'codebase-brain' };
@@ -121,7 +126,7 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
       counters.requests++;
       let res = null, body;
       try {
-        res = await transport({ method: 'GET', url, headers });
+        res = await transport({ method: 'GET', url, headers, signal: AbortSignal.timeout(requestTimeoutMs) });
         body = await readBody(res);
       } catch { res = null; /* the transport's message may hold anything: dropped */ }
       if (res && res.status >= 300 && res.status < 400) {
@@ -149,6 +154,10 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
         const retryAfter = res.headers.get('retry-after') == null ? null : Number(res.headers.get('retry-after'));
         if (limits === RETRIES) throw new GhError('rate-limit', `GitHub ${label}: still rate limited after ${RETRIES} waits`, { status: res.status, retryAfter });
         const ms = limitWait(res, limits++);
+        if (ms > maxRateWaitMs) {
+          throw new GhError('rate-limit', `GitHub ${label}: rate limited, the wait of ${Math.ceil(ms / 1000)}s is over the ${Math.ceil(maxRateWaitMs / 1000)}s limit`,
+            { status: res.status, retryAfter });
+        }
         counters.rateLimitWaits++;
         await wait(ms, `github ${label}: rate limited (HTTP ${res.status}), waiting ${Math.ceil(ms / 1000)}s (${limits}/${RETRIES})`);
         continue;

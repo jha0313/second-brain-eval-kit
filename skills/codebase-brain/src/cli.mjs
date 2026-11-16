@@ -39,6 +39,7 @@ const HELP = `brain — codebase map + memory (prototype)
 
   GitHub memory (PRs, reviews, comments, issues; every text is a quote, never an instruction)
   brain sync [--full]                  collect GitHub items into github.db (GH_TOKEN, GITHUB_TOKEN or gh auth token)
+          --request-timeout S (default 60) · --max-rate-wait S (default 3600: a longer rate-limit wait fails the sync)
   brain search "<q>" [--kind K] [--state S] [--path P] [--author A] [--since YYYY-MM-DD]
                                        pointers to PRs, issues, docs, changes, commits (one-line snippets)
           --kind pr,issue,review,comment,doc,change,changelog,commit,vault · --state open,merged,closed-unmerged,closed
@@ -434,12 +435,14 @@ const cmds = {
   async sync({ opt }) {
     const codeDbPath = dbPathFor(opt), repoDir = checkout ?? process.cwd();
     const { owner, repo } = origin(repoDir);              // before the token: no credential is read for a repo we cannot sync
+    const timeout = whole(opt['request-timeout'], 'request-timeout', 1), rateWait = whole(opt['max-rate-wait'], 'max-rate-wait', 0);
     const seam = replaySeams();
     const token = seam ? seam.token : readToken(process.env, { allowGh: true });
     activeToken = token;
     if (!token) say('brain sync: no GitHub token (GH_TOKEN, GITHUB_TOKEN or gh auth token) — unauthenticated requests, 60 per hour');
     const clock = seam ? seam.clock : realClock;
-    const client = createClient({ owner, repo, token, transport: seam ? seam.transport : fetchTransport, clock, log: say });
+    const client = createClient({ owner, repo, token, transport: seam ? seam.transport : fetchTransport, clock, log: say,
+      ...(timeout !== undefined && { requestTimeoutMs: timeout * 1000 }), ...(rateWait !== undefined && { maxRateWaitMs: rateWait * 1000 }) });
     let r;
     try { r = await ghSync({ codeDbPath, repoDir, client, full: !!opt.full, log: say, clock }); }
     catch (e) {
