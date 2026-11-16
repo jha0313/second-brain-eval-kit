@@ -164,18 +164,34 @@ def test_probe_denies_the_host_paths_trials_deny(tmp_path, monkeypatch):
 
 
 def test_probe_flags_everyday_bash_that_fails():
-    ok = {"name": "Bash", "input": {"command": "B=/bin/echo; $B var-ok"}, "is_error": False, "output": "var-ok"}
-    cwd = {"name": "Bash", "input": {"command": "for f in *; do :; done; echo loop-ok"}, "is_error": True,
-           "output": "Exit code 1\nloop-ok\nzsh:1: operation not permitted: /tmp/x/cwd-1a2b"}
+    C = probe.EVERYDAY_CMD
+    bash = lambda cmd, out, err=False, **extra: {"name": "Bash", "input": {"command": cmd, **extra}, "is_error": err, "output": out}  # noqa: E731
+    var, loop, tmp = bash(C["var-ok"], "var-ok"), bash(C["loop-ok"], "loop-ok"), bash(C["tmp-ok"], "tmp-ok")
+    cwd = bash(C["loop-ok"], "Exit code 1\nloop-ok\nzsh:1: operation not permitted: /tmp/x/cwd-1a2b", err=True)
     other = {"name": "Bash", "input": {"command": "cat docs/notes/key.json"}, "is_error": True, "output": "denied"}
-    assert probe.everyday_errors([ok, other]) == []
-    assert probe.everyday_errors([ok, cwd, other]) == ["zsh:1: operation not permitted: /tmp/x/cwd-1a2b"]
-    fake = {"name": "Bash", "input": {"command": 'echo "var-ok loop-ok tmp-ok"'}, "is_error": False, "output": "var-ok loop-ok tmp-ok"}
-    assert probe.everyday_ok([fake]) == []                                  # printing the words is not running the commands
-    loop = {"name": "Bash", "input": {"command": "for f in *; do :; done; echo loop-ok"}, "is_error": False, "output": "loop-ok"}
-    tmp = {"name": "Bash", "input": {"command": "printf tmp-ok > $TMPDIR/p.txt && cat $TMPDIR/p.txt"}, "is_error": False, "output": "tmp-ok"}
-    assert probe.everyday_ok([ok, loop, tmp]) == ["var-ok", "loop-ok", "tmp-ok"]
-    assert probe.everyday_ok([ok, cwd, tmp]) == ["var-ok", "tmp-ok"]         # the failed loop does not count
+    assert probe.everyday_errors([var, other]) == []
+    assert probe.everyday_errors([var, cwd, other]) == ["zsh:1: operation not permitted: /tmp/x/cwd-1a2b"]
+    assert probe.everyday_ok([var, loop, tmp]) == ["var-ok", "loop-ok", "tmp-ok"]
+    assert probe.everyday_ok([var, cwd, tmp]) == ["var-ok", "tmp-ok"]          # the failed loop does not count
+    joined = bash(f"{C['var-ok']}\n{C['loop-ok']}\n{C['tmp-ok']}", "var-ok\nloop-ok\ntmp-ok")
+    assert probe.everyday_ok([joined]) == ["var-ok", "loop-ok", "tmp-ok"]       # one multi-line call may run all three
+    # printing the words is not running the commands, whatever the description or quoted text says
+    fake = bash('echo "var-ok loop-ok tmp-ok"', "var-ok loop-ok tmp-ok", description="B=var, for f in lo op, %s-ok' tmp, $TMPDIR")
+    quoted = bash("echo 'B=var in lo op %s-ok' tmp' var-ok loop-ok tmp-ok", "B=var in lo op %s-ok tmp var-ok loop-ok tmp-ok")
+    assert probe.everyday_ok([fake]) == [] and probe.everyday_ok([quoted]) == []
+    assert "var-ok" not in "".join(C.values()) and "loop-ok" not in "".join(C.values()) and "tmp-ok" not in "".join(C.values())
+
+
+def test_judge_limit_counts_shown_excerpts(tmp_path, repo):
+    from types import SimpleNamespace
+    from skill_eval import judge
+    repo.write({"svc/lever/hook.ts": lines(5)})
+    head = repo.commit()
+    case = SimpleNamespace(hard=[{"cites_exist": {"min": 1, "prepared": [f".brain/f{i}.json" for i in range(12)]}}],
+                           key_paths=lambda kinds=None: [])
+    answer = " ".join(f".brain/f{i}.json" for i in range(12)) + " and svc/lever/hook.ts:2."
+    out = judge._excerpts(case, {"final": answer}, repo.root, head)
+    assert "svc/lever/hook.ts:2-2" in out and ".brain/f" not in out
 
 
 def test_estimate_uses_the_measured_rates():
