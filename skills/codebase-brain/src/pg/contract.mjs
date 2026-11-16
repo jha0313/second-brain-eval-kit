@@ -618,7 +618,7 @@ export const CI_SIGNAL_CLEANUP_MS = 5000;   // SIGINT/SIGTERM: kill children, cl
 export const CI_EXIT = Object.freeze({ ok: 0, failed: 1, usage: 2, verifyFailed: 3, outcomeUnknown: 4 });
 /** attempt.error is `<stage>:<kind>`, never free text (R16 / §6.7). */
 export const CI_ERROR_KINDS = Object.freeze(['timeout', 'exit', 'signal', 'connect', 'checksum', 'http', 'rate-limit',
-  'outbound', 'stale-base', 'not-descendant', 'binding', 'sql', 'fault', 'internal']);
+  'outbound', 'stale-base', 'base-moved', 'not-descendant', 'not-resanitized', 'binding', 'sql', 'fault', 'internal']);
 export const ciError = (stage, kind) => {
   if (!CI_STAGES.includes(stage) || !CI_ERROR_KINDS.includes(kind)) fail(`bad ci error ${stage}:${kind}`);
   return `${stage}:${kind}`;
