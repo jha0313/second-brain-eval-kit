@@ -172,8 +172,10 @@ it('V11: the COMMIT reply is lost: publish resolves it under the lock as ok and 
   const proxy = await commitProxy(W);
   try {
     proxy.arm('drop-reply');
-    const r2 = await pub(r1.after, fx.s2, { url: proxy.url });
+    const seen = [];
+    const r2 = await pub(r1.after, fx.s2, { url: proxy.url, onStage: (s) => { seen.push(s); } });
     assert.equal(proxy.commits, 1);
+    assert.deepEqual(seen.slice(-2), ['ok', 'committed'], 'the hook hears the resolved commit once');
     await assertRun(r2);
     assert.deepEqual((await rows('SELECT run_id::int AS r FROM brain.run ORDER BY run_id')).map((x) => x.r), [r1.run, r2.run]);
   } finally { await proxy.close(); }
@@ -351,6 +353,20 @@ it('S2: the client deadline follows statement_timeout: a 46 s statement under th
   assert.ok(r.run > r1.run);
   assert.deepEqual(seen, ['locked', 'run', 'nodes', 'items', 'facts', 'counts', 'ok', 'committed']);
   assert.deepEqual(await attempt(a.attemptId), { status: 'ok', stage: null, error: null });
+});
+
+it('S2: a COMMIT sent on a dead socket resolves as rolled back; the stage hook hears it', SLOW, async () => {
+  await branch.reset();
+  const r1 = await pub(null, fx.s1);
+  const before = await dump();
+  const a = await begin(fx.s2.meta.commit);
+  const p = plan(r1.after, fx.s2, a);
+  const seen = [];
+  const drop = (s, { client }) => { seen.push(s); if (s === 'ok') client.connection.stream.destroy(); };
+  await assert.rejects(publish(args(a, p, fx.s2, { onStage: drop })), (e) => e.code === 'publish-failed' && e.kind === 'rolled-back');
+  assert.deepEqual(seen.slice(-2), ['ok', 'rolled-back']);
+  assert.equal(await dump(), before);
+  assert.deepEqual(await attempt(a.attemptId), { status: 'failed', stage: 'commit', error: 'rolled-back' });
 });
 
 test('input and connection failures are BrainErrors that echo no value (no server needed)', { timeout: 120_000 }, async () => {

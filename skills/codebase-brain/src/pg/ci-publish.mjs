@@ -134,7 +134,7 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
 
   // ---- signals: kill the child, drop the publish socket, record within CI_SIGNAL_CLEANUP_MS, exit ----
   // phase (publish's stage hook): 'committing' from the attempt-ok UPDATE, 'committed' once COMMIT has returned (or a
-  // lost COMMIT resolved as ok), back to 'writing' when publish fails with nothing committed
+  // lost COMMIT resolved as ok), back to 'writing' once a lost COMMIT resolved as not committed or publish failed
   const abort = new AbortController();
   let current = 'prepare', attemptId = null, group = null, stopping = null, phase = 'writing', run = null;
   const killChild = (sig) => { if (group) { try { process.kill(-group, sig); } catch { /* gone */ } } };
@@ -300,9 +300,10 @@ export async function ciPublish({ source, mirror: mirrorDir, work = null, full =
       ({ run } = await stage('publish', () => publish({ url, attemptId, base: base?.run ?? null, delta: up.delta, checksum: up.checksum, mode,
         commit: prep.sourceSha, toolVersion: prep.toolVersion, repoDir: src, limits: txLimits, recordFailure: false, signal: abort.signal,
         onStage: async (name, ctx) => {
+          if (name === 'committed') phase = 'committed';               // set before any await: a signal may come next
+          if (name === 'rolled-back') phase = 'writing';
           if (hook) await hook(name, ctx);
-          if (name === 'ok') phase = 'committing';
-          if (name === 'committed') phase = 'committed';
+          if (name === 'ok') phase = 'committing';                     // after the hook: a fault there commits nothing
         } })));
     } catch (e) {
       if (e.code === 'outcome-unknown') {                            // R12: never written over

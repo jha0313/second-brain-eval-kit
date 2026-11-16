@@ -260,8 +260,9 @@ function descends(repoDir, older, newer) {
  *   signal?: AbortSignal }} opts
  *   checksum: contract.checksum(applyDelta(base state, delta)); commit: the source commit (= delta.meta.commit and the
  *   attempt's source_sha); repoDir: the source checkout (git ancestry, normal mode); onStage: hook awaited after each
- *   stage ('locked', 'run', 'nodes', 'items', 'facts', 'counts', 'ok'; 'committed' once COMMIT has returned or a lost
- *   COMMIT resolved as ok, before the connection closes; its errors are ignored) with the client; limits: default
+ *   stage ('locked', 'run', 'nodes', 'items', 'facts', 'counts', 'ok'; then 'committed' once COMMIT has returned or a
+ *   lost COMMIT resolved as ok, or 'rolled-back' once it resolved as not committed, each before any connection closes
+ *   and with its errors ignored) with the client; limits: default
  *   transaction_timeout 60s (10min for the first publish), statement_timeout 30s, lock_timeout 15s (each query's
  *   client deadline is statement_timeout + 15 s); recordFailure: false leaves every failure unrecorded (recorded =
  *   false) for the caller; signal: abort destroys the socket (the server rolls back) and throws code 'aborted' without
@@ -358,8 +359,8 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
     }
     if (committing) {                                              // R12: the COMMIT reply is lost (or COMMIT failed)
       kill(c);
-      const r = await resolveAttempt({ url, attemptId });
-      if (r.outcome === 'ok') { await stage('committed').catch(() => {}); return { run: r.run }; }
+      const r = await resolveAttempt({ url, attemptId, onOutcome: (o) => { stage(o === 'ok' ? 'committed' : 'rolled-back').catch(() => {}); } });
+      if (r.outcome === 'ok') return { run: r.run };
       if (r.outcome === 'rolled-back') {
         fail('publish-failed', 'commit', 'the COMMIT did not happen: nothing was written', { kind: 'rolled-back', recorded: await record('commit', 'rolled-back') });
       }
@@ -401,11 +402,12 @@ export async function failAttempt({ url, attemptId, stage, error = null }) {
 /**
  * R12: after a lost COMMIT reply. New connection, the publish lock with lock_timeout 60s, then: a run row for the
  * attempt -> 'ok'; none -> 'rolled-back' (the caller then runs failAttempt). Lock not acquired, no connection or no answer
- * within the client deadline (75 s) -> 'unknown'. Never writes.
- * @param {{ url: string, attemptId: number }} opts
+ * within the client deadline (75 s) -> 'unknown'. Never writes. onOutcome('ok'|'rolled-back') is called as soon as the
+ * server has answered, before the lock is released and the connection closed.
+ * @param {{ url: string, attemptId: number, onOutcome?: (outcome: 'ok'|'rolled-back') => void }} opts
  * @returns {Promise<{ outcome: 'ok'|'rolled-back'|'unknown', run: number|null }>}
  */
-export async function resolveAttempt({ url, attemptId }) {
+export async function resolveAttempt({ url, attemptId, onOutcome = null }) {
   let c;
   try {
     c = await connect(url, { queryTimeout: 75_000 });
@@ -413,7 +415,9 @@ export async function resolveAttempt({ url, attemptId }) {
     await c.query("SET LOCAL lock_timeout = '60s'");
     await c.query('SELECT pg_advisory_xact_lock($1)', [C.PUBLISH_LOCK_KEY]);
     const r = (await c.query('SELECT run_id FROM brain.run WHERE attempt_id = $1', [attemptId])).rows[0];
-    return r ? { outcome: 'ok', run: Number(r.run_id) } : { outcome: 'rolled-back', run: null };
+    const out = r ? { outcome: 'ok', run: Number(r.run_id) } : { outcome: 'rolled-back', run: null };
+    try { onOutcome?.(out.outcome); } catch { /* a hook cannot change the outcome */ }
+    return out;
   } catch { return { outcome: 'unknown', run: null }; }               // 55P03 lock_not_available, a timeout, a dead socket
   finally {
     if (c) {
