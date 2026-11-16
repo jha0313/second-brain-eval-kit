@@ -99,7 +99,7 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
     const cut = msg.indexOf('\n');
     const subject = msg.slice(0, cut), body = msg.slice(cut + 1);
     const cleanBody = body.split('\n').filter((l) => !/^(Co-authored-by|Signed-off-by|Claude-Session|Reviewed-by):/i.test(l.trim()) && !/^https?:\/\/claude\.ai\//.test(l.trim())).join('\n').trim();
-    const touched = files.split('\n').map((f) => f.trim()).filter(Boolean);
+    const touched = files.split('\n').filter(Boolean);   // no trim: ' a.ts' is a different file from 'a.ts'
     // a bulk commit (initial import, mass rename, the root of a shallow clone) says nothing about one file
     const bulk = touched.length > BULK_FILES;
     const id = addChunk({ source: 'commit', title: subject, body: bulk ? cleanBody : `${cleanBody}\n\nfiles: ${sanitize(touched.join(' ')).text}`, sha, date: date.slice(0, 10) });
