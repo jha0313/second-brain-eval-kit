@@ -3,63 +3,24 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { copyFileSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { copyFileSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as C from '../../src/pg/contract.mjs';
-import { snapshot, diff, applyDelta, checkOutbound, factKeyOf } from '../../src/pg/snapshot.mjs';
-import { githubDbPath } from '../../src/gh-schema.mjs';
-import { runBrain } from '../phase1/helpers.mjs';
-import { buildStores, expectedText, EXPECTED } from './golden/build-golden.mjs';
-import { canaries, identSecret, zwSplit, githubSecretCorpus, repoSecretCorpus, replayRoutes, writeReplay, setupRepo, sync, leaksIn } from '../security/lib.mjs';
+import { snapshot, diff, applyDelta, checkOutbound } from '../../src/pg/snapshot.mjs';
+import { expectedText, EXPECTED } from './golden/build-golden.mjs';
+import { canaries, identSecret, zwSplit, leaksIn } from '../security/lib.mjs';
+import { FULL, INCR, OLD_COMMIT, ROUTES, REFUND, git, build, fixtureBuilds, withoutOldCommit, atVersion0, corpusState } from './fixture-builds.mjs';
 
-const FULL = { map: 'full', docs: 'full', commits: 'append', github: 'full' };
-const INCR = { ...FULL, github: 'incremental' };
 const TABLES = ['nodes', 'items', 'edge', 'unresolved', 'link', 'ref_link'];
-const ROUTES = ['src/lib/routes.generated.ts', 'src/lib/routes.generated.ts#ROUTES@variable', 'src/lib/routes.generated.ts#displayName@variable'];
-const REFUND = ['src/lib/refund.ts', 'src/lib/refund.ts#refund@function'];
-const OLD_COMMIT = 'commit:b070cb73666691f1bdd5fb238720ece1301fc069';   // the fixture commit (fixed dates, golden)
-// no user or system git config (signing, hooks) in this process or the builds and syncs it spawns
-Object.assign(process.env, { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
-
 const sorted = (a) => [...a].sort();
 const keysOf = (part, keyOf) => sorted(part.put.map(keyOf));
 const emptyDelta = (d) => TABLES.every((t) => d[t].put.length === 0 && d[t].close.length === 0);
 const json = (v) => JSON.stringify(v, (k, x) => (x instanceof Map ? Object.fromEntries(x) : x?.type === 'Buffer' ? Buffer.from(x.data).toString('hex') : x));
 const linkKeys = (state, ptr) => [...state.link].filter(([, l]) => l.ptr === ptr).map(([k]) => k);
 
-function build(repo, db) {
-  const r = runBrain(['build', '.', '--db', db], { cwd: repo, env: { BRAIN_DB: db } });
-  assert.equal(r.status, 0, r.stderr);
-}
-const git = (repo, ...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: repo, encoding: 'utf8' });
-
 let one, s1, s2, s2full, s2v1, newCommit;
-before(() => {
-  // build 1 = the golden stores; build 2 = the next commit of the same checkout, built into a second code.db
-  one = buildStores();
-  s1 = snapshot({ codeDb: one.codeDb, githubDb: one.ghDb, manifest: INCR });
-  const repo = one.codeDb.replace(/\.db$/, '');                          // fixtureRepo puts <repo>.db next to <repo>
-  rmSync(join(repo, 'src/lib/routes.generated.ts'));
-  writeFileSync(join(repo, 'src/lib/refund.ts'), 'export function refund(n: number) { return n; }\n');
-  writeFileSync(join(repo, 'docs/credits.md'), `${readFileSync(join(repo, 'docs/credits.md'), 'utf8')}\nRefunds go through src/lib/refund.ts.\n`);
-  git(repo, 'add', '-A', '-f');
-  git(repo, 'commit', '-q', '-m', 'refund: give credits back');
-  newCommit = `commit:${git(repo, 'rev-parse', 'HEAD').trim()}`;
-  const codeDb2 = `${repo}-two.db`;
-  build(repo, codeDb2);
-  // GitHub between the builds: issue 45 edited; ic:8 is gone (a full sync drops it, an incremental one cannot know)
-  copyFileSync(one.ghDb, githubDbPath(codeDb2));
-  const gh = new DatabaseSync(githubDbPath(codeDb2));
-  gh.exec("UPDATE items SET body = 'Failed runs keep their credits now. See src/lib/credits.ts', updated_at = '2026-11-14T00:00:00Z' WHERE ptr = 'issue:45'");
-  s2 = snapshot({ codeDb: codeDb2, githubDb: githubDbPath(codeDb2), manifest: INCR });
-  gh.exec("DELETE FROM items WHERE ptr = 'ic:8'; DELETE FROM refs WHERE ptr = 'ic:8'");
-  s2full = snapshot({ codeDb: codeDb2, githubDb: githubDbPath(codeDb2), manifest: FULL });
-  gh.exec('UPDATE sync_state SET sanitize_version = 1');                // what `brain sync --full` stamps (R15)
-  gh.close();
-  s2v1 = snapshot({ codeDb: codeDb2, githubDb: githubDbPath(codeDb2), manifest: FULL });
-});
+before(() => ({ one, s1, s2, s2full, s2v1, newCommit } = fixtureBuilds()));
 
 test('snapshot: the golden fixture reproduces expected.json; a mirror snapshots to the same state', () => {
   const s = snapshot({ codeDb: one.codeDb, githubDb: one.ghDb, manifest: FULL });
@@ -136,10 +97,6 @@ test('V21 offline: an item gone from a full GitHub sync closes with its ref_link
   assert.throws(() => diff(s1, noGithub), /no GitHub state/);
 });
 
-/** s2 as a build whose commit window no longer holds the fixture commit (Phase 0 keeps the newest 5,000 only) */
-const withoutOldCommit = (s) => ({ ...s, items: new Map([...s.items].filter(([p]) => p !== OLD_COMMIT)),
-  link: new Map([...s.link].filter(([, l]) => l.ptr !== OLD_COMMIT)) });
-
 test('R8: a commit outside the build window stays, and so do its links, except the one to a closed node', () => {
   const d = diff(s1, withoutOldCommit(s2));
   assert.ok(!d.items.close.includes(OLD_COMMIT) && !d.items.put.some((i) => i.ptr === OLD_COMMIT));
@@ -153,15 +110,7 @@ test('R8: a commit outside the build window stays, and so do its links, except t
 test('R15: a sanitize_version bump needs a full publish and sanitizes the commits the build did not recreate', () => {
   // the server's run was made by an older sanitizer that missed a secret in the fixture commit
   const reg = canaries(), leaked = identSecret(reg, 'old-commit', 'github-token');
-  const old = structuredClone(s1);
-  old.meta.sanitize_version = 0;
-  for (const i of old.items.values()) if (i.origin === 'repo') {
-    if (i.ptr === OLD_COMMIT) i.chunks[0].body += `\ndeploy token ${leaked}`;
-    i.rev = C.repoItemRev(0);
-    const was = C.hex(i.hash);
-    i.hash = C.itemHash(i.rev, i.chunks, []);
-    old.link = new Map([...old.link].map(([k, l]) => (l.ptr === i.ptr && l.revHash === was ? [factKeyOf('link', { ...l, revHash: C.hex(i.hash) }), { ...l, revHash: C.hex(i.hash) }] : [k, l])));
-  }
+  const old = atVersion0(s1, `deploy token ${leaked}`);
   applyDelta(null, diff(null, old));                                     // the doctored base is a consistent state
   const next = withoutOldCommit(s2v1);
   assert.throws(() => diff(old, { ...next, manifest: C.validateManifest(INCR) }), /needs a full publish/);
@@ -242,15 +191,7 @@ test('applyDelta refuses a delta that does not fit its base', () => {
 // ---------------------------------------------------------------------------------------------- R16 / V19 offline
 
 let corpus;
-before(() => {
-  const reg = canaries();
-  const gh = githubSecretCorpus(reg);
-  const fx = setupRepo(repoSecretCorpus(reg));
-  assert.equal(fx.build.status, 0, 'corpus build');
-  const r = sync(fx, writeReplay(replayRoutes(gh)));
-  assert.equal(r.status, 0, 'corpus sync');
-  corpus = { reg, state: snapshot({ codeDb: fx.codeDb, githubDb: fx.ghDb, manifest: FULL }) };
-});
+before(() => { corpus = corpusState(); });
 
 test('V19 offline: the Phase 1 T7 corpus publishes clean (masked by build and sync, nothing for R16 to refuse)', () => {
   const d = diff(null, corpus.state);
