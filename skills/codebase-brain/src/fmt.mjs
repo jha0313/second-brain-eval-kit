@@ -1,4 +1,5 @@
 // Terminal output: aligned tables, color only on a TTY (agents get plain text).
+import { normalize } from './sanitize.mjs';
 const tty = process.stdout.isTTY && !process.env.NO_COLOR;
 const paint = (code) => (s) => (tty ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 export const c = { dim: paint(2), bold: paint(1), red: paint(31), green: paint(32), yellow: paint(33), blue: paint(34), cyan: paint(36) };
@@ -51,3 +52,13 @@ export function table(head, rows, { align = [], max = [], indent = '  ', fit = C
 }
 
 export const plural = (n, word) => `${n.toLocaleString('en-US')} ${word}${n === 1 ? '' : 's'}`;
+
+// ---------- Phase 1: external strings (design §6.5 L4) ----------
+// safe: one line, control / bidi / zero-width characters gone (normalize), newlines folded to spaces.
+export const safe = (s) => normalize(String(s ?? '')).replace(/\n/g, ' ');
+// ext: an external string as a quoted value. Inner quotes and backslashes are escaped, so it can never close its
+// own quote, start a line, or pass for brain's own output. n = max width including the quotes.
+export function ext(s, n = 0) {
+  const body = safe(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return `"${n ? cut(body, Math.max(1, n - 2)) : body}"`;
+}

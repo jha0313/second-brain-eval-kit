@@ -10,6 +10,8 @@ import { why, markMentions } from './why.mjs';
 import { MAX_NAME_OWNERS } from './index-knowledge.mjs';
 import { viz } from './viz.mjs';
 import { table, c, cut, cutLeft, plural, width, COLS } from './fmt.mjs';
+import { withWriteLock } from './gh-schema.mjs';
+import { relink } from './link.mjs';
 
 const HELP = `brain — codebase map + memory (prototype)
 
@@ -119,7 +121,7 @@ function describe(n) {
 }
 
 const cmds = {
-  build({ pos, opt }) {
+  async build({ pos, opt }) {
     const repo = resolve(pos[0] || opt.repo || '.');
     const dbPath = opt.db ? resolve(opt.db) : process.env.BRAIN_DB ? resolve(process.env.BRAIN_DB) : defaultDbPath(repo);
     const options = { includeRoots: opt['include-root'], noKnowledge: !!opt['no-knowledge'] };
@@ -133,7 +135,11 @@ const cmds = {
         return opt.json && out(JSON.stringify({ db: dbPath, skipped: true, freshness: freshnessOf(f) }));
       }
     }
-    const r = build({ repo, dbPath, vault: opt.vault, ...options, tilde });
+    // one write lifecycle: nobody reads a half-deleted code.db for relinking, no sync writes refs meanwhile
+    const { value: r } = await withWriteLock(dbPath, async () => {
+      const built = build({ repo, dbPath, vault: opt.vault, ...options, tilde });
+      return { ...built, relink: await relink({ codeDbPath: dbPath, repoDir: repo, log: console.error }) };
+    });
     if (opt.json) out(JSON.stringify({ db: dbPath, skipped: false, ...r }));
   },
 
@@ -316,7 +322,7 @@ const { pos, opt } = parse(process.argv.slice(2));
 const cmd = pos.shift();
 if (!cmd || opt.help || !cmds[cmd]) { out(HELP); process.exit(cmd && !opt.help ? 1 : 0); }
 if (cmd !== 'build') checkout = here(opt);
-try { cmds[cmd]({ pos, opt }); }
+try { await cmds[cmd]({ pos, opt }); }
 catch (e) {
   if (opt.json) out(JSON.stringify({ error: e.message }));
   else out(`${c.red('brain error')}: ${e.message}\n  fail open: continue with grep / your normal tools`);

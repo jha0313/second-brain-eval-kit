@@ -6,6 +6,11 @@ import { trackedFiles, headCommit, git, dirtyFiles, contentHashes, TS_EXT, CPP_E
 import { loadTypeScript, indexTypeScript } from './index-ts.mjs';
 import { indexGeneric } from './index-generic.mjs';
 import { indexKnowledge } from './index-knowledge.mjs';
+import { randomBytes } from 'node:crypto';
+import { SANITIZE_VERSION, sweepSecrets } from './sanitize.mjs';
+
+// a new id per build: Phase 0 pointers carry it (doc:path:a-b@<build_id>) so a rebuilt index rejects old ones
+export const newBuildId = () => [...randomBytes(8)].map((b) => '0123456789abcdefghijklmnopqrstuvwxyz'[b % 36]).join('');
 
 export function build({ repo, dbPath, vault, includeRoots = [], noKnowledge = false, log = console.error, tilde = (p) => p }) {
   repo = resolve(repo);
@@ -55,6 +60,9 @@ export function build({ repo, dbPath, vault, includeRoots = [], noKnowledge = fa
     setMeta(db, 'options', { includeRoots, noKnowledge });
     if (commit) setMeta(db, 'worktree', contentHashes(repo, dirtyFiles(repo)));
     setMeta(db, 'stats', stats);
+    setMeta(db, 'build_id', newBuildId());
+    stats.swept = sweepSecrets(db).rows;                  // write-boundary sweep (sanitize.mjs), before the version is claimed
+    setMeta(db, 'sanitize_version', SANITIZE_VERSION);
     setMeta(db, 'coverage', { unresolvedLocal, programs: stats.ts?.programs ?? 0, orphans: stats.ts?.orphans ?? 0 });
     timings.total = lap(t0);
     setMeta(db, 'timings', timings);

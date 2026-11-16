@@ -14,6 +14,9 @@
     "typescript": "5.9.3"
   },
   "scripts": {
-    "test": "node test/run.mjs"
+    "test": "node test/run.mjs && node --test \"test/phase1/*.test.mjs\"",
+    "test:phase0": "node test/run.mjs",
+    "test:phase1": "node --test \"test/phase1/*.test.mjs\"",
+    "test:security": "node --test \"test/security/*.test.mjs\""
   }
 }

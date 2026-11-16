@@ -5,11 +5,11 @@ import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { git } from './files.mjs';
 
-const MD_EXT = /\.(md|mdx)$/i;
-const PR_RE = /(?<![\w/#])#(\d{2,6})\b/g;
-const PATH_RE = /(?<![\w/.-])(?:@\/)?((?:[\w.-]+\/)+(?:[\w.-]*\w)?)(?!\w)/g;   // a/b/c.ts, services/billing/, @/lib/x
-const PATH_TRIES = ['', '.ts', '.tsx', '/index.ts', '/index.tsx', '.mjs', '.js'];
-const IDENT_RE = /\b([A-Za-z_][A-Za-z0-9_]*[a-z0-9][A-Z][A-Za-z0-9_]*|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|[A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g;
+export const MD_EXT = /\.(md|mdx)$/i;
+export const PR_RE = /(?<![\w/#])#(\d{2,6})\b/g;
+export const PATH_RE = /(?<![\w/.-])(?:@\/)?((?:[\w.-]+\/)+(?:[\w.-]*\w)?)(?!\w)/g;   // a/b/c.ts, services/billing/, @/lib/x
+export const PATH_TRIES = ['', '.ts', '.tsx', '/index.ts', '/index.tsx', '.mjs', '.js'];
+export const IDENT_RE = /\b([A-Za-z_][A-Za-z0-9_]*[a-z0-9][A-Z][A-Za-z0-9_]*|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|[A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g;
 // A name in a doc links to its exported symbols only if 1–3 of them have it. With more (a `displayName` in every
 // component, a `handler` in every route) the name says nothing about which one the text means, and linking all
 // of them would point `why` at unrelated code. Skipped names are counted (brain status) so the cut is visible.
@@ -24,10 +24,7 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
   const nodeByKey = db.prepare('SELECT id FROM nodes WHERE key = ?');
   const symbolsByName = db.prepare(`SELECT id FROM nodes WHERE name = ? AND kind != 'file' AND exported = 1 LIMIT ${MAX_NAME_OWNERS + 1}`);
   const insDir = db.prepare(`INSERT OR IGNORE INTO nodes(key, kind, name, path, lang) VALUES (?, 'dir', ?, ?, 'dir')`);
-  const known = new Set(tracked);
-  const dirs = new Set(tracked.flatMap((p) => p.split('/').slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join('/'))));
-  const byBase = new Map();
-  for (const p of tracked) { const b = p.split('/').pop(); byBase.set(b, byBase.has(b) ? null : p); }   // null = ambiguous
+  const { known, dirs, byBase } = pathIndex(tracked);
   const tooCommon = new Set();
   const stats = { docs: 0, changes: 0, changelog: 0, commits: 0, bulkCommits: 0, vault: 0, vaultSkippedNewer: 0, chunks: 0,
     links: { 'mentions-path': 0, 'mentions-symbol': 0, 'area-doc': 0, touches: 0 } };
@@ -125,6 +122,27 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
   db.exec(`INSERT INTO chunks_tri(rowid, title, body) SELECT id, title, body FROM chunks`);
   stats.unlinkedNames = { count: tooCommon.size, examples: [...tooCommon].sort().slice(0, 5) };
   return stats;
+}
+
+// Path rules shared with the Phase 1 linker (link.mjs): which tracked file or directory a path-like string names.
+export function pathIndex(tracked) {
+  const known = new Set(tracked);
+  const dirs = new Set(tracked.flatMap((p) => p.split('/').slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join('/'))));
+  const byBase = new Map();
+  for (const p of tracked) { const b = p.split('/').pop(); byBase.set(b, byBase.has(b) ? null : p); }   // null = ambiguous
+  return {
+    known, dirs, byBase,
+    /** a PATH_RE match -> { kind: 'file' | 'dir', path } | null (same rules as linkText) */
+    resolvePath(raw) {
+      const p = raw.replace(/^\.\//, '').replace(/\/$/, '');
+      const file = PATH_TRIES.map((x) => p + x).find((c) => known.has(c));
+      if (file) return { kind: 'file', path: file };
+      if (dirs.has(p) && p.includes('/')) return { kind: 'dir', path: p };
+      return null;
+    },
+    /** a bare file name -> its path when exactly one tracked file has it */
+    resolveBase(base) { const p = byBase.get(base); return p ? { kind: 'file', path: p } : null; },
+  };
 }
 
 const prsOf = (text) => [...new Set([...text.matchAll(PR_RE)].map((m) => `#${m[1]}`))].join(' ');

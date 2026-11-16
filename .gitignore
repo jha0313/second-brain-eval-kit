@@ -18,3 +18,8 @@ runs/
 .codebase-brain/
 
 .DS_Store
+
+# Neon / local secrets (never committed)
+.env
+.env.*
+.neon
