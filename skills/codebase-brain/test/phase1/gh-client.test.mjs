@@ -110,7 +110,13 @@ test('network errors and 5xx retry 3 times after 1s, 2s, 4s, then GhError', asyn
   assert.deepEqual(client.stats(), { requests: 4, retries: 3, waitedMs: 7000, rateLimitWaits: 0 });
   assert.equal(logs.length, 3);
 
-  for (const [step, kind, status] of [[{ status: 503 }, 'server', 503], [new Error('ECONNRESET'), 'network', null]]) {
+  // a body that breaks off while reading is a network error (retried); only a body that is not JSON is protocol
+  const cut = { status: 200, headers: {}, json: async () => { throw new TypeError('terminated'); } };
+  const r = make(scripted(cut, REPO_OK));
+  assert.equal((await r.client.getRepo()).id, 42);
+  assert.deepEqual(r.clock.slept, [1000]);
+
+  for (const [step, kind, status] of [[{ status: 503 }, 'server', 503], [new Error('ECONNRESET'), 'network', null], [cut, 'network', null]]) {
     const { client: c, clock: k } = make(scripted(step));
     await assert.rejects(c.getRepo(), (e) => e instanceof GhError && e.kind === kind && e.code === `gh-${kind}` && e.status === status);
     assert.deepEqual(k.slept, [1000, 2000, 4000]);
@@ -327,6 +333,41 @@ test('only GET: no other method in the code; URLs off this repository are refuse
   const t = scripted(REPO_OK);
   await assert.rejects(make(t, { owner: '..', repo: 'x' }).client.getRepo(), (e) => e.kind === 'protocol');
   assert.equal(t.calls.length, 0);
+
+  // once getRepo() bound the id, a Link by id must name this repository
+  for (const [id, ok] of [[42, true], [999, false]]) {
+    const b = scripted(REPO_OK, { headers: link(`https://api.github.com/repositories/${id}/pulls?page=2`), body: [{ number: 2, updated_at: at(2) }] },
+      { body: [{ number: 1, updated_at: at(1) }] });
+    const { client } = make(b);
+    await client.getRepo();
+    const run = collect(client.pullsDesc({ stopBefore: null }));
+    if (ok) assert.equal((await run).length, 2); else await assert.rejects(run, (e) => e.kind === 'protocol');
+    assert.equal(b.calls.length, ok ? 3 : 2);
+  }
+});
+
+test('redirects are followed by the client, each hop checked against this repository (R13)', async () => {
+  let opts = null;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, o) => { opts = o; return new Response('[]', { status: 200 }); };
+  try {
+    const { fetchTransport } = await import('../../src/gh-client.mjs');
+    await fetchTransport({ method: 'GET', url: 'https://api.github.com/repos/o/r', headers: {} });
+  } finally { globalThis.fetch = realFetch; }
+  assert.equal(opts.redirect, 'manual');                                       // fetch never follows on its own
+
+  const moved = scripted({ status: 301, headers: { location: 'https://api.github.com/repositories/42' }, body: { message: 'Moved Permanently' } }, REPO_OK);
+  assert.equal((await make(moved).client.getRepo()).id, 42);                   // a renamed repository
+  assert.deepEqual(moved.calls.map((c) => c.url), ['https://api.github.com/repos/o/r', 'https://api.github.com/repositories/42']);
+  for (const step of [{ status: 302, headers: { location: 'https://evil.example/x' }, body: {} }, { status: 307, headers: { location: '/user' }, body: {} },
+    { status: 301, body: {} }]) {
+    const t = scripted(step, REPO_OK);
+    await assert.rejects(make(t).client.getRepo(), (e) => e.kind === 'protocol');
+    assert.equal(t.calls.length, 1);
+  }
+  const loop = scripted({ status: 301, headers: { location: 'https://api.github.com/repos/o/r' }, body: {} });
+  await assert.rejects(make(loop).client.getRepo(), (e) => e.kind === 'protocol');
+  assert.equal(loop.calls.length, 4);
 });
 
 const fakeGh = (script) => {

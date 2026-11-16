@@ -30,7 +30,10 @@
 // - rate-limit waits (primary or secondary) are at most 3 per request; a primary wait is the time to
 //   x-ratelimit-reset capped at 1 hour, or the 60s-doubling step when the reset is not in the future (clock skew)
 // - a URL is fetched only when it is on api.github.com under B, or under /repositories/<id>/ (the form GitHub uses
-//   in Link headers); anything else is GhError('protocol') before any request, so the token goes nowhere else
+//   in Link headers and repo redirects; once getRepo() returned the id, only that id); anything else, Link or
+//   redirect, is GhError('protocol') before any request, so the token goes nowhere else. Redirects are followed
+//   here (at most 3), not by fetch, so every hop passes that check
+// - a body that is not JSON is 'protocol'; a body that breaks off while reading is a network error (retried)
 // - error messages and log lines hold only fixed words, endpoint labels and numbers: no URL, header or GitHub text
 import { execFileSync } from 'node:child_process';
 import { GhError } from './errors.mjs';
@@ -45,7 +48,7 @@ import { GhError } from './errors.mjs';
 
 /** @type {Transport} */
 export const fetchTransport = async ({ method, url, headers }) => {
-  const r = await fetch(url, { method, headers });
+  const r = await fetch(url, { method, headers, redirect: 'manual' });
   return { status: r.status, headers: { get: (n) => r.headers.get(n) }, json: () => r.json() };
 };
 
@@ -55,6 +58,7 @@ export const realClock = { now: () => Date.now(), sleep: (ms) => new Promise((re
 const API = 'https://api.github.com';
 const PER_PAGE = 100;
 const RETRIES = 3;
+const REDIRECTS = 3;
 const MAX_FILE_PAGES = 30;
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
@@ -68,7 +72,10 @@ const STREAMS = {
 const isoSecond = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 const qs = (q) => new URLSearchParams({ ...q, per_page: PER_PAGE }).toString();
 const nextLink = (res) => /<([^>]+)>\s*;\s*rel="next"/.exec(res.headers.get('link') ?? '')?.[1] ?? null;
-const readJson = async (res) => { try { return await res.json(); } catch { return undefined; } };
+const BAD_JSON = Symbol('bad json');
+const readBody = async (res) => {
+  try { return await res.json(); } catch (e) { if (e instanceof SyntaxError) return BAD_JSON; throw e; }
+};
 
 /**
  * @param {{ owner: string, repo: string, token: string | null, transport?: Transport, clock?: Clock, log?: Log }} opts
@@ -80,12 +87,14 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
   const headers = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'codebase-brain' };
   if (token) headers.Authorization = `Bearer ${token}`;
   const counters = { requests: 0, retries: 0, waitedMs: 0, rateLimitWaits: 0 };
+  let repoId = null;
 
   const inScope = (url) => {
     const u = URL.parse(url);
     const p = u?.pathname.toLowerCase() ?? '';
     const b = basePath.toLowerCase();
-    return u?.origin === API && (p === b || p.startsWith(`${b}/`) || /^\/repositories\/\d+\//.test(p));
+    const byId = /^\/repositories\/(\d+)(\/|$)/.exec(p);
+    return u?.origin === API && (p === b || p.startsWith(`${b}/`) || (byId != null && (repoId == null || Number(byId[1]) === repoId)));
   };
 
   const wait = async (ms, line) => {
@@ -108,10 +117,22 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
 
   async function get(url, label) {
     if (!inScope(url)) throw new GhError('protocol', `GitHub ${label}: refused a URL outside this repository`);
-    for (let fails = 0, limits = 0; ;) {
+    for (let fails = 0, limits = 0, redirects = 0; ;) {
       counters.requests++;
-      let res = null;
-      try { res = await transport({ method: 'GET', url, headers }); } catch { /* the transport's message may hold anything: dropped */ }
+      let res = null, body;
+      try {
+        res = await transport({ method: 'GET', url, headers });
+        body = await readBody(res);
+      } catch { res = null; /* the transport's message may hold anything: dropped */ }
+      if (res && res.status >= 300 && res.status < 400) {
+        const location = res.headers.get('location');
+        const to = location && URL.parse(location, url)?.href;
+        if (!to || !inScope(to) || redirects++ === REDIRECTS) {
+          throw new GhError('protocol', `GitHub ${label}: refused a redirect (HTTP ${res.status})`, { status: res.status });
+        }
+        url = to;
+        continue;
+      }
       if (!res || res.status >= 500) {
         const what = res ? `HTTP ${res.status}` : 'network error';
         if (fails === RETRIES) throw new GhError(res ? 'server' : 'network', `GitHub ${label}: ${what} after ${RETRIES} retries`, { status: res?.status ?? null });
@@ -120,9 +141,8 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
         await wait(ms, `github ${label}: ${what}, retry ${fails}/${RETRIES} in ${ms / 1000}s`);
         continue;
       }
-      const body = await readJson(res);
       if (res.status >= 200 && res.status < 300) {
-        if (body === undefined) throw new GhError('protocol', `GitHub ${label}: HTTP ${res.status} without a JSON body`, { status: res.status });
+        if (body === BAD_JSON) throw new GhError('protocol', `GitHub ${label}: HTTP ${res.status} without a JSON body`, { status: res.status });
         return { body, res };
       }
       if (rateLimited(res, body)) {
@@ -153,6 +173,7 @@ export function createClient({ owner, repo, token, transport = fetchTransport, c
       if (!Number.isSafeInteger(body?.id) || typeof body.full_name !== 'string' || Number.isNaN(date)) {
         throw new GhError('protocol', 'GitHub repo: missing id, full_name or Date header', { status: res.status });
       }
+      repoId = body.id;
       return { id: body.id, fullName: body.full_name, serverDate: isoSecond(date) };
     },
     /**
