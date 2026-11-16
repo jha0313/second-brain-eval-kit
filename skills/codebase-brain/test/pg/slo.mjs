@@ -7,13 +7,13 @@
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { CI_STAGES } from '../../src/pg/contract.mjs';
+import { stageLine } from '../../src/pg/ci-publish.mjs';
 
 export const SLO_MS = 10 * 60_000;                                   // T1: trigger -> published, p95
 const EVENTS = ['start', 'ok', 'fail', 'skipped'];
 const LINE = new RegExp(`(?:^|\\s)brain-stage (${CI_STAGES.join('|')}) (${EVENTS.join('|')}) (\\S+)\\s*$`);
 
-/** The line ci-publish prints at a stage boundary. */
-export const stageLine = (stage, event, at = new Date()) => `brain-stage ${stage} ${event} ${at.toISOString()}`;
+export { stageLine };                                                  // the line ci-publish prints at a stage boundary
 
 /**
  * @param {string} text a job log @returns {{ stage: string, ms: number|null, outcome: 'ok'|'fail'|'skipped'|'open' }[]}

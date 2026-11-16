@@ -76,7 +76,7 @@ jobs:
           key: brain-mirror-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: brain-mirror-
 
-      # Only this step sees the writer URL. The driver runs build and sync as child processes without it (and without the
+      # Only this step sees the writer URL. ci-publish runs build and sync as child processes without it (and without the
       # source token, which sync gets as GH_TOKEN), with BRAIN_TYPESCRIPT=kit: the source repo's own code never runs.
       - name: publish
         timeout-minutes: ${{ inputs.full && 320 || 20 }}
@@ -87,7 +87,7 @@ jobs:
         run: |
           args=(--source src-repo --mirror .brain-mirror --work "$RUNNER_TEMP/brain-work")
           if [ "$FULL" = true ]; then args+=(--full); fi
-          node "$BRAIN_DIR/ci/brain-publish.mjs" "${args[@]}"
+          node "$BRAIN_DIR/src/pg/ci-publish.mjs" "${args[@]}"
 
       - name: save the mirror
         if: success()

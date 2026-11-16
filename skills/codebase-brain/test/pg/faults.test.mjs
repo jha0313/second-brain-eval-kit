@@ -21,7 +21,7 @@ test('volatile paths drop build stamps and keep the rest; refs.other keeps its k
   const run = { run_id: 1, meta: { commit: 'x', built_at: 't', build_id: 'b', timings: { ts: 3 } },
     checksum: { node: { rows: 2, sha256: 'n' }, meta: { rows: 1, sha256: 'm' }, 'sync.github': { rows: 1, sha256: 's' } } };
   for (const p of VOLATILE_PATHS.run) dropPath(run, p);
-  assert.deepEqual(run, { run_id: 1, meta: { commit: 'x' }, checksum: { node: { rows: 2, sha256: 'n' } } });
+  assert.deepEqual(run, { run_id: 1, meta: { commit: 'x' }, checksum: { node: { rows: 2, sha256: 'n' }, meta: { rows: 1 }, 'sync.github': { rows: 1 } } });
   const st = { state: { row: { cursor: 'T', run_pid: 9 }, refs: { build: 'b2', other: { k1: 'b1' } } } };
   for (const p of VOLATILE_PATHS.sync_state) dropPath(st, p);
   assert.deepEqual(st, { state: { row: { cursor: 'T' }, refs: { other: { k1: null } } } });
