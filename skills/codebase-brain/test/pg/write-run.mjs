@@ -10,10 +10,11 @@ const js = (v) => (v === null || v === undefined ? null : JSON.stringify(v));   
 /**
  * @param {import('pg').Client} c writer connection
  * @param {object} base the server state at its latest run (State with run set) @param {object} next the build to publish
- * @param {{ gha: number, checksum?: object }} o gha: a unique GitHub run id; checksum: store this instead (a bogus run)
+ * @param {{ gha: number, checksum?: object, publishedAt?: string }} o gha: a unique GitHub run id; checksum: store this
+ *   instead (a bogus run); publishedAt: run.published_at instead of the clock (--as-of date tests; keep it increasing)
  * @returns {Promise<{ run: number, state: object }>} state: what the server shows at run (run set)
  */
-export async function writeRun(c, base, next, { gha, checksum }) {
+export async function writeRun(c, base, next, { gha, checksum, publishedAt = null }) {
   const delta = diff(base, next);
   const after = applyDelta(base, delta);
   const q = async (sql, params) => (await c.query(sql, params)).rows;
@@ -22,9 +23,9 @@ export async function writeRun(c, base, next, { gha, checksum }) {
   try {
     const { attempt_id: att } = await one(`INSERT INTO brain.attempt (gha_run_id, gha_attempt, source_sha, base_run) VALUES ($1, 1, $2, $3)
       RETURNING attempt_id`, [gha, next.meta.commit, base.run]);
-    const run = Number((await one(`INSERT INTO brain.run (attempt_id, commit_sha, mode, tool_version, sanitize_version, meta, checksum)
-      VALUES ($1, $2, 'normal', 'mirror-test', $3, $4, $5) RETURNING run_id`,
-    [att, next.meta.commit, next.meta.sanitize_version, js(delta.meta), js(checksum ?? C.checksum(after))])).run_id);
+    const run = Number((await one(`INSERT INTO brain.run (attempt_id, commit_sha, mode, tool_version, sanitize_version, meta, checksum, published_at)
+      VALUES ($1, $2, 'normal', 'mirror-test', $3, $4, $5, coalesce($6::timestamptz, clock_timestamp())) RETURNING run_id`,
+    [att, next.meta.commit, next.meta.sanitize_version, js(delta.meta), js(checksum ?? C.checksum(after)), publishedAt])).run_id);
     const nodeId = async (key) => (key === null ? null : (await one('SELECT node_id FROM brain.node WHERE key = $1', [key])).node_id);
     const close = async (table, where, params) => {
       const n = (await c.query(`UPDATE brain.${table} SET valid_to = $1 WHERE valid_to IS NULL AND ${where}`, [run, ...params])).rowCount;
