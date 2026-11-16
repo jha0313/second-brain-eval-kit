@@ -166,6 +166,7 @@ function* walk(dir) {
 // Heading sections with their line ranges, so a citation can say path:12-31.
 export function sections(text, rel) {
   const lines = text.split('\n');
+  if (lines.length > 1 && lines.at(-1) === '') lines.pop();       // the final newline ends the last line; it is not a line
   const out = [];
   // title: frontmatter title (changes/ fragments), else the first H1, else the file name
   const fm = /^---\n([\s\S]*?)\n---/.exec(text);
