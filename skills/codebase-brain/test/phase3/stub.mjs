@@ -82,7 +82,8 @@ export const alive = (pid) => { try { process.kill(pid, 0); return true; } catch
  * GitHub = clock + ghSkewMs. Laptop clocks are what tests pass to refresh / staleness as `now`.
  * CI per Actions run: pending (behind another run, a newer dispatch cancels it) -> queued (queueMs) -> in progress:
  * prepMs then the attempt is recorded (A5 skip, or 'fail-before-start') -> runMs then publish / fail.
- * plans: outcome of each new run in order ('ok' default, 'fail-sync', 'fail-before-start', 'abandon', 'hold').
+ * plans: outcome of each new run in order ('ok' default, 'fail-sync', 'fail-not-descendant', 'fail-before-start',
+ *   'abandon', 'hold').
  */
 export function createWorld({ clock, repos, dbSkewMs = 0, ghSkewMs = 0, queueMs = 20_000, prepMs = 30_000, runMs = 120_000 } = {}) {
   const w = {
@@ -155,7 +156,11 @@ export function createWorld({ clock, repos, dbSkewMs = 0, ghSkewMs = 0, queueMs 
       w.publishes += 1;
       return complete(r, 'success', t);
     }
-    if (r.plan === 'fail-sync') { Object.assign(r.attempt, { status: 'failed', stage: 'sync' }); return complete(r, 'failure', t); }
+    if (r.plan === 'fail-sync') { Object.assign(r.attempt, { status: 'failed', stage: 'sync', error: 'sync:exit' }); return complete(r, 'failure', t); }
+    if (r.plan === 'fail-not-descendant') {   // P10: a normal publish on a rewritten main
+      Object.assign(r.attempt, { status: 'failed', stage: 'publish', error: 'publish:not-descendant' });
+      return complete(r, 'failure', t);
+    }
     return complete(r, 'cancelled', t);   // abandon: the job was killed, the attempt stays running
   }
   function complete(r, conclusion, t) {
@@ -183,7 +188,7 @@ export function createWorld({ clock, repos, dbSkewMs = 0, ghSkewMs = 0, queueMs 
       github_t: latestT(),
       binding: w.db.binding ? { ...w.db.binding } : null,
       attempts: [...w.db.attempts].sort((a, b) => b.startedMs - a.startedMs || b.attemptId - a.attemptId).slice(0, 20)
-        .map(({ ghaRunId, ghaAttempt, sourceSha, status, stage, startedMs }) => ({ ghaRunId, ghaAttempt, sourceSha, status, stage, startedMs })),
+        .map(({ ghaRunId, ghaAttempt, sourceSha, status, stage, error, startedMs }) => ({ ghaRunId, ghaAttempt, sourceSha, status, stage, error: error ?? null, startedMs })),
     };
   };
 

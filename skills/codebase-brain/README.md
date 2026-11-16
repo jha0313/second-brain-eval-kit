@@ -145,7 +145,7 @@ server mode의 모든 답 footer는 답이 읽은 run과 그 brain이 `origin`�
 ```
 
 - 네 칸: code(`= main` · `N commits behind main` · `differs from main`, `git ls-remote origin`과 로컬 git 객체), memory(`github as of <나이> ago`, 24시간이 넘으면 `(stale)`, 없으면 `github never synced`; 나이는 DB 시계), activity(`refresh queued` · `refresh running`), last(마지막 실행이 실패 · 중단이면 표시). 읽지 못한 칸은 `(freshness unknown)`입니다. 답마다 reader의 SELECT 하나와 `ls-remote` 한 번(8초 상한)을 더 씁니다. Actions API는 `brain status`와 `brain refresh`만 읽습니다.
-- `brain refresh`: 이미 fresh(`= main`, 24시간 이내)면 바로 exit 0입니다. 낡았으면 진행 중인 run을 기다리거나 `brain-publish`를 dispatch하고, 서버 상태가 완료 조건(최신 run 커밋 = 확인하는 순간의 `main`, GitHub 시각이 시작 때보다 뒤, 24시간 이내)을 채울 때 exit 0입니다. 어느 Actions run이 publish했는지는 따지지 않습니다. 한 호출은 80초 안에 끝나고(아직이면 exit 75, `brain refresh --wait`로 이어 감), 처음 호출부터 15분이 지나면 exit 1로 멈춥니다. 같은 `main`으로 15분 안에 실패한 run이 있으면 다시 dispatch하지 않습니다(cooldown, exit 1). 이어 받기 상태는 `~/.cache/brain/refresh/<source repo id>.json`(0600, 잠금)에 둡니다. refresh는 brain DB에 쓰지 않습니다.
+- `brain refresh`: 이미 fresh(`= main`, 24시간 이내)면 바로 exit 0입니다. 낡았으면 진행 중인 run을 기다리거나 `brain-publish`를 dispatch하고, 서버 상태가 완료 조건(최신 run 커밋 = 확인하는 순간의 `main`, GitHub 시각이 시작 때보다 뒤, 24시간 이내)을 채울 때 exit 0입니다. 어느 Actions run이 publish했는지는 따지지 않습니다. 한 호출은 80초 안에 끝나고(아직이면 exit 75, `brain refresh --wait`로 이어 감), 처음 호출부터 15분이 지나면 exit 1로 멈춥니다. 같은 `main`으로 15분 안에 실패한 run이 있으면 다시 dispatch하지 않습니다(cooldown, exit 1). 이어 받기 상태는 `~/.cache/brain/refresh/<source repo id>.json`(0600, 잠금)에 둡니다. 같은 노트북의 다른 refresh가 잠금을 쥐고 있으면 dispatch하지 않습니다. `--wait`면 그 호출의 80초 안에서 잠금이 풀리기를 기다렸다가 이어 가고, `--wait`가 없으면 바로 exit 75입니다. refresh는 brain DB에 쓰지 않습니다.
 - SKILL.md 규칙 10: footer에 `behind main` · `differs from main` · `(stale)` · `never synced`가 있으면 refresh 뒤에 답하고, exit 1 · 2면 낡은 데이터라고 사용자에게 밝힙니다.
 
 ## 한계

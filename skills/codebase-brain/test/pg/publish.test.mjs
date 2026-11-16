@@ -318,14 +318,16 @@ it('V23: after a force-push a normal publish is refused; bootstrap goes through 
   await branch.reset();
   const r1 = await pub(null, fx.s1);
   const r2 = await pub(r1.after, fx.s2);
-  await assert.rejects(pub(r2.after, fx.s5), (e) => e.code === 'stale-base' && e.kind === 'not-descendant' && e.recorded === true);
+  // S7 / P10: the message gives the bootstrap in one line
+  await assert.rejects(pub(r2.after, fx.s5), (e) => e.code === 'stale-base' && e.kind === 'not-descendant' && e.recorded === true
+    && e.message.endsWith(`nothing was written — ${C.BOOTSTRAP_HINT}`) && !e.message.includes('\n'));
   const r3 = await pub(r2.after, fx.s5, { mode: 'bootstrap' });
   await assertRun(r3);
   assert.equal(await value('SELECT mode FROM brain.run WHERE run_id = $1', [r3.run]), 'bootstrap');
   const late = await begin(fx.s4.meta.commit);                          // starts on run 3 ...
   const p = plan(r3.after, fx.s4, late);
   await pub(r3.after, fx.s2, { mode: 'bootstrap' });                     // ... another run commits first
-  await assert.rejects(publish(args(late, p, fx.s4, { mode: 'bootstrap' })), (e) => e.code === 'stale-base' && e.kind === 'base-moved');
+  await assert.rejects(publish(args(late, p, fx.s4, { mode: 'bootstrap' })), (e) => e.code === 'stale-base' && e.kind === 'base-moved' && !e.message.includes(C.BOOTSTRAP_HINT));
 });
 
 it('S2: an abort while the publish connection opens writes nothing and records nothing (code aborted)', SLOW, async () => {

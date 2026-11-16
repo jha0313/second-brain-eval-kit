@@ -14,7 +14,7 @@ import pg from 'pg';
 import { refresh, loadState } from '../../src/refresh.mjs';
 import { createActionsClient, actionsFromEnv } from '../../src/gh-actions.mjs';
 import { staleness, STATUS_SQL } from '../../src/pg/status.mjs';
-import { REFRESH_EXIT as EXIT, REFRESH_MESSAGES as MSG, REFRESH_LIMITS as LIM, refreshStatePath } from '../../src/pg/contract.mjs';
+import { REFRESH_EXIT as EXIT, REFRESH_MESSAGES as MSG, REFRESH_LIMITS as LIM, refreshStatePath, BOOTSTRAP_HINT } from '../../src/pg/contract.mjs';
 import {
   gitRepos, createWorld, stubReader, githubStub, fakeClock, tempDir, stubBin, alive, stallingPgServer,
   FAKE_TOKEN, OTHER_TOKEN, H, M,
@@ -217,13 +217,38 @@ describe('P6 / P8 / P9: concurrency, pending replacement, main moving', () => {
     assert.equal(x.world.publishes, 1);
     assert.equal(x.world.skips, x.world.dispatches - 1, 'the other dispatch ended skipped (A5)');
   });
-  test('the lock held by another process: exit 75, no dispatch, state only read (F2, F11)', async (t) => {
+  test('the lock held by another process, no --wait: exit 75 at once, no dispatch, state only read (F2, F11)', async (t) => {
     const x = await rig(t, { clock: { now: Date.now } });
     const holder = await holdLock(t, x.statePath, { runId: 777 });
-    const r = await x.call();
+    const t0 = Date.now();
+    const r = await x.call({ wait: false });
+    assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0} ms`);
     assert.equal(r.exit, EXIT.running);
     assert.equal(r.message, MSG.running(777, r.message.match(/, (\d+s)\)$/)[1], null));
     assert.match(r.message, /^still running \(actions run 777, \d+s\)$/);
+    assert.equal(x.gh.count('dispatch'), 0);
+    holder.kill('SIGKILL');
+  });
+  test('S7: --wait on a held lock waits for the holder, then carries on as the holder (one call, exit 0)', async (t) => {
+    const x = await rig(t, { clock: { now: Date.now }, fresh: true });
+    await holdLock(t, x.statePath, { runId: 777, finishMs: 1500 });   // the holder ends with exit 0 after 1.5 s
+    const t0 = Date.now();
+    const r = await x.call({ wait: true, lockPollMs: 100 });
+    const took = Date.now() - t0;
+    assert.equal(r.exit, EXIT.fresh, r.message);
+    assert.ok(took >= 1200 && took < 10_000, `took ${took} ms`);
+    assert.equal(x.gh.count('dispatch'), 0);
+    assert.equal(existsSync(x.statePath), false, 'no state file left');
+  });
+  test('S7: --wait on a lock held past the call budget: exit 75 with the holder\'s state when the budget (less the last look) ends', async (t) => {
+    const x = await rig(t, { clock: { now: Date.now } });
+    const holder = await holdLock(t, x.statePath, { runId: 777 });
+    const t0 = Date.now();
+    const r = await x.call({ wait: true, lockPollMs: 100, start: t0 - (LIM.callMs - 5000 - 1500) });   // 1.5 s of budget left
+    const took = Date.now() - t0;
+    assert.equal(r.exit, EXIT.running);
+    assert.match(r.message, /^still running \(actions run 777, \d+s\)$/);
+    assert.ok(took >= 1300 && took < 5000, `took ${took} ms`);
     assert.equal(x.gh.count('dispatch'), 0);
     holder.kill('SIGKILL');
   });
@@ -323,6 +348,21 @@ describe('P15: cooldown', () => {
       assert.equal(x.gh.count('dispatch'), 2);
     });
   }
+  test('S7 / P10: a run that fails as not-descendant -> the failure and the cooldown give the bootstrap hint (one line)', async (t) => {
+    const x = await rig(t);
+    x.world.plans.push('fail-not-descendant');
+    const first = await until(x);
+    assert.equal(first.at(-1).exit, EXIT.failed);
+    assert.equal(first.at(-1).message, MSG.failed(`run failed in publish; ${BOOTSTRAP_HINT}`));
+    const r = await x.call();
+    assert.equal(r.exit, EXIT.failed);
+    assert.ok(r.message.startsWith('refresh FAILED (cooldown: last attempt failed '), r.message);
+    assert.ok(r.message.endsWith(` ago in publish; data is stale; ${BOOTSTRAP_HINT})`), r.message);
+    for (const m of [first.at(-1).message, r.message]) {
+      assert.ok(!m.includes('\n') && m.includes('brain-bootstrap.yml') && m.includes('BRAIN_BOOTSTRAP_UNTIL'), m);
+    }
+    assert.equal(x.gh.count('dispatch'), 1);
+  });
   test('a failure on an older main HEAD does not cool down the new HEAD', async (t) => {
     const x = await rig(t);
     x.world.plans.push('fail-sync');
@@ -573,21 +613,27 @@ async function stallProxy(host, port) {
     close: () => new Promise((r) => { for (const p of pairs) for (const s of p) s.destroy(); server.close(r); }) };
 }
 
-/** A child process that holds withWriteLock(statePath) and wrote a state file; resolves once it holds the lock. */
-async function holdLock(t, statePath, { runId = null, baseT = null } = {}) {
+/**
+ * A child process that holds withWriteLock(statePath) and wrote a state file; resolves once it holds the lock.
+ * finishMs: after that long it ends like a refresh that exited 0 (deletes the state file, then releases the lock).
+ */
+async function holdLock(t, statePath, { runId = null, baseT = null, finishMs = null } = {}) {
   const now = Date.now();
   const st = { v: 1, startedAt: new Date(now).toISOString(), deadline: new Date(now + LIM.deadlineMs).toISOString(), baseT,
     baseHead: 'f'.repeat(40), runId, dispatchedAt: new Date(now).toISOString(), extraDispatches: 0 };
   const code = `
     import { withWriteLock } from ${JSON.stringify(join(SRC, 'gh-schema.mjs'))};
-    import { writeFileSync, mkdirSync } from 'node:fs';
+    import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
     import { dirname } from 'node:path';
     const p = ${JSON.stringify(statePath)};
     mkdirSync(dirname(p), { recursive: true });
     await withWriteLock(p, async () => {
       writeFileSync(p, ${JSON.stringify(JSON.stringify(st))}, { mode: 0o600 });
       process.stdout.write('ready\\n');
-      await new Promise(() => setInterval(() => {}, 1000));
+      const finishMs = ${JSON.stringify(finishMs)};
+      if (finishMs === null) await new Promise(() => setInterval(() => {}, 1000));
+      await new Promise((resolve) => setTimeout(resolve, finishMs));
+      rmSync(p, { force: true });
     });`;
   const child = spawn(process.execPath, ['--no-warnings', '--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'inherit'] });
   t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });

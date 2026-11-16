@@ -317,7 +317,10 @@ export async function publish({ url, attemptId, base, delta, checksum, mode, com
     const stale = runOf(latest?.run_id) !== base || (att && runOf(att.base_run) !== base) ? 'base-moved'
       : att?.status !== 'running' ? 'attempt-not-running'
         : mode === 'normal' && latest && !descends(repoDir, latest.commit_sha, commit) ? 'not-descendant' : null;
-    if (stale) fail('stale-base', 'stale-base', `the base run changed or the commit does not descend from it (${stale}): nothing was written`, { kind: stale });
+    if (stale) {
+      fail('stale-base', 'stale-base', `the base run changed or the commit does not descend from it (${stale}): nothing was written`
+        + (stale === 'not-descendant' ? ` — ${C.BOOTSTRAP_HINT}` : ''), { kind: stale });
+    }
     if (latest && sanitizeVersion < latest.sanitize_version) {
       fail('sanitize-version', 'sanitize', 'this kit sanitizes with an older version than the server: nothing was written', { kind: 'older' });
     }

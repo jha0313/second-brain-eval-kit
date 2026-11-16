@@ -8,8 +8,8 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { staleness, footerLine, STATUS_SQL, runGit } from '../../src/pg/status.mjs';
-import { needsRefresh, REFRESH_TRIGGERS, FRESHNESS_UNKNOWN, CODE_STATES, MEMORY_STATES } from '../../src/pg/contract.mjs';
+import { staleness, footerLine, STATUS_SQL, runGit, bootstrapHint } from '../../src/pg/status.mjs';
+import { needsRefresh, REFRESH_TRIGGERS, FRESHNESS_UNKNOWN, CODE_STATES, MEMORY_STATES, BOOTSTRAP_HINT } from '../../src/pg/contract.mjs';
 import { gitRepos, createWorld, stubReader, worldActions, stubBin, alive, H, M } from './stub.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -157,6 +157,27 @@ describe('P4 failure display and last', () => {
     const s = await look(x, { actions: worldActions(x.world) });
     assert.deepEqual([s.last.state, s.last.stage], ['failed', 'sync']);
     assert.ok(footerLine(s).endsWith('last attempt FAILED 40m ago (sync)'));
+  });
+  test('S7 / P10: the last attempt failed as not-descendant -> the bootstrap hint; another failure or a newer end -> none', async () => {
+    const x = setup();
+    const r = x.world.addActionsRun({ conclusion: 'failure', createdMs: Date.now() - 30 * M });
+    x.world.addAttempt({ ghaRunId: r.id, status: 'failed', stage: 'publish', error: 'publish:not-descendant', startedMs: Date.now() - 30 * M });
+    let s = await look(x, { actions: worldActions(x.world) });
+    assert.deepEqual([s.last.state, s.last.stage], ['failed', 'publish']);
+    assert.deepEqual(Object.keys(s.last).sort(), ['agoMs', 'stage', 'state']);   // the `last` cell (JSON too) is unchanged
+    assert.equal(s.detail.executions[0].error, 'publish:not-descendant');
+    assert.equal(bootstrapHint(s.detail.executions), BOOTSTRAP_HINT);
+    assert.ok(!BOOTSTRAP_HINT.includes('\n') && BOOTSTRAP_HINT.includes('brain-bootstrap.yml') && BOOTSTRAP_HINT.includes('BRAIN_BOOTSTRAP_UNTIL'));
+    // a newer failure before start (no DB attempt) is the last one now: no hint
+    x.world.addActionsRun({ conclusion: 'failure', createdMs: Date.now() - 5 * M, startedMs: Date.now() - 5 * M });
+    s = await look(x, { actions: worldActions(x.world) });
+    assert.equal(s.last.state, 'failed before start');
+    assert.equal(bootstrapHint(s.detail.executions), null);
+    // another kind of failure: no hint
+    const y = setup();
+    const q = y.world.addActionsRun({ conclusion: 'failure', createdMs: Date.now() - 30 * M });
+    y.world.addAttempt({ ghaRunId: q.id, status: 'failed', stage: 'publish', error: 'publish:base-moved', startedMs: Date.now() - 30 * M });
+    assert.equal(bootstrapHint((await look(y, { actions: worldActions(y.world) })).detail.executions), null);
   });
   test('F8: DB running, Actions over -> abandoned', async () => {
     const x = setup();
@@ -311,7 +332,7 @@ describe('Neon: STATUS_SQL under brain_reader', { skip: READER_URL ? false : 'se
       assert.deepEqual(row.binding, { sourceRepoId: 1, opsRepo: 'o/brain-ops', workflow: '.github/workflows/brain-publish.yml' });
       assert.equal(row.attempts.length, 1);
       assert.deepEqual({ ...row.attempts[0], startedMs: typeof row.attempts[0].startedMs },
-        { ghaRunId: 1, ghaAttempt: 1, sourceSha: 'b070cb73666691f1bdd5fb238720ece1301fc069', status: 'ok', stage: null, startedMs: 'number' });
+        { ghaRunId: 1, ghaAttempt: 1, sourceSha: 'b070cb73666691f1bdd5fb238720ece1301fc069', status: 'ok', stage: null, error: null, startedMs: 'number' });
       // staleness over the real client: memory age = DB now() - T
       const repos = gitRepos();
       const s = await staleness({ reader: client, repoDir: repos.clone, actions: null });
