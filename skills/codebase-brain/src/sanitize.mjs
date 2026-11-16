@@ -135,7 +135,7 @@ export function mask(text) { return maskWith(text, plainMark); }
 
 // ---------- L8: injection-looking text ----------
 
-const SUSPICIOUS = [
+export const SUSPICIOUS = [
   /\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+)*(?:previous|prior|above|earlier)\s+(?:instructions|prompts|messages|rules)/i,
   /\byou\s+are\s+now\b/i,
   /<\/?\s*system\s*>|<\|im_start\|>/i,

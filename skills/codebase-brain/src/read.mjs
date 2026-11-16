@@ -86,6 +86,7 @@ import { MAX_GET, LINK_STATUS, RRF_K, filterOf, listOf } from './store/common.mj
  */
 
 const SHORT = 160;           // search snippet and get first line, in characters
+const BODY_PREFIX = 800;     // server search rows: characters of each body sent (snippetFromPrefix), the rest only when needed
 const LINK_GROUPS = { file: 'files', dir: 'dirs', symbol: 'symbols', commit: 'commits', item: 'items', route: 'routes', name: 'names' };
 const FLAGS = ['suspicious', 'files-truncated'];
 const REDACTED = /\[REDACTED:[a-z-]+(?::[0-9a-f]{4})?\]/g;
@@ -103,10 +104,30 @@ const strOr = (v) => (v == null ? null : String(v));
 const cmp = (a, b) => { a = String(a ?? ''); b = String(b ?? ''); return a < b ? -1 : a > b ? 1 : 0; };
 const cut = (s, n) => { const cs = [...s]; return cs.length <= n ? s : cs.slice(0, n - 1).join('') + '…'; };
 // one line for a search row: frontmatter and heading lines dropped (the title shows them), whitespace folded
-const snippet = (body) => cut(String(body ?? '').replace(/^---\n[\s\S]*?\n---\n?/, '').replace(/^#{1,6}\s.*$/gm, '').replace(/\s+/g, ' ').trim(), SHORT);
+const fold = (body) => String(body ?? '').replace(/^---\n[\s\S]*?\n---\n?/, '').replace(/^#{1,6}\s.*$/gm, '').replace(/\s+/g, ' ').trim();
+const snippet = (body) => cut(fold(body), SHORT);
 const firstLine = (body) => cut(String(body ?? '').split('\n').map((l) => l.trim()).find(Boolean) ?? '', SHORT);
 // a commit chunk's body ends with the build's "files: …" trailer: not part of the message
 const textOf = (c) => (c.source === 'commit' ? String(c.body ?? '').replace(/^files: .*$/m, '') : c.body);
+
+/**
+ * The search snippet of a text (for a commit chunk, of textOf its body) from the first characters p of the body, or
+ * null when they do not decide it. Exact: t = p up to its last line break (a commit: textOf of that) begins the whole
+ * text T at a line start of T (textOf takes out one line's characters, never a line break), and each step of fold() keeps
+ * "begins": the frontmatter step once its closing --- is in t; the heading step, as a match stops at a line break (the
+ * one after its line, or after the next line for a line of #s only) and one that t's end cuts short only takes more of T;
+ * folding and trimming. So when fold(t) has more than SHORT characters, its first ones decide snippet(T).
+ */
+export function snippetFromPrefix(p, commit = false) {
+  let i = p.length;
+  while (i > 0 && !/[\n\r\u2028\u2029]/.test(p[i - 1])) i--;     // the line terminators of ^ $ . in a JS regex
+  const t = commit ? textOf({ source: 'commit', body: p.slice(0, i) }) : p.slice(0, i);
+  if (t.startsWith('---\n') && !/^---\n[\s\S]*?\n---/.test(t)) return null;
+  const w = fold(t);
+  return [...w].length > SHORT ? cut(w, SHORT) : null;
+}
+/** a search row's snippet as searchRow shows it, from the whole body */
+export const snippetOf = (body, commit = false) => snippet(commit ? textOf({ source: 'commit', body }) : body);
 // repo memory has no flags / redactions columns: both are read off the stored (already masked) text
 const marksOf = (text) => ({ flags: flagSuspicious(text ?? '') ? ['suspicious'] : [], redactions: (String(text ?? '').match(REDACTED) || []).length });
 const emptyLinks = () => Object.fromEntries(Object.values(LINK_GROUPS).map((k) => [k, []]));
@@ -150,16 +171,24 @@ function ranked(c, opts) {
   return { shown: k.shown, total: k.total, next: cursor + limit < k.groups ? cursor + limit : null, facts: searchFacts(c, opts, k.truncated) };
 }
 
+// r.snippet: given for a row whose body came cut (rows prefix), and then (repo memory) the store found nothing suspicious
 function searchRow(g, r) {
   if (!r) throw new BrainError('store', `the store lost search row ${g.key}`);
   if (r.origin !== 'github') {
-    return { ptr: r.ptr, type: r.source, origin: r.origin, state: null, date: dateOf(r.date), assoc: null, matched: [], flags: marksOf(textOf(r)).flags,
-      untrusted: { title: String(r.title ?? ''), snippet: snippet(textOf(r)), author: null } };
+    return { ptr: r.ptr, type: r.source, origin: r.origin, state: null, date: dateOf(r.date), assoc: null, matched: [],
+      flags: r.cut ? [] : marksOf(textOf(r)).flags, untrusted: { title: String(r.title ?? ''), snippet: r.snippet ?? snippetOf(r.body, r.source === 'commit'), author: null } };
   }
   const flags = flagsOf(r.flags);
   if (!flags.includes('suspicious') && g.kids.some((k) => flagsOf(k.flags).includes('suspicious'))) flags.unshift('suspicious');
   return { ptr: r.ptr, type: TYPE_OF_KIND[r.kind], origin: 'github', state: stateOf(r.state), date: dateOf(g.d), assoc: enumOf(r.author_assoc),
-    matched: g.kids.map((k) => k.ptr), flags, untrusted: { title: String(r.title ?? ''), snippet: snippet(r.body), author: strOr(r.author) } };
+    matched: g.kids.map((k) => k.ptr), flags, untrusted: { title: String(r.title ?? ''), snippet: r.snippet ?? snippet(r.body), author: strOr(r.author) } };
+}
+// a row whose body came cut: with its snippet when snippetFromPrefix decides it and (repo memory) sus is false, else null
+function proven(r) {
+  if (!r.cut) return r;
+  const repo = r.origin !== 'github';
+  const s = repo && r.sus ? null : snippetFromPrefix(String(r.body ?? ''), repo && r.source === 'commit');
+  return s === null ? null : { ...r, snippet: s };
 }
 
 function searchResult(q, rk, rows) {
@@ -178,10 +207,13 @@ export function search(ctx, q, opts = {}) {
  * @returns {Promise<SearchResult & { view: import('./pg/contract.mjs').View }>}
  */
 export async function searchIn(store, q, opts = {}) {
-  // the server ranks (top): only the shown groups come back
+  // the server ranks (top) and sends bodies cut (prefix); a cut row the prefix does not decide is read again whole
   const c = await store.candidates(q, { ...opts, top: pageOf(opts) });
   const rk = c.ranked ? ranked(c, opts) : rank(c, opts);
-  const { rows } = rk.shown.length ? await store.rows(rk.shown.map((g) => g.key), { asOf: c.view.run }) : { rows: [] };
+  const at = { asOf: c.view.run }, keys = rk.shown.map((g) => g.key);
+  const sent = keys.length ? (await store.rows(keys, { ...at, prefix: BODY_PREFIX })).rows.map((r) => [r, proven(r)]) : [];
+  const again = sent.filter(([, ok]) => !ok).map(([r]) => r.key);
+  const rows = [...sent.map(([, ok]) => ok).filter(Boolean), ...(again.length ? (await store.rows(again, at)).rows : [])];
   return { ...searchResult(q, rk, rows), view: c.view };
 }
 

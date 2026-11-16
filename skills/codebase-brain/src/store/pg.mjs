@@ -9,7 +9,8 @@
 //   tokens and stems as FTS5's, sql/003) ranked by ts_rank instead of FTS5 bm25, and the trigram lists are ILIKE
 //   for every length: a term of 3+ characters one list part each (the pg_trgm indexes when it has a trigram and the
 //   planner takes them), a shorter one (never a trigram) in one shared scan (tr in candidates).
-// - Search payload (§6.9): candidates with top ranks the lists in SQL and returns only the shown groups.
+// - Search payload (§6.9): candidates with top ranks the lists in SQL and returns only the shown groups; rows with
+//   prefix cuts long bodies (read.mjs proves each snippet from the prefix, or reads that row again whole).
 // - Repo memory pointers: <source>:<path>:<a>-<b>@r<n> (rev n of item <source>:<path>). A Phase 1 @<build> pointer
 //   reads the view run when its build is that run's build, else it is stale. Vault notes are never on the server.
 import { BrainError, NotFoundError, StalePtrError } from '../errors.mjs';
@@ -17,6 +18,7 @@ import { parseRevPtr, formatPtr, formatRevPtr, GH_TYPES, MEMORY_TYPES } from '..
 import { ITEM_META_COLUMNS } from '../pg/contract.mjs';
 import { MAX_NAME_OWNERS } from '../index-knowledge.mjs';
 import { CAP, RRF_K, filterOf, termsOf } from './common.mjs';
+import { SUSPICIOUS } from '../sanitize.mjs';
 
 const R = '(SELECT run_id FROM v)';
 const vis = (t, run = R) => `(${t}.valid_from <= ${run} AND (${t}.valid_to IS NULL OR ${t}.valid_to > ${run}))`;
@@ -29,6 +31,46 @@ const REF_KEY = (i, f) => `('[' || to_json(${i}.ptr)::text || ',' || to_json(${f
 const BUILD_OF = (refs, i, f) => `CASE WHEN ${refs}->'other' ? ${REF_KEY(i, f)} THEN ${refs}->'other'->>${REF_KEY(i, f)} ELSE ${refs}->>'build' END`;
 // Phase 1 refs.resolved (text) as rows (val, n); anything but a JSON array is no entries
 const RAW_LIST = (col) => `jsonb_array_elements_text(CASE WHEN ${col} IS JSON ARRAY THEN ${col}::jsonb ELSE '[]'::jsonb END) WITH ORDINALITY`;
+
+// A sanitize.mjs SUSPICIOUS regex as a Postgres one that matches wherever it matches (a superset, so "no match" is
+// exact): \b is dropped, \s is the JS set, and under /i an ASCII letter takes both cases (JS without /u folds no other
+// character onto one). Any other escape, flag, range, lookaround, [] / [^] or cased non-ASCII letter throws: a new rule fails
+// here instead of going unflagged.
+const JS_SPACE = '[\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]';
+export function pgSuperset(re) {
+  const no = (what) => { throw new Error(`pgSuperset ${re}: ${what}`); };
+  if (!/^i?$/.test(re.flags)) no(`flags ${re.flags}`);
+  const src = re.source;
+  let out = '', set = false;
+  for (let i = 0; i < src.length; i++) {
+    let ch = src[i];
+    if (ch === '\\') {
+      ch = src[++i];
+      if (!set && ch === 'b') continue;
+      if (!set && ch === 's') out += JS_SPACE;
+      else if (ch === 'n') out += '\n';
+      else if (/^[\\/|.*+?()[\]{}^$-]$/.test(ch)) out += `\\${ch}`;
+      else no(`\\${ch}`);
+      continue;
+    }
+    if (ch === '[') { if (set || /^\^?\]/.test(src.slice(i + 1))) no('[ in a set, or [] / [^]'); set = true; } else if (ch === ']') set = false;
+    else if (set && ch === '-') no('a range');
+    else if (ch === '(' && src[i + 1] === '?' && src[i + 2] !== ':') no('a lookaround');
+    else if (re.ignoreCase && ch.toLowerCase() !== ch.toUpperCase()) {
+      if (!/^[a-z]$/i.test(ch)) no(`cased ${ch}`);
+      const both = ch.toLowerCase() + ch.toUpperCase();
+      out += set ? both : `[${both}]`;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+const SUSPECT = SUSPICIOUS.map((re) => `(${pgSuperset(re)})`).join('|');
+// read.mjs textOf of a commit chunk (its first "files: " line taken out, the line break kept): /^files: .*$/m
+const FILES_LINE = '(^|[\n\r\u2028\u2029])files: [^\n\r\u2028\u2029]*';
+/** SQL that is true when a SUSPICIOUS rule may match text (a commit chunk: textOf it), false only when none can; p adds a parameter */
+export const suspectSql = (p, text, commit) => `(CASE WHEN ${commit} THEN regexp_replace(${text}, ${p(FILES_LINE)}, '\\1') ELSE ${text} END) ~ ${p(SUSPECT)}`;
 
 function statement() {
   const params = [];
@@ -57,26 +99,27 @@ function viewOf(r, missing) {
 // a GitHub item revision as a github.db items row (+ rev, parentPtr); i: brain.item, r: brain.item_rev, s: the ledger
 const PARENT = (i, r) => `CASE WHEN ${i}.kind IN ('pr', 'issue') THEN NULL ELSE (SELECT pi.ptr FROM brain.item pi JOIN brain.item_rev px ON px.item_id = pi.item_id
   WHERE pi.ptr IN ('pr:' || (${r}.meta->>'parent_number'), 'issue:' || (${r}.meta->>'parent_number')) AND ${vis('px')} ORDER BY pi.kind = 'pr' DESC LIMIT 1) END`;
-const ITEM = (i, r, parent = true) => `(coalesce(${r}.meta, '{}'::jsonb) || jsonb_build_object('id', ${i}.item_id, 'ptr', ${i}.ptr, 'kind', ${i}.kind,
-  'title', ${r}.title, 'body', ${r}.body, 'state', ${r}.state, 'author', ${r}.author, 'updated_at', ${r}.source_updated_at, 'rev', ${r}.rev_no,
+const ITEM = (i, r, parent = true, body = `${r}.body`) => `(coalesce(${r}.meta, '{}'::jsonb) || jsonb_build_object('id', ${i}.item_id, 'ptr', ${i}.ptr, 'kind', ${i}.kind,
+  'title', ${r}.title, 'body', ${body}, 'state', ${r}.state, 'author', ${r}.author, 'updated_at', ${r}.source_updated_at, 'rev', ${r}.rev_no,
   'detail_for', (SELECT state->'items'->${i}.ptr->'detail_for' FROM s), 'reviews_at', (SELECT state->'items'->${i}.ptr->'reviews_at' FROM s)
   ${parent ? `, 'parentPtr', ${PARENT(i, r)}` : ''}))`;
 // a repo chunk as a code.db chunks row (+ rev)
-const CHUNK = (c, i, r) => `jsonb_build_object('id', ${c}.chunk_id, 'source', ${i}.kind,
+const CHUNK = (c, i, r, body = `${c}.body`) => `jsonb_build_object('id', ${c}.chunk_id, 'source', ${i}.kind,
   'path', CASE WHEN ${i}.kind = 'commit' THEN NULL ELSE substr(${i}.ptr, length(${i}.kind) + 2) END, 'start_line', ${c}.start_line,
-  'end_line', ${c}.end_line, 'title', ${c}.title, 'body', ${c}.body, 'sha', ${c}.sha, 'date', ${c}.date, 'prs', ${c}.prs,
+  'end_line', ${c}.end_line, 'title', ${c}.title, 'body', ${body}, 'sha', ${c}.sha, 'date', ${c}.date, 'prs', ${c}.prs,
   'body_line', ${c}.body_line, 'rev', ${r}.rev_no)`;
 
 const CHUNK_COLS = ['id', 'source', 'path', 'start_line', 'end_line', 'title', 'body', 'sha', 'date', 'prs', 'body_line'];
 const ITEM_COLS = ['id', 'ptr', 'kind', 'title', 'body', 'state', 'author', 'updated_at', ...ITEM_META_COLUMNS, 'detail_for', 'reviews_at'];
 const pick = (j, cols) => Object.fromEntries(cols.map((c) => [c, j[c] ?? null]));
+const cutOf = (j) => (j.cut === undefined ? {} : { cut: j.cut === true, ...(j.sus === undefined ? {} : { sus: j.sus === true }) });   // rows prefix
 function chunkRow(j) {
   const c = pick(j, CHUNK_COLS);
   const ptr = c.source === 'commit' ? `commit:${String(c.sha).slice(0, 8)}`
     : formatRevPtr({ type: c.source, path: c.path, a: c.start_line, b: c.end_line, rev: j.rev });
-  return { ...c, key: `c${c.id}`, ptr, rev: j.rev, origin: 'repo', parentPtr: null };
+  return { ...c, key: `c${c.id}`, ptr, rev: j.rev, origin: 'repo', parentPtr: null, ...cutOf(j) };
 }
-const itemRow = (j) => ({ ...pick(j, ITEM_COLS), key: `g${j.id}`, rev: j.rev, origin: 'github', parentPtr: j.parentPtr ?? null });
+const itemRow = (j) => ({ ...pick(j, ITEM_COLS), key: `g${j.id}`, rev: j.rev, origin: 'github', parentPtr: j.parentPtr ?? null, ...cutOf(j) });
 const revsOf = (revs) => (revs ?? []).map((x) => ({ rev: x.rev, run: Number(x.run), publishedAt: iso(x.publishedAt), state: x.state ?? null }));
 
 // ---------- candidates: the lists of sqlite.mjs, in one statement ----------
@@ -268,15 +311,23 @@ async function candidates(client, q, opts = {}) {
   };
 }
 
-/** hydrate candidate keys ('c' + chunk_id, 'g' + item_id) at the run; unknown keys are left out */
+/**
+ * hydrate candidate keys ('c' + chunk_id, 'g' + item_id) at the run; unknown keys are left out. prefix n (read.mjs
+ * searchIn): a body over n characters comes as its first n, with cut; a repo chunk's also has sus: whether its text
+ * (read.mjs textOf) may be suspicious (SUSPECT; false is exact)
+ */
 async function rows(client, keys, opts = {}) {
   const ids = (c) => keys.map(String).filter((k) => k[0] === c && /^\d+$/.test(k.slice(1))).map((k) => k.slice(1));
   const { params, p } = statement();
+  const n = opts.prefix ? `${p(opts.prefix)}::int` : null;
+  const body = (col) => (n ? `CASE WHEN char_length(${col}) > ${n} THEN left(${col}, ${n}) ELSE ${col} END` : col);
+  const cut = (col, more = '') => (n ? ` || jsonb_build_object('cut', char_length(${col}) > ${n}${more})` : '');
+  const sus = n ? `, 'sus', char_length(c.body) > ${n} AND ${suspectSql(p, 'c.body', "i.kind = 'commit'")}` : '';
   const sql = `WITH ${head(atRun(p, opts.asOf))}
     SELECT ${VIEW},
-      (SELECT coalesce(jsonb_agg(${CHUNK('c', 'i', 'r')}), '[]'::jsonb) FROM brain.chunk c JOIN brain.item_rev r USING (rev_id) JOIN brain.item i USING (item_id)
+      (SELECT coalesce(jsonb_agg(${CHUNK('c', 'i', 'r', body('c.body'))}${cut('c.body', sus)}), '[]'::jsonb) FROM brain.chunk c JOIN brain.item_rev r USING (rev_id) JOIN brain.item i USING (item_id)
         WHERE c.chunk_id = ANY(${p(ids('c'))}::bigint[]) AND i.origin = 'repo' AND ${vis('r')}) AS chunks,
-      (SELECT coalesce(jsonb_agg(${ITEM('i', 'r')}), '[]'::jsonb) FROM brain.item_rev r JOIN brain.item i USING (item_id)
+      (SELECT coalesce(jsonb_agg(${ITEM('i', 'r', true, body('r.body'))}${cut('r.body')}), '[]'::jsonb) FROM brain.item_rev r JOIN brain.item i USING (item_id)
         WHERE r.item_id = ANY(${p(ids('g'))}::bigint[]) AND i.origin = 'github' AND ${vis('r')}) AS items`;
   const r = (await client.query(sql, params)).rows[0];
   const view = viewOf(r, noRun(opts.asOf));
