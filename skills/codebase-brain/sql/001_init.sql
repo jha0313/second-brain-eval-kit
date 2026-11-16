@@ -1,5 +1,6 @@
 -- 001_init: schema brain (design docs/phase2-design.md §6.1–§6.2). Q0 draft; lane A owns sql/* from Q1 on.
--- Run as the owner (neondb_owner) in one transaction: psql -v ON_ERROR_STOP=1 -1 -f sql/001_init.sql
+-- Applied by src/pg/migrate.mjs as the owner (neondb_owner), in one transaction with its ledger row. Never edit an
+-- applied file: add sql/NNN_*.sql instead.
 -- Column meanings and the SQLite -> server mapping: src/pg/contract.mjs COLUMN_MAP.
 --
 -- Table shapes:
@@ -17,8 +18,8 @@
 --   - every new revision / fact / identity / chunk / ref / sync_state row belongs to the run inserted by the SAME
 --     transaction (brain.publishing_run()); revisions get rev_no = previous + 1
 --   - a run row takes the publish advisory lock itself (contract.PUBLISH_LOCK_KEY = 2026111601, exclusive, held to
---     COMMIT), needs a running attempt and a run_id above every earlier one, and is the only run of its transaction;
---     run ids therefore follow commit order
+--     COMMIT), needs a running attempt and a run_id above every earlier one, is the only run of its transaction and is
+--     inserted at the transaction's top level (not inside a SAVEPOINT); run ids therefore follow commit order
 --   - attempt: inserted as running; status changes once; 'ok' only in the transaction that inserted its run
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;   -- R14
@@ -248,7 +249,9 @@ BEGIN
   -- COMMIT, so no other run row can commit between this check and this transaction's end (re-taking a lock the caller
   -- already holds is a no-op).
   PERFORM pg_catalog.pg_advisory_xact_lock(2026111601);
-  IF brain.publishing_run() IS NOT NULL THEN
+  -- one run per transaction, checked on the rows as well: the session setting alone can be reset by the caller, and a
+  -- multi-row INSERT reaches this check before mark (an AFTER trigger) ran for its first row
+  IF brain.publishing_run() IS NOT NULL OR EXISTS (SELECT 1 FROM brain.run WHERE xmin = pg_catalog.pg_current_xact_id()::xid) THEN
     RAISE EXCEPTION 'brain.run: one run per transaction' USING ERRCODE = 'insufficient_privilege';
   END IF;
   IF NEW.run_id <= (SELECT coalesce(max(run_id), 0) FROM brain.run) THEN
@@ -263,6 +266,12 @@ END $$;
 CREATE FUNCTION brain.mark_run() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   PERFORM pg_catalog.set_config('brain.publishing_run', NEW.run_id::text, true);   -- transaction-local
+  -- inside a SAVEPOINT the row's xmin is the subtransaction's id, so publishing_run() could never see it: refuse now,
+  -- not at the first guarded insert after it
+  IF brain.publishing_run() IS DISTINCT FROM NEW.run_id THEN
+    RAISE EXCEPTION 'brain.run: insert the run row at the top level of its transaction, not inside a SAVEPOINT'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
   RETURN NULL;
 END $$;
 
