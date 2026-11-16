@@ -7,7 +7,8 @@
 //   the mirror's ids ('c' + chunk_id, 'g' + item_id), so read.mjs shapes both stores alike and ties break as on a mirror
 //   of the same run. The lists follow src/store/sqlite.mjs one by one; FTS is chunk.tsv (simple over brain.fts_text:
 //   tokens and stems as FTS5's, sql/003) ranked by ts_rank instead of FTS5 bm25, and the trigram lists are ILIKE
-//   (pg_trgm index) for every length.
+//   for every length: a term of 3+ characters one list part each (the pg_trgm indexes when it has a trigram and the
+//   planner takes them), a shorter one (never a trigram) in one shared scan (tr in candidates).
 // - Repo memory pointers: <source>:<path>:<a>-<b>@r<n> (rev n of item <source>:<path>). A Phase 1 @<build> pointer
 //   reads the view run when its build is that run's build, else it is stale. Vault notes are never on the server.
 import { BrainError, NotFoundError, StalePtrError } from '../errors.mjs';
@@ -32,9 +33,10 @@ function statement() {
   const params = [];
   return { params, p: (v) => { params.push(v); return `$${params.length}`; } };
 }
-// v: the run; s: its GitHub sync_state (no row: the run has no GitHub state)
+// v: the run; s: its GitHub sync_state (no row: the run has no GitHub state). refs is taken out once: state is a
+// large toasted jsonb, and rl reads refs for every ref row (Q9: decompressed per row, most of a search's time)
 const head = (runSql) => `v AS (SELECT run_id, commit_sha, published_at, sanitize_version, meta->>'build_id' AS build FROM brain.run WHERE run_id = ${runSql}),
-  s AS (SELECT st.state FROM brain.sync_state st JOIN v USING (run_id) WHERE st.source = 'github')`;
+  s AS MATERIALIZED (SELECT st.state, st.state->'refs' AS refs FROM brain.sync_state st JOIN v USING (run_id) WHERE st.source = 'github')`;
 const atRun = (p, asOf) => `coalesce(${p(asOf ?? null)}::bigint, (SELECT max(run_id) FROM brain.run))`;
 const VIEW = `(SELECT to_jsonb(v) FROM v) AS v, (SELECT state->'row' FROM s) AS sync`;
 
@@ -130,13 +132,27 @@ async function candidates(client, q, opts = {}) {
       `seeds AS (SELECT id, key, kind FROM hit UNION SELECT nv.id, nv.key, nv.kind FROM hit JOIN nv ON nv.key = hit.path WHERE hit.kind <> 'file')`);
   }
 
+  // a trigram term under 3 characters never has a trigram, so each one was a scan of brain.chunk, twice (items and
+  // chunks; Q9: ~46 ms a scan). Those terms are matched in one scan instead, each title and body lowercased once: in a
+  // UTF-8 database ILIKE is lower() LIKE lower(), so every list is the same. th / hit: the terms (1-based) a chunk's
+  // title matches / its title or body matches
+  const short = t.tri.filter((s) => [...s].length < 3);
+  const shortNo = (s) => short.indexOf(s) + 1;
+  if (short.length && (f.ghKinds.length || f.sources.length)) {
+    ctes.push(`lp AS MATERIALIZED (SELECT n::int AS n, lower(x) AS p FROM unnest(${p(short.map(likeOf))}::text[]) WITH ORDINALITY u(x, n))`,
+      `tr AS MATERIALIZED (SELECT x.chunk_id, x.rev_id, x.ord, ARRAY(SELECT lp.n FROM lp WHERE x.lt LIKE lp.p) AS th,
+          ARRAY(SELECT lp.n FROM lp WHERE x.lt LIKE lp.p OR x.lb LIKE lp.p) AS hit
+        FROM (SELECT chunk_id, rev_id, ord, lower(title) AS lt, lower(body) AS lb FROM brain.chunk OFFSET 0) x
+        WHERE x.lt LIKE ANY(ARRAY(SELECT p FROM lp)) OR x.lb LIKE ANY(ARRAY(SELECT p FROM lp)))`);
+  }
+
   let pending = '0';
   if (f.ghKinds.length) {
     ctes.push(`gi AS (SELECT i.item_id AS id, i.ptr, i.kind, r.rev_id, r.state, r.author, r.source_updated_at AS updated_at, r.meta
       FROM brain.item_rev r JOIN brain.item i USING (item_id) WHERE i.origin = 'github' AND ${vis('r')})`);
     if (seeded || f.path) {
       // refs at R with their ref_link; cur: resolved against this run's build (else pending until the next relink)
-      ctes.push(`rl AS (SELECT gi.ptr, f.kind, f.target, l.status, l.reason, l.resolved_raw, coalesce(${BUILD_OF('s.state->\'refs\'', 'gi', 'f')} = v.build, false) AS cur
+      ctes.push(`rl AS (SELECT gi.ptr, f.kind, f.target, l.status, l.reason, l.resolved_raw, coalesce(${BUILD_OF('s.refs', 'gi', 'f')} = v.build, false) AS cur
         FROM gi JOIN brain.ref f ON f.rev_id = gi.rev_id LEFT JOIN brain.ref_link l ON l.ref_id = f.ref_id AND ${vis('l')} CROSS JOIN v CROSS JOIN s)`);
     }
     if (f.path) {   // sqlite.mjs pathRefs
@@ -165,8 +181,9 @@ async function candidates(client, q, opts = {}) {
     const text = ' JOIN brain.chunk c ON c.rev_id = g.rev_id AND c.ord = 0';   // the item's search chunk (title + body)
     if (tsq) add('items_fts', `${G(', ts_rank(c.tsv, w.q) AS sc', `${text} CROSS JOIN tq w`)} WHERE c.tsv @@ w.q`, 'sc DESC, id');
     for (const s of t.tri) {
-      const L = p(likeOf(s));
-      add('items_tri', `${G(`, coalesce(c.title ILIKE ${L}, false) AS th`, text)} WHERE (c.title ILIKE ${L} OR c.body ILIKE ${L})`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
+      const k = shortNo(s), L = k ? null : p(likeOf(s));
+      add('items_tri', k ? `${G(`, ${k} = ANY(tr.th) AS th`, ' JOIN tr ON tr.rev_id = g.rev_id AND tr.ord = 0')} WHERE ${k} = ANY(tr.hit)`
+        : `${G(`, coalesce(c.title ILIKE ${L}, false) AS th`, text)} WHERE (c.title ILIKE ${L} OR c.body ILIKE ${L})`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
     }
     const nums = t.prs.flatMap((n) => [`pr:${n.slice(1)}`, `issue:${n.slice(1)}`]);
     if (nums.length) add('items_keys', `${G()} WHERE g.ptr = ANY(${p(nums)}::text[])`, 'id');
@@ -192,8 +209,9 @@ async function candidates(client, q, opts = {}) {
     const K = 'SELECT id, key, grp, d, ptr, flags';
     if (tsq) add('chunks_fts', `${K}, ts_rank(tsv, w.q) AS sc FROM ch CROSS JOIN tq w WHERE tsv @@ w.q`, 'sc DESC, id');
     for (const s of t.tri) {
-      const L = p(likeOf(s));
-      add('chunks_tri', `${K}, coalesce(title ILIKE ${L}, false) AS th FROM ch WHERE title ILIKE ${L} OR body ILIKE ${L}`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
+      const k = shortNo(s), L = k ? null : p(likeOf(s));
+      add('chunks_tri', k ? `${K}, ${k} = ANY(tr.th) AS th FROM ch JOIN tr ON tr.chunk_id = ch.id WHERE ${k} = ANY(tr.hit)`
+        : `${K}, coalesce(title ILIKE ${L}, false) AS th FROM ch WHERE title ILIKE ${L} OR body ILIKE ${L}`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
     }
     for (const n of t.prs) add('chunks_keys', `${K} FROM ch WHERE (' ' || prs || ' ') LIKE ${p(`% ${n} %`)}`, 'id');
     for (const sha of t.shas) add('chunks_keys', `${K} FROM ch WHERE sha LIKE ${p(`${sha}%`)}`, 'id');
