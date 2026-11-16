@@ -16,7 +16,9 @@ KINDS = {"find-all", "why", "small", "other"}
 HARD_CHECKS = {"skill_loaded", "tool_used", "tool_not_used", "tool_order", "set_match", "cites_exist", "answer_regex",
                "sources_hit"}
 DEFAULT_LIMITS = {"max_turns": 40, "timeout_s": 900, "max_usd": 3.0}
-ARM_KEYS = {"skill", "patch", "outputs", "env"}
+ARM_KEYS = {"skill", "patch", "outputs", "env", "network", "secret_env"}
+HOST_RE = re.compile(r"(?:\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 # GitHub item pointers, as in skills/codebase-brain/src/ptr.mjs (P0 grammar). review / rc / ic have a parent PR or issue.
 GH_PTR_RE = re.compile(r"(pr|issue|review|rc|ic):([1-9]\d{0,15})")
 CHILD_TYPES = ("review", "rc", "ic")
@@ -81,6 +83,9 @@ class Suite:
     arm_outputs: dict[str, list[str]] = field(default_factory=dict)   # arm -> the prepare outputs it gets (arms that list them)
     arm_env: dict[str, dict] = field(default_factory=dict)            # arm -> skill_env overrides
     github_evidence: Path | None = None                     # frozen index of valid GitHub pointers (load_github_index)
+    arm_network: dict[str, list[str]] = field(default_factory=dict)  # arm -> hosts its trials may reach (sandbox allowlist)
+    arm_secret_env: dict[str, list[str]] = field(default_factory=dict)  # arm -> host env var NAMES passed to its trials, redacted
+    format_slots: list[str] = field(default_factory=list)   # <…> texts in prompts that are output formats, not unfilled placeholders
 
     @property
     def dir(self) -> Path:
@@ -96,7 +101,7 @@ def load_suite(path: str | Path, repo_override: str | None = None) -> Suite:
     path = Path(path).resolve()
     raw = yaml.safe_load(path.read_text())
     base = path.parent
-    arms, patches, arm_outputs, arm_env = {}, {}, {}, {}
+    arms, patches, arm_outputs, arm_env, arm_network, arm_secret_env = {}, {}, {}, {}, {}, {}
     for name, spec in (raw.get("arms") or {}).items():
         if isinstance(spec, dict):                 # {skill: dir, patch: v2.diff} = the same skill plus a small edit
             if set(spec) - ARM_KEYS:
@@ -112,6 +117,19 @@ def load_suite(path: str | Path, repo_override: str | None = None) -> Suite:
                 arm_outputs[name] = [str(o) for o in spec["outputs"] or []]
             if spec.get("env"):                    # skill_env overrides for this arm
                 arm_env[name] = {k: str(v) for k, v in spec["env"].items()}
+            if spec.get("network"):                # the only hosts this arm's trials may reach (through the sandbox proxy)
+                hosts = [str(h).strip().lower() for h in spec["network"]]
+                bad_hosts = [h for h in hosts if not HOST_RE.fullmatch(h)]
+                if bad_hosts:
+                    raise SuiteError(f"arm {name}: network takes host names only (no scheme, port or path), got {bad_hosts}")
+                arm_network[name] = hosts
+            if spec.get("secret_env"):             # names only: the values come from the host env at run time
+                names = [str(n) for n in spec["secret_env"]]
+                if any(not ENV_NAME_RE.fullmatch(n) or GH_ENV_RE.match(n) for n in names):
+                    raise SuiteError(f"arm {name}: secret_env takes env var names (not GH_* / GITHUB_*), got {names}")
+                if set(names) & set(arm_env.get(name, {})):
+                    raise SuiteError(f"arm {name}: {sorted(set(names) & set(arm_env[name]))} is both in env and secret_env")
+                arm_secret_env[name] = names
         else:
             arms[name] = None if not spec else _resolve(base, spec)
         if arms[name] and not (arms[name] / "SKILL.md").exists():
@@ -155,6 +173,9 @@ def load_suite(path: str | Path, repo_override: str | None = None) -> Suite:
         sensitivity=dict(raw.get("sensitivity") or {}),
         arm_outputs=arm_outputs,
         arm_env=arm_env,
+        arm_network=arm_network,
+        arm_secret_env=arm_secret_env,
+        format_slots=[str(x) for x in raw.get("format_slots") or []],
         github_evidence=_resolve(base, raw["github_evidence"]) if raw.get("github_evidence") else None,
     )
     for name, outs in arm_outputs.items():

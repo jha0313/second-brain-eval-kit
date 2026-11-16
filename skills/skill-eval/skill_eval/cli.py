@@ -100,6 +100,8 @@ def cmd_run(a):
     print(plan_table(suite, specs, arms, k, est, a, frozen, diffs))
     if a.dry_run:
         return 0
+    for x in arms:                                # secret_env values: read from the host now and registered for redaction
+        runner.secret_env(suite, x)               # before anything is saved; a missing one stops the run here
     if frozen is None and not a.unfrozen:
         raise SuiteError("no FROZEN.json: run `skill-eval freeze SUITE` first (it fixes cases, keys and grading rules "
                          "before any result is seen), or pass --dev for a dev run")

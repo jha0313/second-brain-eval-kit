@@ -77,16 +77,21 @@ def token() -> str | None:
     return TOKEN_FILE.read_text().strip() if auth_mode() == "token" else None
 
 
-def trial_settings(arm_skill: str | None, deny_dirs: list[Path], extra_off: list[str] = ()) -> dict:
+def trial_settings(arm_skill: str | None, deny_dirs: list[Path], extra_off: list[str] = (), network: list[str] | None = None) -> dict:
     off = {s: "off" for s in [*BUNDLED_SKILLS, *extra_off] if s != arm_skill}
     paths = [*map(str, deny_dirs), str(Path.home() / ".claude"), str(TOKEN_FILE.parent), *map(str, credential_paths())]
     # "//abs/path" is an absolute path rule; "/**" covers a folder's contents, the bare form a single file
     deny = [f"{tool}(/{p}{tail})" for p in paths for tool in ("Read", "Edit") for tail in ("", "/**")]
+    sandbox = {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False}
+    if network:
+        # the arm's hosts only (suite `network`): sandboxed commands reach them through the sandbox's own proxy, every other
+        # host is denied, and strictAllowlist makes project/local settings unable to add any
+        sandbox["network"] = {"allowedDomains": list(network), "strictAllowlist": True}
     return {
         "skillOverrides": off,                 # only the arm's skill is visible
         "disableAllHooks": True,               # no hooks from any settings source
         "autoMemoryEnabled": False,            # no memory from earlier sessions
-        "sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False},
+        "sandbox": sandbox,
         # The given tools are allowed at the permission layer: in dontAsk mode, commands the permission checker cannot
         # auto-approve (`$B args`, `for … $(…)`, writing to $TMPDIR, Read of a file the agent wrote to $TMPDIR) were
         # denied and ended trials for reasons unrelated to the skill. Deny rules still win over allow; the sandbox stays
@@ -180,12 +185,34 @@ def ancestor_instructions(ws: Path) -> list[str]:
     return found
 
 
+# Values an arm's `secret_env` passed to its trials (e.g. a database URL), and the password inside each URL. Registered
+# by the runner before anything runs; redact() and scan_saved() cover them like the token. Never written anywhere.
+_SECRETS: set[str] = set()
+
+
+def register_secret(value: str) -> None:
+    """Add a secret (and, for a URL, its password and every ?password=) to what redact() removes."""
+    from urllib.parse import urlsplit, parse_qs, unquote
+    parts = {value}
+    try:
+        u = urlsplit(value)
+        if u.password:
+            parts |= {u.password, unquote(u.password)}
+        for pw in parse_qs(u.query).get("password", []):
+            parts.add(pw)
+    except ValueError:
+        pass
+    _SECRETS.update(p for p in parts if p and len(p) >= 8)
+
+
 def redact(text: str) -> str:
-    """Remove the token, any GitHub-token-shaped string and the token file's folder (in any spelling) from text that
-    will be saved or shown."""
+    """Remove the token, registered secrets, any GitHub-token-shaped string and the token file's folder (in any
+    spelling) from text that will be saved or shown."""
     tok = token()
     if tok:
         text = text.replace(tok, "[REDACTED-TOKEN]")
+    for sec in sorted(_SECRETS, key=len, reverse=True):     # the whole URL first, then a password left anywhere else
+        text = text.replace(sec, "[REDACTED-SECRET]")
     text = GH_TOKEN_RE.sub("[REDACTED-GITHUB-TOKEN]", text)
     folder = str(TOKEN_FILE.parent)
     home = str(Path.home())
@@ -196,13 +223,20 @@ def redact(text: str) -> str:
 
 def scan_saved(out: Path) -> dict:
     """grep every saved file under `out` for the token; redact any hit in place. Returns counts, never the token."""
-    tok, hits = token(), []
-    if not tok:
+    tok, hits, sec_hits = token(), [], []
+    needles = ([tok] if tok else []) + sorted(_SECRETS)
+    if not needles:
         return {"token": "no token in use", "files_with_token": 0}
     for f in Path(out).rglob("*"):
         if f.is_file() and f.stat().st_size < 200_000_000:
             text = f.read_text(errors="replace")
-            if tok in text:
+            if tok and tok in text:
                 hits.append(f.name)
+            if any(s in text for s in _SECRETS):
+                sec_hits.append(f.name)
+            if (tok and tok in text) or any(s in text for s in _SECRETS):
                 f.write_text(redact(text))
-    return {"token": "absent" if not hits else "found and redacted", "files_with_token": len(hits)}
+    r = {"token": "no token in use" if not tok else "absent" if not hits else "found and redacted", "files_with_token": len(hits)}
+    if _SECRETS:
+        r.update(secret_env="absent" if not sec_hits else "found and redacted", files_with_secret=len(sec_hits))
+    return r
