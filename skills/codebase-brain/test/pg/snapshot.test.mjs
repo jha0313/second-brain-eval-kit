@@ -7,7 +7,7 @@ import { copyFileSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } fro
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as C from '../../src/pg/contract.mjs';
-import { snapshot, diff, applyDelta, checkOutbound } from '../../src/pg/snapshot.mjs';
+import { snapshot, diff, applyDelta, checkOutbound, factKeyOf } from '../../src/pg/snapshot.mjs';
 import { expectedText, EXPECTED } from './golden/build-golden.mjs';
 import { canaries, identSecret, zwSplit, leaksIn } from '../security/lib.mjs';
 import { FULL, INCR, OLD_COMMIT, ROUTES, REFUND, git, build, fixtureBuilds, withoutOldCommit, atVersion0, corpusState } from './fixture-builds.mjs';
@@ -153,6 +153,22 @@ test('incremental GitHub: a kept ref_link is resolved again against the new node
   assert.ok(after.items.has('pr:1121'));
   assert.throws(() => applyDelta(s1, { ...d, ref_link: { put: d.ref_link.put.filter((r) => r.ptr !== 'pr:1121'),
     close: d.ref_link.close.filter((k) => s1.ref_link.get(k).ptr !== 'pr:1121') } }), /resolves to other nodes/);
+});
+
+test('incremental GitHub: a relink that changes a ref status closes the old ref_link, so each ref has one visible row', () => {
+  // sync saw issue:45 again (same revision) and relink moved its ref from pending to unlinked
+  const [k0, r0] = [...s1.ref_link].find(([, r]) => r.ptr === 'issue:45');
+  const unlinked = [...s1.ref_link.values()].find((r) => r.status === 'unlinked');
+  const relinked = { ...r0, status: 'unlinked', reason: unlinked.reason };
+  const next = { ...s1, manifest: C.validateManifest(INCR),
+    ref_link: new Map([...s1.ref_link].filter(([k]) => k !== k0)).set(factKeyOf('ref_link', relinked), relinked) };
+  const d = diff(s1, next);
+  assert.deepEqual(d.ref_link.close, [k0]);
+  assert.deepEqual(d.ref_link.put, [relinked]);
+  const after = applyDelta(s1, d), perRef = new Map();
+  for (const r of after.ref_link.values()) perRef.set(`${r.ptr} ${r.revHash} ${r.ord}`, (perRef.get(`${r.ptr} ${r.revHash} ${r.ord}`) ?? 0) + 1);
+  assert.deepEqual([...perRef.values()].filter((n) => n > 1), [], 'one ref_link per ref, as github.db refs holds');
+  assert.equal(C.canonicalJson(C.checksum(after)), C.canonicalJson(C.checksum(next)), 'a mirror of the new run matches its checksum');
 });
 
 test('V8: a const/type declaration swap and same-name methods keep every identity', () => {
