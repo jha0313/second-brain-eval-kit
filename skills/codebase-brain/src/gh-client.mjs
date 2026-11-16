@@ -10,6 +10,21 @@
 // - the token never appears in an error, a log line, or a return value; HTTP errors are logged without headers
 // - per_page=100 everywhere; Link rel="next" is followed only where the stream is not keyset-paged
 // - every request is GET under https://api.github.com/repos/{owner}/{repo}; nothing else is fetched (R13)
+//
+// EXACT requests (replay fixtures in lanes G, S, I match these query key sets exactly; order does not matter).
+// B = /repos/{owner}/{repo}. since = ISO 8601 UTC to the second, "2026-11-15T09:58:00Z" (no milliseconds).
+//   getRepo()               GET B                         {}
+//   pullsDesc() page 1      GET B/pulls                   { state: all, sort: updated, direction: desc, per_page: 100 }
+//   pullsDesc() page n>1    GET <the Link rel="next" URL exactly as GitHub sent it>
+//   streamSince('issues')           GET B/issues          { state: all, sort: updated, direction: asc, per_page: 100, since?, page? }
+//   streamSince('issue-comments')   GET B/issues/comments { sort: updated, direction: asc, per_page: 100, since?, page? }
+//   streamSince('review-comments')  GET B/pulls/comments  { sort: updated, direction: asc, per_page: 100, since?, page? }
+//     since: omitted when null (first sync). page: omitted for page 1; present (2, 3, …) only while paging inside a
+//     same-second batch (R4). Link headers are ignored on these three streams.
+//   reviews(n) page 1       GET B/pulls/{n}/reviews       { per_page: 100 }      then Link rel="next" as sent
+//   files(n) page 1         GET B/pulls/{n}/files         { per_page: 100 }      then Link rel="next" as sent, max 30 pages
+// Request headers: Accept: application/vnd.github+json · X-GitHub-Api-Version: 2022-11-28 ·
+//   User-Agent: codebase-brain · Authorization: Bearer <token> (only when token is non-null)
 import { NotImplementedError } from './errors.mjs';
 
 /**

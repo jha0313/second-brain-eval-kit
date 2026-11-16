@@ -67,7 +67,7 @@ flowchart LR
 | B | sanitize 구현 + Phase 0 원문 마스킹 + `sweepSecrets` | `src/sanitize.mjs`, `src/index-knowledge.mjs`, `test/phase1/sanitize.test.mjs` | `node --test test/phase1/sanitize.test.mjs` + `npm test` |
 | C | GitHub client | `src/gh-client.mjs`, `test/phase1/gh-client.test.mjs` | `node --test test/phase1/gh-client.test.mjs` + `npm test` |
 | D | linker: 추출·해석·relink | `src/link.mjs`, `test/phase1/link.test.mjs` | `node --test test/phase1/link.test.mjs` + `npm test` |
-| E1 | 안전 렌더러, coverage·freshness, 가드, CLI 명령 4개, 오류·로그 출구, viz | `src/fmt.mjs`, `src/answer.mjs`, `src/cli.mjs`, `src/viz.mjs`, `test/phase1/cli.test.mjs` | `node --test test/phase1/cli.test.mjs` + `npm test` |
+| E1 | 안전 렌더러, coverage·freshness, 가드, CLI 명령 4개, 오류·로그 출구, viz | `src/fmt.mjs`, `src/answer.mjs`, `src/cli.mjs`, `src/viz.mjs`, `src/render.mjs`(새 파일: DTO → 텍스트 줄, 순수 함수), `test/phase1/cli.test.mjs`, `test/phase1/render.test.mjs` | `node --test test/phase1/cli.test.mjs` + `npm test` |
 | E2 | `search` · `get` · `source` · `envelope` | `src/read.mjs`, `test/phase1/read.test.mjs` | `node --test test/phase1/read.test.mjs` + `npm test` |
 | G | sync 오케스트레이터, `upsertPage`, `ingestRaw`, failpoint 호출 | `src/gh-sync.mjs`, `test/phase1/gh-sync.test.mjs`, `test/phase1/gh-fixture/**` | `node --test test/phase1/gh-sync.test.mjs` + `npm test` |
 | S | 보안 공격 테스트(black-box, CLI만) | `test/security/**` | `npm run test:security`가 돈다(실패는 정상). 실패 목록을 보고 |
@@ -135,6 +135,7 @@ flowchart LR
 
 - 서명은 파일 그대로. `createClient({ owner, repo, token, transport, clock, log })` → `{ getRepo, pullsDesc, streamSince, reviews, files, stats }`, `readToken(env, { allowGh })`.
 - transport: `async ({ method, url, headers }) => ({ status, headers: { get }, json() })`. clock: `{ now(): ms, sleep(ms): Promise }`. 대기는 `clock.sleep`만 쓴다.
+- **정확한 요청 표**(경로 + query 키 집합 + 헤더)가 파일 머리에 있다. replay fixture(G·S·I)는 이 표에 맞춘다.
 - 재시도 1·2·4초, 1차 rate limit은 reset까지(최대 1시간), 2차는 `retry-after` 또는 60초 배수 ×3. 다 실패하면 `GhError`.
 - **GET만.** 다른 메서드는 코드에 없다. 토큰은 `Authorization` 헤더에만, 오류·로그·`stats()`에 없다.
 - `readToken`: `GH_TOKEN` → `GITHUB_TOKEN` → (`allowGh`일 때만) `gh auth token`. 없으면 `null`.
@@ -315,6 +316,7 @@ flowchart LR
 | A6 | `src/seams.mjs`(replay·failpoint) | S·I가 CLI만으로 수집 경로를 시험할 길이 없었다 |
 | A7 | JSON `freshness`는 Phase 0 객체 + `github` 하위 객체 | Phase 0 체크가 `freshness.state`를 본다 |
 | A8 | `viz.mjs`를 E1에, S 테스트를 `test/security/`로, H를 I로 | 출구 소유자 없음, 빨간 테스트가 필수 관문을 막음, 직렬 단계 제거 |
+| A10 | GitHub 요청 표(경로·query 키·`since` 형식·헤더)를 `gh-client.mjs` 머리에 고정 | replay는 query가 정확히 같아야 맞는다. C·G·S·I가 같은 요청을 가정해야 한다 |
 | A9 | eval arm `none · dump · v2` → `none · v1 · dump · v2` | 한 칸에 한 가지만 바뀌어야 효과를 나눠 말할 수 있다 |
 
 ## 부록 B: Codex 계획 리뷰 1차 처리
