@@ -14,7 +14,7 @@ export function resolveTarget(db, q) {
   if (byKey.length) return { node: byKey[0] };
   const m = /^(.+?)[#:]([\w$.]+)$/.exec(q);                       // path#Name or path:Name
   if (m && !/\.\w+$/.test(q)) {
-    const hits = one(`SELECT * FROM nodes WHERE kind != 'file' AND name = ? AND (path = ? OR path LIKE ?)`, m[2].split('.').pop(), m[1], `%${m[1]}`);
+    const hits = one(`SELECT * FROM nodes WHERE kind != 'file' AND name = ? AND (path = ? OR path LIKE ?) ORDER BY path, line, kind, key`, m[2].split('.').pop(), m[1], `%${m[1]}`);
     if (hits.length === 1) return { node: hits[0] };
     if (hits.length > 1) return { candidates: hits };
   }
@@ -24,11 +24,11 @@ export function resolveTarget(db, q) {
     return { node: known || { id: -1, key: `dir:${dir}`, kind: 'dir', name: dir.split('/').pop(), path: dir } };
   }
   if (q.includes('/') || /\.\w+$/.test(q)) {                       // a path, or the tail of one
-    const hits = one(`SELECT * FROM nodes WHERE kind IN ('file','dir') AND (path = ? OR path LIKE ?) ORDER BY length(path)`, q, `%/${q.replace(/^\/+/, '')}`);
+    const hits = one(`SELECT * FROM nodes WHERE kind IN ('file','dir') AND (path = ? OR path LIKE ?) ORDER BY length(path), path`, q, `%/${q.replace(/^\/+/, '')}`);
     if (hits.length === 1 || (hits.length && hits[0].path === q)) return { node: hits[0] };
     if (hits.length) return { candidates: hits };
   }
-  const hits = one(`SELECT * FROM nodes WHERE name = ? AND kind NOT IN ('file','dir') ORDER BY exported DESC, kind`, q);
+  const hits = one(`SELECT * FROM nodes WHERE name = ? AND kind NOT IN ('file','dir') ORDER BY exported DESC, kind, path, line, key`, q);
   const exported = hits.filter((h) => h.exported);
   if (hits.length === 1) return { node: hits[0] };
   if (exported.length === 1) return { node: exported[0], others: hits.length - 1 };
@@ -42,7 +42,7 @@ export function find(db, q, { limit = 20, kind } = {}) {
     SELECT n.*, (SELECT count(*) FROM edges e WHERE e.dst = n.id AND e.kind NOT IN ('import','export')) AS uses
     FROM nodes n
     WHERE (n.name = ? OR n.name LIKE ? OR n.path LIKE ?) ${kind ? 'AND n.kind = ?' : ''}
-    ORDER BY (n.name = ?) DESC, n.exported DESC, uses DESC LIMIT ?`).all(...[q, like, like, ...(kind ? [kind] : []), q, limit + 1]);
+    ORDER BY (n.name = ?) DESC, n.exported DESC, uses DESC, n.path, n.line, n.kind, n.name, n.key LIMIT ?`).all(...[q, like, like, ...(kind ? [kind] : []), q, limit + 1]);
   return { rows: rows.slice(0, limit), truncated: rows.length > limit };
 }
 
@@ -55,7 +55,7 @@ export function refs(db, node, { kinds, filter, exclude, limit = 50, cursor = 0,
     SELECT e.kind, e.path, e.line, e.col, s.name AS in_name, s.kind AS in_kind, f.flags
     FROM edges e JOIN nodes s ON s.id = e.src LEFT JOIN nodes f ON f.key = e.path
     WHERE e.dst = ? AND e.kind IN (${ks.map(() => '?').join(',')})
-    ORDER BY e.path, e.line, e.col`).all(node.id, ...ks)
+    ORDER BY e.path, e.line, e.col, e.kind, s.key`).all(node.id, ...ks)
     .filter((r) => flagMatch(r.flags, filter, exclude));
   const files = new Set(rows.map((r) => r.path));
   return { total: rows.length, files: files.size, rows: rows.slice(cursor, cursor + limit),
@@ -135,11 +135,11 @@ export function impact(db, node, { hops = 99, noTypes = false, noMocks = false }
 
 export function deps(db, node, { hops = 99, noTypes = false } = {}) {
   const out = db.prepare(`SELECT DISTINCT e.dst AS id, n.path, e.kind FROM edges e JOIN nodes n ON n.id = e.dst
-    WHERE e.src = ? AND e.kind IN (${MODULE_EDGES.filter((k) => k !== 'mocks').map(() => '?').join(',')})`);
+    WHERE e.src = ? AND e.kind IN (${MODULE_EDGES.filter((k) => k !== 'mocks').map(() => '?').join(',')}) ORDER BY n.path, e.kind`);
   const kinds = MODULE_EDGES.filter((k) => k !== 'mocks' && !(noTypes && k === 'imports-type'));
   // deps is file level: a symbol starts from the file that defines it (module edges leave files, not symbols)
   const starts = node.kind === 'dir'
-    ? db.prepare(`SELECT id, path FROM nodes WHERE kind = 'file' AND path LIKE ?`).all(`${node.path}/%`)
+    ? db.prepare(`SELECT id, path FROM nodes WHERE kind = 'file' AND path LIKE ? ORDER BY path`).all(`${node.path}/%`)
     : [{ id: node.kind === 'file' ? node.id : db.prepare('SELECT id FROM nodes WHERE key = ?').get(node.path)?.id, path: node.path }];
   const hopOf = new Map(starts.map((s) => [s.path, 0]));
   let frontier = starts;

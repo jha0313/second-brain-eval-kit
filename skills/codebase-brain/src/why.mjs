@@ -36,15 +36,15 @@ export function why(db, question, { limit = 8, perSource = 3 } = {}) {
   // 1. keyword (BM25), title weighted 3x
   if (t.ascii.length) {
     const q = t.ascii.map((w) => `"${w.replace(/"/g, '')}"`).join(' OR ');
-    lists.push({ name: 'bm25', ids: db.prepare(`SELECT rowid AS id FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts, 3.0, 1.0) LIMIT 60`).all(q).map((r) => r.id) });
+    lists.push({ name: 'bm25', ids: db.prepare(`SELECT chunks_fts.rowid AS id FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts, 3.0, 1.0), c.source, c.path, c.sha, c.start_line, c.end_line, c.title LIMIT 60`).all(q).map((r) => r.id) });
   }
   // 2. Korean terms: substring match (trigram index for 3+ chars, LIKE for 2), ranked by how many terms hit
   if (t.hangul.length) {
     const score = new Map();
     for (const h of t.hangul) {
       const rows = h.length >= 3
-        ? db.prepare(`SELECT rowid AS id FROM chunks_tri WHERE chunks_tri MATCH ? LIMIT 400`).all(`"${h}"`)
-        : db.prepare(`SELECT id FROM chunks WHERE title LIKE ? OR body LIKE ? LIMIT 400`).all(`%${h}%`, `%${h}%`);
+        ? db.prepare(`SELECT chunks_tri.rowid AS id FROM chunks_tri JOIN chunks c ON c.id = chunks_tri.rowid WHERE chunks_tri MATCH ? ORDER BY c.source, c.path, c.sha, c.start_line, c.end_line, c.title LIMIT 400`).all(`"${h}"`)
+        : db.prepare(`SELECT id FROM chunks WHERE title LIKE ? OR body LIKE ? ORDER BY source, path, sha, start_line, end_line, title LIMIT 400`).all(`%${h}%`, `%${h}%`);
       for (const r of rows) score.set(r.id, (score.get(r.id) || 0) + 1);
     }
     lists.push({ name: 'korean', ids: [...score.entries()].sort((a, b) => b[1] - a[1]).slice(0, 60).map(([id]) => id) });
@@ -61,12 +61,12 @@ export function why(db, question, { limit = 8, perSource = 3 } = {}) {
     const dirIds = [...ids].flatMap((id) => ancestorDirs(db, id));
     const all = [...ids, ...dirIds];
     const rows = db.prepare(`SELECT l.chunk AS id, count(*) AS n, max(c.date) AS d FROM links l JOIN chunks c ON c.id = l.chunk
-      WHERE l.node IN (${all.map(() => '?').join(',')}) GROUP BY l.chunk ORDER BY n DESC, d DESC LIMIT 60`).all(...all);
+      WHERE l.node IN (${all.map(() => '?').join(',')}) GROUP BY l.chunk ORDER BY n DESC, d DESC, c.source, c.path, c.sha, c.start_line, c.end_line, c.title LIMIT 60`).all(...all);
     lists.push({ name: 'links', ids: rows.map((r) => r.id) });
   }
   // 4. PR numbers and SHAs are exact keys
-  for (const pr of t.prs) lists.push({ name: pr, ids: db.prepare(`SELECT id FROM chunks WHERE (' ' || prs || ' ') LIKE ? ORDER BY source = 'commit' DESC LIMIT 20`).all(`% ${pr} %`).map((r) => r.id) });
-  for (const sha of t.shas) lists.push({ name: sha, ids: db.prepare(`SELECT id FROM chunks WHERE sha LIKE ? LIMIT 5`).all(`${sha}%`).map((r) => r.id) });
+  for (const pr of t.prs) lists.push({ name: pr, ids: db.prepare(`SELECT id FROM chunks WHERE (' ' || prs || ' ') LIKE ? ORDER BY source = 'commit' DESC, source, path, sha, start_line, end_line, title LIMIT 20`).all(`% ${pr} %`).map((r) => r.id) });
+  for (const sha of t.shas) lists.push({ name: sha, ids: db.prepare(`SELECT id FROM chunks WHERE sha LIKE ? ORDER BY source, path, sha, start_line, end_line, title LIMIT 5`).all(`${sha}%`).map((r) => r.id) });
 
   const fuse = (ls) => {
     const fused = new Map();
@@ -83,7 +83,7 @@ export function why(db, question, { limit = 8, perSource = 3 } = {}) {
   // only docs written by one or two commits (a changes/ fragment, a decision note): a long-lived doc's
   // writers are many and say nothing about this question
   const writers = db.prepare(`SELECT l.chunk AS id FROM links l JOIN chunks c ON c.id = l.chunk
-    WHERE l.node = ? AND l.kind = 'touches' AND (SELECT count(*) FROM links x WHERE x.node = l.node AND x.kind = 'touches') <= 2`);
+    WHERE l.node = ? AND l.kind = 'touches' AND (SELECT count(*) FROM links x WHERE x.node = l.node AND x.kind = 'touches') <= 2 ORDER BY c.source, c.path, c.sha, c.start_line, c.end_line, c.title`);
   const hop = [];
   for (const f of first) {
     const d = docOf.get(f.id);
@@ -116,7 +116,7 @@ export function why(db, question, { limit = 8, perSource = 3 } = {}) {
   }
 
   // 6. one hop: the code each citation points to
-  const linksOf = db.prepare(`SELECT n.path, n.name, n.kind, l.kind AS link FROM links l JOIN nodes n ON n.id = l.node WHERE l.chunk = ?`);
+  const linksOf = db.prepare(`SELECT n.path, n.name, n.kind, l.kind AS link FROM links l JOIN nodes n ON n.id = l.node WHERE l.chunk = ? ORDER BY n.path, n.kind, n.name, n.line, l.kind`);
   const related = new Map();
   for (const p of picked) {
     p.links = linksOf.all(p.id);
@@ -128,7 +128,7 @@ export function why(db, question, { limit = 8, perSource = 3 } = {}) {
     }
   }
   const touchedBy = seeds.length ? db.prepare(`SELECT c.sha, c.date, c.title, c.prs FROM links l JOIN chunks c ON c.id = l.chunk
-    WHERE l.kind = 'touches' AND l.node = ? ORDER BY c.date DESC LIMIT 3`) : null;
+    WHERE l.kind = 'touches' AND l.node = ? ORDER BY c.date DESC, c.source, c.path, c.sha, c.start_line, c.end_line, c.title LIMIT 3`) : null;
   const history = seeds.slice(0, 3).map((s) => ({ seed: s.key, commits: touchedBy.all(s.kind === 'file' ? s.id : fileNode(db, s.path)?.id ?? -1) }));
 
   return { question, terms: t, seeds: seeds.map((s) => s.key), lists: lists.map((l) => `${l.name}:${l.ids.length}`), gap: !picked.length,
