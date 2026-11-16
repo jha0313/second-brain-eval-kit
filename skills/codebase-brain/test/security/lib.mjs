@@ -115,14 +115,13 @@ export const secretLines = (reg, loc, kinds = SECRET_KINDS) =>
   kinds.map((k, i) => `rotation step ${i + 1}:${k === 'private-key' ? '\n' : ' '}${secret(reg, loc, k)}`).join('\n');
 export const secretLine = (reg, loc, kinds) => kinds.map((k, i) => `(${i + 1}) ${secret(reg, loc, k)}`).join(' · ');
 
-// Token canaries in the environment of every run. In replay mode the active token is "replay-token" (seams.mjs):
-// it is a canary too, since the token may appear only in the Authorization header.
-export const ACTIVE_TOKEN = 'replay-' + 'token';
+// Token canaries in the environment of every run. In replay mode the active token is GH_TOKEN (seams.mjs), so the
+// canary that may appear only in the Authorization header is the one the client really sends.
 export const TOKEN_ENV = { GH_TOKEN: 'brain' + 'TokCanary' + rnd('env:GH_TOKEN', 28, LOW + D), GITHUB_TOKEN: 'gh' + 'p_' + rnd('env:GITHUB_TOKEN', 36) };
+export const ACTIVE_TOKEN = TOKEN_ENV.GH_TOKEN;
 export function addTokenCanaries(reg) {
   reg.set('env/GH_TOKEN', TOKEN_ENV.GH_TOKEN);
   reg.set('env/GITHUB_TOKEN', TOKEN_ENV.GITHUB_TOKEN);
-  reg.set('seam/active-token', ACTIVE_TOKEN);
   return reg;
 }
 
@@ -245,6 +244,13 @@ export function override(routes, path, query, responses) {
   if (!r) throw new Error(`no route ${path}`);
   r.responses = typeof responses === 'function' ? responses(r.responses) : responses;
   return routes;
+}
+
+/** The requests a replay run made (requests.log of seams.mjs): [{ method, url, unmatched }]. */
+export function replayRequests(dir) {
+  let text = '';
+  try { text = readFileSync(join(dir, 'requests.log'), 'utf8'); } catch {}
+  return text.split('\n').filter(Boolean).map((l) => { const [method, url, flag] = l.split(' '); return { method, url, unmatched: flag === 'unmatched' }; });
 }
 
 export function writeReplay(routes) {

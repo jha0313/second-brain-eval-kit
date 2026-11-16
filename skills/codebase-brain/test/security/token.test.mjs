@@ -6,7 +6,7 @@ import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   NOW, BASE, PULLS_Q, FAILPOINTS, STREAMS, ACTIVE_TOKEN, canaries, secret, rnd, addTokenCanaries, githubSecretCorpus, replayRoutes, override, writeReplay, ok, pr,
-  setupRepo, sync, parseJson, brief, resetGithub, storeLeaks, outputLeaks,
+  setupRepo, sync, parseJson, brief, resetGithub, storeLeaks, outputLeaks, replayRequests, OWNER, REPO, REPO_ID,
 } from './lib.mjs';
 
 const reg = addTokenCanaries(canaries());
@@ -44,11 +44,22 @@ function verdict(runs, expect) {
   if (expect === 'failed') assert.ok(typeof res.error === 'string' && res.error.length > 0, 'a failed run says why');
 }
 
+// every request the client sent (requests.log of the replay seam): a GET on api.github.com for this repository only,
+// by name or by the id getRepo returned (the form GitHub uses in Link headers). The token goes nowhere else.
+const REPO_URL = new RegExp(`^https://api\\.github\\.com(/repos/${OWNER}/${REPO}|/repositories/${REPO_ID})([/?]|$)`);
+function onlyRepoRequests(dir) {
+  const reqs = replayRequests(dir);
+  assert.ok(reqs.length > 0, 'the replay seam logged the requests');
+  for (const r of reqs) { assert.equal(r.method, 'GET', r.url); assert.match(r.url, REPO_URL); }
+  return reqs;
+}
+
 for (const s of SCENARIOS) {
   test(`token: ${s.name}: no token or secret in stdout, stderr or the stores`, () => {
     resetGithub(fx);
     const dir = writeReplay(s.mutate(replayRoutes(gh)));
     verdict([sync(fx, dir), sync(fx, dir, ['--json'])], s.expect);
+    onlyRepoRequests(dir);
   });
 }
 
@@ -68,11 +79,12 @@ for (const name of FAILPOINTS) {
       runs.push(sync(fx, dir, ['--json'], env));
     }
     verdict(runs, name === 'sync:relink' ? 'ok' : 'failed');
+    onlyRepoRequests(dir);
   });
 }
 
-// Black-box, only a stored page is visible: a client that sends the request and then fails before storing it passes
-// here. Seeing the request itself needs a request log from the replay seam (reported as a contract request).
+// Two checks: the replay seam's request log shows the foreign URL was never requested (a client that sends it and then
+// fails would pass a store-only check), and the page behind it is not in the stores.
 test('token: a Link rel="next" to another host is never followed (the token would go with it)', () => {
   resetGithub(fx);
   const marker = canaries();
@@ -81,8 +93,10 @@ test('token: a Link rel="next" to another host is never followed (the token woul
   const routes = replayRoutes(gh);
   routes.find((x) => x.path === `${BASE}/pulls` && !x.query.page).responses[0].headers.link = '<https://evil.example/exfil?page=2>; rel="next"';
   routes.push({ path: '/exfil', query: { page: '2' }, responses: [ok([pr({ number: 999, state: 'open', title, body: 'x', head: 'x', updated: '2026-09-01T10:00:00Z' })])] });
-  const run = sync(fx, writeReplay(routes), ['--json']);
+  const dir = writeReplay(routes);
+  const run = sync(fx, dir, ['--json']);
   assert.ok(['ok', 'failed'].includes(parseJson(run)?.status), `sync --json: ${brief(reg, run)}`);
+  assert.ok(!onlyRepoRequests(dir).some((r) => r.url.includes('evil.example')), 'the foreign Link URL was requested');
   assert.deepEqual(storeLeaks(marker, fx.codeDb), [], 'the page behind the foreign link was fetched and stored');
   assert.deepEqual([...outputLeaks(reg, [run]), ...storeLeaks(reg, fx.codeDb)], []);
 });

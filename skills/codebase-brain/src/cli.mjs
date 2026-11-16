@@ -441,7 +441,7 @@ const cmds = {
     const clock = seam ? seam.clock : realClock;
     const client = createClient({ owner, repo, token, transport: seam ? seam.transport : fetchTransport, clock, log: say });
     let r;
-    try { r = await ghSync({ codeDbPath, repoDir, client, full: !!opt.full, log: say, clock }); }
+    try { r = await ghSync({ codeDbPath, repoDir, client, full: !!opt.full, log: say, clock, token }); }
     catch (e) {
       if (e.code !== 'lock-busy') throw e;
       r = { status: 'busy', cursor: null, counts: null, error: e.message, staleLock: false, relink: null };

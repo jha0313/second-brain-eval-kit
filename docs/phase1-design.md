@@ -341,7 +341,7 @@ sequenceDiagram
 | Ctrl-C · 프로세스 죽음 | 쪽 단위로 쓴 항목은 남는다. 다음 run이 lock을 정리하고 상태를 `interrupted`로 표시한다 | 그대로 | 다음 run이 같은 창부터 다시. `detail_for`로 이미 받은 파일 목록은 건너뜀 |
 | 다른 쓰기 작업이 도는 중 | 바로 끝난다 | — | `another brain write is running (pid …)` |
 | PR 변경 파일이 3,000개 넘음 (API 상한) | 받은 만큼 저장, `files-truncated` 표시, `sync_state.limits`에 개수 기록. run은 성공 | 이동 | `--path` 검색 coverage `partial` (§6.8) |
-| 링크 해석 오류 · grep 상한 초과 | run은 성공(cursor와 분리). 해당 refs는 `pending` 또는 `ambiguous: budget` | 이동 | 그 refs가 걸리는 질의의 coverage `partial` (§6.8) |
+| 링크 해석 오류 · grep 상한 초과 | run은 성공(cursor와 분리). 해당 refs는 `pending`(상한 초과는 reason `budget`) | 이동 | 그 refs가 걸리는 질의의 coverage `partial` (§6.8) |
 
 ### 6.4 비밀 마스킹
 
@@ -424,7 +424,7 @@ flowchart TD
   RT -- "아니오" --> GG{"git grep -F (인덱스 커밋)<br/>맞는 파일 수"}
   GG -- "1–10개" --> L6["linked (파일:줄)"]
   GG -- "11개 이상" --> A2["ambiguous: too-many"]
-  GG -- "상한 초과" --> A3["ambiguous: budget"]
+  GG -- "상한 초과" --> A3["pending: budget"]
   GG -- "0개" --> U6["unlinked: no-match<br/>(다른 서비스에 있을 수 있음)"]
 ```
 
@@ -445,7 +445,7 @@ flowchart TD
 
 - Next.js route 표: `code.db`에서 `route` · `page` 플래그가 붙은 파일 경로로 만든다. `app/api/run/route.ts` → `/api/run`. `[id]`는 한 마디, `[...x]`는 여러 마디와 맞춘다. `(group)` 마디는 지운다.
 - 표에 없으면 문자열 그대로 찾는다. 토큰은 3–200자, 한 줄, NUL 없음만 받는다(빈 패턴이나 여러 줄 패턴은 `git grep -f`에서 뜻이 달라진다). 토큰 파일 하나로 인덱스 커밋에서 `git grep -n -I -F -f <토큰 파일> <commit> --`을 한 번 돌리고, 출력을 흘려 읽으며 맞은 줄을 토큰별로 나눈다. 토큰마다 파일 10개를 넘으면 그 토큰은 `too-many`로 정하고 더 모으지 않는다. 파일별 매치 수 제한(`-m`)은 쓰지 않는다. 여러 토큰에 함께 걸려서, 한 토큰의 이른 매치가 같은 파일의 다른 토큰을 가리기 때문이다.
-- 상한: 출력 16 MB, 20초. 넘으면 아직 정해지지 않은 토큰을 모두 `ambiguous: budget`으로 둔다. 종료 코드 1은 "맞은 것 없음"이고, 그 밖의 0 아닌 코드는 오류로 보고 `pending`을 유지한다(다음 relink가 다시 시도).
+- 상한: 출력 16 MB, 20초. 넘으면 아직 정해지지 않은 토큰을 모두 `pending`, reason `budget`으로 둔다. 종료 코드 1은 "맞은 것 없음"이고, 그 밖의 0 아닌 코드는 오류로 보고 `pending`을 유지한다(다음 relink가 다시 시도).
 - 결과는 `resolved`에 `파일:줄`로 최대 10개. 0개면 `unlinked: no-match`. 웹에서 큐나 다른 서버로 넘어가는 이름이 이 repo에 없다는 뜻일 수 있다. 버리지 않고 남겨서 `get`이 보여 준다.
 
 ### 6.7 읽기 3단계
@@ -518,7 +518,7 @@ $ brain get pr:1121
 |---|---|---|
 | `coverage:` | `complete` | 볼 수 있는 소스를 다 봤고 잘린 것이 없다 |
 | | `truncated` | 결과 개수나 후보 상한(§6.7)에 걸렸다. `--cursor N` 또는 `--from N`으로 이어 본다 |
-| | `partial · <이유>` | 빠진 소스가 있다. 이유: `github not synced`, `last github sync failed`, `N PRs have >3000 files`(경로가 들어간 질의), `N refs not linked yet`(경로·심볼·route로 거는 질의에서 `pending` 또는 `ambiguous: budget` refs가 있을 때), Phase 0의 `unresolved imports`. 결과가 0개여도 붙는다 |
+| | `partial · <이유>` | 빠진 소스가 있다. 이유: `github not synced`, `last github sync failed`, `N PRs have >3000 files`(경로가 들어간 질의), `N refs not linked yet`(경로·심볼·route로 거는 질의에서 `pending` refs(상한 초과 `budget` 포함)가 있을 때), Phase 0의 `unresolved imports`. 결과가 0개여도 붙는다 |
 | `freshness:` 코드 | `code @a = HEAD (up to date)` | 인덱스 커밋과 HEAD가 같고 작업 트리에 바뀐 추적 파일이 없다 |
 | | `code @a · HEAD @b · 14 commits behind · 37 files changed` | `git rev-list --count a..b`, Phase 0의 바뀐 파일 수 |
 | | `code @a · HEAD @b · diverged` | 인덱스 커밋이 HEAD의 조상이 아니다 |

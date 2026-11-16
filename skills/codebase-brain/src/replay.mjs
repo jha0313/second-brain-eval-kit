@@ -10,7 +10,9 @@
 //                                               | { "status": 200, "bodyFile": "pulls-2.json" } ] } ] }
 //   Each call to a route takes the next response; the last one repeats. An unmatched request gets 404
 //   { "message": "replay: no route" } and is listed in transport.unmatched.
-import { readFileSync } from 'node:fs';
+//   requests.log  written here: one line per request, "METHOD <full URL>" (+ " unmatched"); headers are never written,
+//                 so black-box tests can check the host and path of every request without seeing the token.
+import { readFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sameQuery = (a, b) => {
@@ -29,6 +31,7 @@ export function replayTransport(dir) {
     const key = `${method} ${u.pathname}${u.search}`;
     requests.push(key);
     const route = routes.find((r) => r.path === u.pathname && sameQuery(r.query, query));
+    appendFileSync(join(dir, 'requests.log'), `${method} ${url}${route ? '' : ' unmatched'}\n`, { mode: 0o600 });
     if (!route) {
       unmatched.push(key);
       return { status: 404, headers: { get: () => null }, json: async () => ({ message: 'replay: no route' }) };

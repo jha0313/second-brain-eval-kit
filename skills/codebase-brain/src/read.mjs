@@ -18,12 +18,15 @@ import { flagSuspicious } from './sanitize.mjs';
  *
  * @typedef {{ kind?: string[], state?: string[], path?: string, author?: string, since?: string, limit?: number, cursor?: number }} SearchOpts
  *   kind values: pr, issue, review, comment, doc, change, changelog, commit, vault (review/comment narrow which children
- *   may match; rows still roll up to the parent pr/issue). state values: open, merged, closed-unmerged, closed.
+ *   may match; rows still roll up to the parent pr/issue). review = reviews + inline review comments; comment = inline
+ *   review comments + conversation (issue) comments. state values: open, merged, closed-unmerged, closed; closed means
+ *   what GitHub means, not open (an issue closed, a PR merged or closed unmerged).
  *
  * @typedef {{
  *   ptr: string, type: 'pr'|'issue'|'doc'|'change'|'changelog'|'vault'|'commit',
  *   origin: 'github'|'repo'|'vault', state: string|null, date: string|null, assoc: string|null,
  *   matched: string[],                                   // child pointers that matched (max 3): review:…, rc:…, ic:…
+ *   flags: string[],                                     // 'suspicious' (the row or a matched child), 'files-truncated'
  *   untrusted: { title: string, snippet: string, author: string|null }
  * }} SearchRow
  *
@@ -32,6 +35,7 @@ import { flagSuspicious } from './sanitize.mjs';
  *   pathQuery: boolean,           // --path was given
  *   pathRefsPending: number,      // refs that could match --path but are pending / ambiguous: budget / stale build
  *   filesTruncated: number,       // PRs with >3,000 files (their file list is incomplete)
+ *                                 // these two count toward coverage only when pathQuery is true (answer.coverage)
  *   githubPresent: boolean        // github.db exists
  * }} ReadFacts
  *
@@ -44,6 +48,7 @@ import { flagSuspicious } from './sanitize.mjs';
  *   ptr: string, type: 'review'|'rc'|'ic', depth: 0|1, state: string|null, date: string|null, assoc: string|null,
  *   position: null | { side: string|null, startSide: string|null, start: number|null, end: number|null, commit: string|null,
  *                      outdated: boolean, originalStart: number|null, originalEnd: number|null, originalCommit: string|null },
+ *   flags: string[],
  *   untrusted: { author: string|null, firstLine: string, path: string|null }
  * }} ThreadEntry
  *
@@ -52,11 +57,14 @@ import { flagSuspicious } from './sanitize.mjs';
  *   dates: { created: string|null, updated: string|null, closed: string|null, merged: string|null, submitted: string|null },
  *   merge: { sha: string|null, commitPtr: string|null, prPtr: string|null },   // commitPtr for a PR, prPtr for a commit
  *   reviewsAt: string|null,
+ *   parent: string|null,                                                      // review / rc / ic: the pr:N or issue:N it belongs to
+ *   position: ThreadEntry['position'],                                        // rc: where the inline comment sits; else null
  *   path: string|null, lines: { a: number, b: number }|null,                  // repo memory only
  *   thread: ThreadEntry[],                                                    // PR / issue only
  *   links: { files: LinkDTO[], dirs: LinkDTO[], symbols: LinkDTO[], commits: LinkDTO[], items: LinkDTO[], routes: LinkDTO[], names: LinkDTO[] },
  *   flags: string[], redactions: number,
- *   untrusted: { title: string, author: string|null, url: string|null, base: string|null, head: string|null, firstLine: string }
+ *   untrusted: { title: string, author: string|null, url: string|null, base: string|null, head: string|null, firstLine: string,
+ *                path?: string|null }                                         // rc: the GitHub file path it comments on
  * }} GetItem
  *
  * @typedef {{ items: GetItem[], facts: ReadFacts }} GetResult
@@ -207,13 +215,15 @@ function searchRow(ctx, g) {
   if (g.key[0] === 'c') {
     const c = ctx.code.prepare('SELECT * FROM chunks WHERE id = ?').get(id);
     return { ptr: chunkPtr(c, ctx.meta.build_id), type: c.source, origin: c.source === 'vault' ? 'vault' : 'repo', state: null, date: dateOf(c.date),
-      assoc: null, matched: [], untrusted: { title: String(c.title ?? ''), snippet: snippet(textOf(c)), author: null } };
+      assoc: null, matched: [], flags: marksOf(textOf(c)).flags, untrusted: { title: String(c.title ?? ''), snippet: snippet(textOf(c)), author: null } };
   }
   const r = ctx.gh.prepare('SELECT * FROM items WHERE id = ?').get(id);
-  const ptrOf = ctx.gh.prepare('SELECT ptr FROM items WHERE id = ?');
-  const matched = g.children.sort((a, b) => b.score - a.score || cmp(a.key, b.key)).slice(0, 3).map((c) => ptrOf.get(Number(c.key.slice(1))).ptr);
+  const childOf = ctx.gh.prepare('SELECT ptr, flags FROM items WHERE id = ?');
+  const kids = g.children.sort((a, b) => b.score - a.score || cmp(a.key, b.key)).slice(0, 3).map((c) => childOf.get(Number(c.key.slice(1))));
+  const flags = flagsOf(r.flags);
+  if (!flags.includes('suspicious') && kids.some((k) => flagsOf(k.flags).includes('suspicious'))) flags.unshift('suspicious');
   return { ptr: r.ptr, type: TYPE_OF_KIND[r.kind], origin: 'github', state: stateOf(r.state), date: dateOf(g.d), assoc: enumOf(r.author_assoc),
-    matched, untrusted: { title: String(r.title ?? ''), snippet: snippet(r.body), author: strOr(r.author) } };
+    matched: kids.map((k) => k.ptr), flags, untrusted: { title: String(r.title ?? ''), snippet: snippet(r.body), author: strOr(r.author) } };
 }
 
 /** @param {Ctx} ctx @param {string} q @param {SearchOpts} [opts] @returns {SearchResult} */
@@ -271,12 +281,15 @@ function findItem(ctx, p) {
   return r;
 }
 
+const positionOf = (r) => (r.kind === 'review_comment' ? { side: enumOf(r.side), startSide: enumOf(r.start_side), start: r.start_line ?? null,
+  end: r.line ?? null, commit: hexOf(r.commit_id), outdated: r.line == null, originalStart: r.original_start_line ?? null,
+  originalEnd: r.original_line ?? null, originalCommit: hexOf(r.original_commit_id) } : null);
+
 function threadEntry(r, depth) {
   const rc = r.kind === 'review_comment';
   return {
     ptr: r.ptr, type: TYPE_OF_KIND[r.kind], depth, state: stateOf(r.state), date: dateOf(r.submitted_at ?? r.created_at), assoc: enumOf(r.author_assoc),
-    position: rc ? { side: enumOf(r.side), startSide: enumOf(r.start_side), start: r.start_line ?? null, end: r.line ?? null, commit: hexOf(r.commit_id),
-      outdated: r.line == null, originalStart: r.original_start_line ?? null, originalEnd: r.original_line ?? null, originalCommit: hexOf(r.original_commit_id) } : null,
+    position: positionOf(r), flags: flagsOf(r.flags),
     untrusted: { author: strOr(r.author), firstLine: firstLine(r.body), path: rc ? strOr(r.path) : null },
   };
 }
@@ -319,15 +332,19 @@ function getGithub(ctx, p) {
   const parent = r.kind === 'pr' || r.kind === 'issue';
   // a merge SHA counts only for a merged PR (an open PR's merge_commit_sha is GitHub's test merge)
   const sha = r.kind === 'pr' && r.state === 'merged' ? hexOf(r.merge_sha) : null;
+  // a child's parent: the PR with that number if github.db has it, else the issue (a comment on an issue)
+  const up = parent || r.parent_number == null ? null
+    : ctx.gh.prepare("SELECT ptr FROM items WHERE ptr IN (?, ?) ORDER BY kind = 'pr' DESC LIMIT 1").get(`pr:${r.parent_number}`, `issue:${r.parent_number}`);
   return {
     ptr: r.ptr, type: p.type, origin: 'github', state: stateOf(r.state), assoc: enumOf(r.author_assoc), draft: !!r.draft,
     dates: { created: dateOf(r.created_at), updated: dateOf(r.updated_at), closed: dateOf(r.closed_at), merged: dateOf(r.merged_at), submitted: dateOf(r.submitted_at) },
     merge: { sha, commitPtr: sha ? `commit:${sha.slice(0, 8)}` : null, prPtr: null },
-    reviewsAt: dateOf(r.reviews_at), path: null, lines: null,
+    reviewsAt: dateOf(r.reviews_at), parent: up?.ptr ?? null, position: positionOf(r), path: null, lines: null,
     thread: parent ? thread(ctx.gh, r.number) : [],
     links: links(ctx.gh, r.ptr, ctx.meta.build_id),
     flags: flagsOf(r.flags), redactions: Number(r.redactions) || 0,
-    untrusted: { title: String(r.title ?? ''), author: strOr(r.author), url: strOr(r.url), base: strOr(r.base), head: strOr(r.head), firstLine: firstLine(r.body) },
+    untrusted: { title: String(r.title ?? ''), author: strOr(r.author), url: strOr(r.url), base: strOr(r.base), head: strOr(r.head), firstLine: firstLine(r.body),
+      ...(r.kind === 'review_comment' && { path: strOr(r.path) }) },
   };
 }
 
@@ -340,13 +357,16 @@ function getMemory(ctx, p) {
     ptr: formatPtr(p), type: p.type, origin: p.type === 'vault' ? 'vault' : 'repo', state: null, assoc: null, draft: false,
     dates: { created: dateOf(c.date), updated: null, closed: null, merged: null, submitted: null },
     merge: { sha, commitPtr: null, prPtr: pr?.ptr ?? null },
-    reviewsAt: null, path: commit ? null : p.path, lines: commit ? null : { a: c.start_line, b: c.end_line },
+    reviewsAt: null, parent: null, position: null, path: commit ? null : p.path, lines: commit ? null : { a: c.start_line, b: c.end_line },
     thread: [], links: emptyLinks(), ...marksOf(c.body),
     untrusted: { title: String(c.title ?? ''), author: null, url: null, base: null, head: null, firstLine: firstLine(textOf(c)) },
   };
 }
 
-/** @param {Ctx} ctx @param {string[]} ptrs at most 5 @returns {GetResult} @throws {PtrError | NotFoundError | StalePtrError} */
+/**
+ * @param {Ctx} ctx @param {string[]} ptrs at most 5 @returns {GetResult}
+ * @throws {PtrError | NotFoundError | StalePtrError | BrainError} BrainError code 'too-many-pointers' for 6 or more
+ */
 export function get(ctx, ptrs) {
   if (ptrs.length > MAX_GET) throw new BrainError('too-many-pointers', `get takes at most ${MAX_GET} pointers (got ${ptrs.length})`);
   const parsed = ptrs.map(parsePtr);

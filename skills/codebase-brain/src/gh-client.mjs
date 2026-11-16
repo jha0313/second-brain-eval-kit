@@ -9,7 +9,8 @@
 // - 401 -> GhError('auth'), 403 (not rate limit) -> 'forbidden', 404 -> 'not-found', anything unparsable -> 'protocol'
 // - the token never appears in an error, a log line, or a return value; HTTP errors are logged without headers
 // - per_page=100 everywhere; Link rel="next" is followed only where the stream is not keyset-paged
-// - every request is GET under https://api.github.com/repos/{owner}/{repo}; nothing else is fetched (R13)
+// - every request is GET on https://api.github.com under /repos/{owner}/{repo}/ or /repositories/{id}/ (id from getRepo(),
+//   the form GitHub's Link headers use); any other host or path, Link or redirect, is GhError('protocol') (R13, plan A14)
 //
 // EXACT requests (replay fixtures in lanes G, S, I match these query key sets exactly; order does not matter).
 // B = /repos/{owner}/{repo}. since = ISO 8601 UTC to the second, "2026-11-15T09:58:00Z" (no milliseconds).
@@ -22,7 +23,8 @@
 //     since: omitted when null (first sync). page: omitted for page 1; present (2, 3, …) only while paging inside a
 //     same-second batch (R4). Link headers are ignored on these three streams.
 //   reviews(n) page 1       GET B/pulls/{n}/reviews       { per_page: 100 }      then Link rel="next" as sent
-//   files(n) page 1         GET B/pulls/{n}/files         { per_page: 100 }      then Link rel="next" as sent, max 30 pages
+//   files(n) page 1         GET B/pulls/{n}/files         { per_page: 100 }      then Link rel="next" as sent, max 30 pages;
+//     truncated = 3,000 files came back (GitHub's cap, which may end with no next link) or a next link remains after page 30
 // Request headers: Accept: application/vnd.github+json · X-GitHub-Api-Version: 2022-11-28 ·
 //   User-Agent: codebase-brain · Authorization: Bearer <token> (only when token is non-null)
 //
