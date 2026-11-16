@@ -84,12 +84,29 @@ test('false positives stay untouched: SHA, UUID, base64 image, env expressions, 
   }
 });
 
+test('a literal is masked whatever it looks like when quoted or in a URL; text after a marker is not shielded (Codex review)', () => {
+  for (const [text, secret] of [['password = "true"', 'true'], ['password="!!!"', '!!!'], ['password="string"', 'string'],
+    ['token="process.env.actual-secret"', 'actual-secret'], ['https://admin:false@db.internal/app', 'false'], ['password: true', 'true']]) {
+    const r = mask(text);
+    assert.ok(r.redactions >= 1, text);
+    assert.equal(r.text.includes(secret), false, `${text} -> ${r.text}`);
+  }
+  const gh = 'gh' + 'p_' + R('A1b2', 9);
+  for (const text of [`password="${gh}:remaining-pass"`, `https://u:${gh}-remaining-pass@host`, `Authorization: Bearer ${gh}.remaining-pass`]) {
+    const r = mask(text);
+    assert.equal(r.text.includes(gh) || r.text.includes('remaining-pass'), false, `${text} -> ${r.text}`);
+    assert.equal(mask(r.text).redactions, 0);
+  }
+  assert.equal(mask('token: string').redactions, 0);                                    // bare type annotation stays
+});
+
 test('line count is preserved and masking is idempotent (property, seeded)', () => {
   let seed = 7;
   const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
   const parts = ['\n', '\r', '\r\n', '\u2028', '\u2029', '\u0085', '\x1b[31m', '\x1b]0;t\x07', '\x1b', '\x9b', '\u200b', '\u202e', ' ', '\t',
     'a', '9', '"', "'", '`', ':', '=', '@', '/', '.', 'token', 'password', 'Authorization: Bearer ', 'https://', 'u:p',
-    '-----BEGIN ' + 'PRIVATE KEY-----', '-----END ' + 'PRIVATE KEY-----', 'gh' + 'p_', 'A1b2A1b2A1b2', 'AK' + 'IA', 'sk-', 'ey' + 'J', 'xo' + 'xb-'];
+    '-----BEGIN ' + 'PRIVATE KEY-----', '-----END ' + 'PRIVATE KEY-----', 'gh' + 'p_', 'A1b2A1b2A1b2', 'AK' + 'IA', 'sk-', 'ey' + 'J', 'xo' + 'xb-',
+    '[REDACTED:assignment]', '[REDACTED:github-token:1a2b]', ']', ')', ',', '$'];
   for (let i = 0; i < 5000; i++) {
     let s = '';
     for (let j = 1 + Math.floor(rnd() * 40); j > 0; j--) s += parts[Math.floor(rnd() * parts.length)];
@@ -155,6 +172,34 @@ test('sections: blank lines are dropped by slicing, the first body line keeps it
     assert.ok(body[0].trim() && body.at(-1).trim());
   }
   assert.equal(out[0].bodyLine, 3);
+});
+
+test('sweepSecrets: two secrets whose 4-hex suffixes collide still get two graph keys (Codex review)', () => {
+  const secret = (n) => 'gh' + 'p_' + String(n).padStart(36, 'Q');
+  const seen = new Map();
+  let pair = null;
+  for (let n = 0; !pair; n++) {
+    const suffix = /:([0-9a-f]{4})\]/.exec(sanitizeIdent(secret(n)))[1];
+    if (seen.has(suffix)) pair = [seen.get(suffix), n]; else seen.set(suffix, n);
+  }
+  const [a, b] = pair.map(secret);
+  assert.equal(sanitizeIdent(`src/${a}.ts`), sanitizeIdent(`src/${b}.ts`));              // the pure function alone collides
+  const path = join(mkdtempSync(join(tmpdir(), 'sweep-col-')), 'code.db');
+  const db = createDb(path);
+  inTransaction(db, () => {
+    for (const s of [a, b]) {
+      db.prepare("INSERT INTO nodes(key, kind, name, path) VALUES (?, 'file', ?, ?)").run(`src/${s}.ts`, `${s}.ts`, `src/${s}.ts`);
+      db.prepare("INSERT INTO edges(src, dst, kind, path, line, col) VALUES (1, 1, 'call', ?, 1, 0)").run(`src/${s}.ts`);
+    }
+  });
+  inTransaction(db, () => sweepSecrets(db));                                              // no UNIQUE failure
+  const keys = db.prepare('SELECT key FROM nodes ORDER BY id').all().map((r) => r.key);
+  assert.equal(new Set(keys).size, 2);
+  assert.ok(keys.every(isRedacted));
+  assert.deepEqual(db.prepare('SELECT path FROM edges ORDER BY rowid').all().map((r) => r.path), keys);   // each edge follows its own file
+  db.close();
+  const bytes = readFileSync(path);
+  assert.equal(occurrences(bytes, a) + occurrences(bytes, b), 0);
 });
 
 test('sweepSecrets: canaries planted in nodes, edges, unresolved, links, meta, chunks and FTS are gone from the file bytes', () => {

@@ -32,18 +32,23 @@ export function normalize(text) {
 
 // ---------- masking ----------
 
-// Values that are not literals (design §6.4 "남기는 것"): code that reads a secret, placeholders, type names.
-const KEEP = [
-  /^\[REDACTED:/,                                                                       // masked already
-  /^(?:process\.env\b|os\.environ\b|ENV\[|ENV\.fetch\b|Deno\.env\b|import\.meta\.env\b|\$\{|\{\{)/,   // env lookups, ${{ secrets.X }}, ${VAR}, templates
-  /^\$[A-Z_][A-Z0-9_]*$/,                                                               // $TOKEN (an env var, not a literal)
-  /^(?:[\w$]+\.)*get_?env\s*\(/i,                                                       // getenv("X"), os.getenv(…), System.getenv(…)
-  /^<|^(?:x{3,}|\*{3,}|\.{3}|…|changeme)$/i,                                            // <token>, xxx, ***, changeme
-  /^(?:string|str|number|int|bool|boolean|bytes|null|none|nil|undefined|true|false|any|unknown)$/i,   // `token: string`
-  /^(?:await|new|yield|typeof)$|^(?:this|self)\./,                                     // `const token = await …`, `token: this.token`
-  /^[^A-Za-z0-9]*$/,                                                                    // no literal at all: "{", "|"
+// Values that are not literals (design §6.4 "남기는 것"). Anywhere: interpolation and placeholders.
+const PLACEHOLDER = [
+  /^(?:\$\{|\{\{|<)/,                                                                   // ${{ secrets.X }}, ${VAR}, {{ .Values.x }}, <token>
+  /^\$[A-Z_][A-Z0-9_]*$/,                                                               // $TOKEN
+  /^(?:x{3,}|\*{3,}|\.{3}|…|changeme)$/i,                                               // xxx, ***, changeme
 ];
-const keep = (v) => KEEP.some((re) => re.test(v));
+// Unquoted only: code that reads a secret or annotates a type. Inside quotes the same text is a literal.
+const CODE = [
+  /^(?:process\.env\b|os\.environ\b|ENV\[|ENV\.fetch\b|Deno\.env\b|import\.meta\.env\b)/,
+  /^(?:[\w$]+\.)*get_?env\s*\(/i,                                                       // getenv("X"), os.getenv(…), System.getenv(…)
+  /^(?:string|str|number|int|bool|boolean|bytes|any|unknown|null|none|nil|undefined)$/i,   // `token: string`
+  /^(?:await|new|yield|typeof)$|^(?:this|self)\./,                                     // `const token = await …`, `token: this.token`
+  /^[{[(|>-]+$/,                                                                        // structure, not a value: "{", "|", ">-"
+];
+// a value that is nothing but markers (and closing punctuation) was masked already; text around a marker is a literal
+const MASKED = /^(?:\[REDACTED:[a-z-]+(?::[0-9a-f]{4})?\])+[,;)\]}"'\x60]*$/;
+const notLiteral = (v, quoted) => !v || MASKED.test(v) || PLACEHOLDER.some((re) => re.test(v)) || (!quoted && CODE.some((re) => re.test(v)));
 
 // "keyword <sep> value": value is a quoted string or a bare token up to whitespace (design: any literal, any length)
 const SEP = String.raw`(["']?)([ \t]*\??[ \t]*(?::=|=(?![=>])|:(?!:))[ \t]*)`;
@@ -66,16 +71,28 @@ const TOKEN_RULES = [
   ['api-key', /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}|(?<![A-Za-z0-9])[sr]k_live_[A-Za-z0-9]{10,}|(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g, 0],
   ['jwt', /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, 0],
   // scheme://user:pass@host -> user:pass (the last @ before the path, so a raw @ in the password is covered)
-  ['url-credential', /(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)([^\s/?#@:]*:([^\s/?#]*))@/gi, 2, (m) => !keep(m[3])],
+  ['url-credential', /(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)([^\s/?#@:]*:([^\s/?#]*))@/gi, 2, (m) => !notLiteral(m[3], true)],
   // Authorization: Bearer|Basic|token <value>; a bare header value only when it looks like a token
   ['bearer', /(\bAuthorization["']?[ \t]*[:=][ \t]*["']?)((?:Bearer|Basic|token|Digest)[ \t]+)?([^\s"',;]+)/gi, 3,
-    (m) => !keep(m[3]) && (m[2] || (m[3].length >= 8 && /\d/.test(m[3])))],
+    (m) => !notLiteral(m[3], true) && (m[2] || (m[3].length >= 8 && /\d/.test(m[3])))],
   ['bearer', /(\bBearer[ \t]+)([A-Za-z0-9._~+/=-]{8,})/gi, 2, (m) => /\d/.test(m[2])],
 ];
 
-const hash4 = (s) => createHash('sha256').update(s).digest('hex').slice(0, 4);
+const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 const plainMark = (kind) => `[REDACTED:${kind}]`;
-const hashMark = (kind, secret) => `[REDACTED:${kind}:${hash4(secret)}]`;
+// Identifier marker: 4 hex of the secret's hash. With `taken` (one sweep = one code.db), a marker that another secret
+// already holds moves to the next salted hash, so two secrets never share a graph key. Only hashes are kept.
+const identMark = (taken) => (kind, secret) => {
+  const id = sha256(secret);
+  let marker;
+  for (let salt = 0; salt < 1000; salt++) {
+    marker = `[REDACTED:${kind}:${(salt ? sha256(`${salt}:${secret}`) : id).slice(0, 4)}]`;
+    const owner = taken?.get(marker);
+    if (!taken || owner === id) return marker;
+    if (owner === undefined) { taken.set(marker, id); return marker; }
+  }
+  return marker;
+};
 
 // The rules, in order. mark(kind, secret) -> marker. Every rule keeps line breaks where they are.
 function maskWith(input, mark) {
@@ -93,7 +110,7 @@ function maskWith(input, mark) {
     text = text.replace(re, (...args) => {
       const m = args.slice(0, -2);                        // [match, ...groups]
       const secret = m[group];
-      if (secret === undefined || secret.includes('[REDACTED:') || (ok && !ok(m))) return m[0];
+      if (secret === undefined || MASKED.test(secret) || (ok && !ok(m))) return m[0];
       if (!group) return hit(kind, secret);
       const at = m[0].indexOf(secret, m.slice(1, group).join('').length);
       return m[0].slice(0, at) + hit(kind, secret) + m[0].slice(at + secret.length);
@@ -103,9 +120,10 @@ function maskWith(input, mark) {
     text = text.replace(re, (all, key, quote, sep, value) => {
       const q = /^["'\x60]/.test(value) && value.length > 1 && value.at(-1) === value[0];
       let core = q ? value.slice(1, -1) : value;
+      if (MASKED.test(core)) return all;                  // before the tail is cut: "]" may close a marker
       let tail = '';
       if (!q) { const t = /[,;)\]}"'\x60]+$/.exec(core); if (t && t.index > 0) { tail = t[0]; core = core.slice(0, t.index); } }
-      if (!core || keep(core)) return all;
+      if (notLiteral(core, q)) return all;
       return key + quote + sep + (q ? value[0] : '') + hit(kind, core) + (q ? value[0] : '') + tail;
     });
   }
@@ -142,10 +160,12 @@ export function sanitize(text) {
 export function sanitizeLine(s) { return sanitize(s).text.replace(/\n/g, ' '); }
 
 /** A graph identifier (repo path, symbol name, import spec): masked with a collision-safe hash suffix. */
-export function sanitizeIdent(s) {
+export function sanitizeIdent(s) { return maskIdent(s, null); }
+
+// an identifier is a key: it changes only when it holds a secret (the same secret always gives the same marker)
+function maskIdent(s, taken) {
   const raw = String(s ?? '');
-  // an identifier is a key: it changes only when it holds a secret (the same secret always gives the same marker)
-  const m = maskWith(normalize(raw), hashMark);
+  const m = maskWith(normalize(raw), identMark(taken));
   return m.redactions ? m.text : raw;
 }
 
@@ -165,9 +185,10 @@ const PROSE = { chunks: new Set(['title', 'body']) };
 export function sweepSecrets(db) {
   let rows = 0;
   const memo = new Map();                                    // edges.path repeats once per edge: mask each value once
+  const taken = new Map();                                   // marker -> hash of its secret, for this database
   const ident = (v) => {
     if (!MAY_HOLD_SECRET.test(v)) return v;
-    if (!memo.has(v)) memo.set(v, sanitizeIdent(v));
+    if (!memo.has(v)) memo.set(v, maskIdent(v, taken));
     return memo.get(v);
   };
   const prose = (v) => (MAY_HOLD_SECRET.test(v) ? sanitize(v).text : v);
