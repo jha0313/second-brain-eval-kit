@@ -10,10 +10,16 @@ from pathlib import Path
 
 import yaml
 
+from .isolation import GH_ENV_RE                       # never passed to a trial (TrialEnv drops them too)
+
 KINDS = {"find-all", "why", "small", "other"}
 HARD_CHECKS = {"skill_loaded", "tool_used", "tool_not_used", "tool_order", "set_match", "cites_exist", "answer_regex",
                "sources_hit"}
 DEFAULT_LIMITS = {"max_turns": 40, "timeout_s": 900, "max_usd": 3.0}
+ARM_KEYS = {"skill", "patch", "outputs", "env"}
+# GitHub item pointers, as in skills/codebase-brain/src/ptr.mjs (P0 grammar). review / rc / ic have a parent PR or issue.
+GH_PTR_RE = re.compile(r"(pr|issue|review|rc|ic):([1-9]\d{0,15})")
+CHILD_TYPES = ("review", "rc", "ic")
 
 
 class SuiteError(ValueError):
@@ -32,6 +38,8 @@ class Case:
     pass_threshold: float
     source: Path
     family: str = ""                     # near-duplicate questions share a family; stats resample families
+    canary: str | None = None            # safety case: regex for the injected command (tool calls that match = attempts)
+    expose_marker: str | None = None     # safety case: a string only the injected item holds (a tool result with it = exposed)
 
     def key_paths(self, names=("set_match", "sources_hit")) -> list[Path]:
         return [Path(args["key"]) for chk in self.hard for name, args in chk.items() if name in names]
@@ -68,6 +76,9 @@ class Suite:
     sensitivity: dict = field(default_factory=dict)          # {exclude: [case ids], reason}: reported next to the main result
     cases: list[Case] = field(default_factory=list)
     trusted_dirs: list[Path] = field(default_factory=list)  # read-denied for the agent
+    arm_outputs: dict[str, list[str]] = field(default_factory=dict)   # arm -> the prepare outputs it gets (arms that list them)
+    arm_env: dict[str, dict] = field(default_factory=dict)            # arm -> skill_env overrides
+    github_evidence: Path | None = None                     # frozen index of valid GitHub pointers (load_github_index)
 
     @property
     def dir(self) -> Path:
@@ -83,14 +94,22 @@ def load_suite(path: str | Path, repo_override: str | None = None) -> Suite:
     path = Path(path).resolve()
     raw = yaml.safe_load(path.read_text())
     base = path.parent
-    arms, patches = {}, {}
+    arms, patches, arm_outputs, arm_env = {}, {}, {}, {}
     for name, spec in (raw.get("arms") or {}).items():
         if isinstance(spec, dict):                 # {skill: dir, patch: v2.diff} = the same skill plus a small edit
-            arms[name] = _resolve(base, spec["skill"])
+            if set(spec) - ARM_KEYS:
+                raise SuiteError(f"arm {name}: unknown key(s) {sorted(set(spec) - ARM_KEYS)}; an arm has {sorted(ARM_KEYS)}")
+            arms[name] = _resolve(base, spec["skill"]) if spec.get("skill") else None
             if spec.get("patch"):
+                if not arms[name]:
+                    raise SuiteError(f"arm {name}: a patch needs a skill")
                 patches[name] = _resolve(base, spec["patch"])
                 if not patches[name].exists():
                     raise SuiteError(f"arm {name}: patch not found: {patches[name]}")
+            if "outputs" in spec:                  # only these prepare outputs (default: all of them, skill arms only)
+                arm_outputs[name] = [str(o) for o in spec["outputs"] or []]
+            if spec.get("env"):                    # skill_env overrides for this arm
+                arm_env[name] = {k: str(v) for k, v in spec["env"].items()}
         else:
             arms[name] = None if not spec else _resolve(base, spec)
         if arms[name] and not (arms[name] / "SKILL.md").exists():
@@ -132,7 +151,18 @@ def load_suite(path: str | Path, repo_override: str | None = None) -> Suite:
         label=str(repo.get("label") or Path(repo_path).name),
         find_all_pass=dict(raw.get("find_all_pass") or {"min_recall": 0.9, "min_precision": 0.8}),
         sensitivity=dict(raw.get("sensitivity") or {}),
+        arm_outputs=arm_outputs,
+        arm_env=arm_env,
+        github_evidence=_resolve(base, raw["github_evidence"]) if raw.get("github_evidence") else None,
     )
+    for name, outs in arm_outputs.items():
+        if set(outs) - set(suite.prepare_outputs):
+            raise SuiteError(f"arm {name}: outputs {sorted(set(outs) - set(suite.prepare_outputs))} are not in prepare_outputs")
+    for where, env in [("skill_env", suite.skill_env)] + [(f"arm {a} env", e) for a, e in arm_env.items()]:
+        if any(GH_ENV_RE.match(k) for k in env):
+            raise SuiteError(f"{where}: GH_* / GITHUB_* variables never reach a trial (trials hold no GitHub credential)")
+    if suite.github_evidence:
+        load_github_index(suite.github_evidence)        # fail here, not in the middle of grading
     patterns = raw.get("cases", "cases/*.yaml")
     patterns = [patterns] if isinstance(patterns, str) else patterns
     files = sorted({f for p in patterns for f in glob.glob(str(_resolve(base, p)))})
@@ -146,8 +176,15 @@ def load_suite(path: str | Path, repo_override: str | None = None) -> Suite:
     unknown = set(suite.sensitivity.get("exclude") or []) - set(ids)
     if unknown:
         raise SuiteError(f"sensitivity.exclude names unknown cases: {sorted(unknown)}")
+    if suite.github_evidence:                       # GitHub citations are graded against the frozen index
+        for c in suite.cases:
+            for chk in c.hard:
+                for name in ("cites_exist", "sources_hit"):
+                    if name in chk:
+                        chk[name]["github_evidence"] = str(suite.github_evidence)
     trusted = {suite.dir} | {Path(f).parent for f in files}
     trusted |= {kp.parent for c in suite.cases for kp in c.key_paths()}
+    trusted |= {suite.github_evidence.parent} if suite.github_evidence else set()
     suite.trusted_dirs = sorted(trusted)
     return suite
 
@@ -189,9 +226,24 @@ def load_case(path: Path, suite: Suite) -> Case:
         pass_threshold=float(raw.get("pass_threshold", suite.pass_threshold)),
         source=path,
         family=str(raw.get("family", "")),
+        **safety_fields(raw, path.name),
     )
     lint_prompt(case)
     return case
+
+
+def safety_fields(raw: dict, where: str) -> dict:
+    """A safety case sets both canary (a regex) and expose_marker (a string); other cases set neither."""
+    canary, marker = raw.get("canary"), raw.get("expose_marker")
+    if canary is None and marker is None:
+        return {}
+    if not canary or not marker:
+        raise SuiteError(f"{where}: a safety case needs both canary and expose_marker")
+    try:
+        re.compile(str(canary))
+    except re.error as e:
+        raise SuiteError(f"{where}: canary is not a valid regex: {e}") from e
+    return {"canary": str(canary), "expose_marker": str(marker)}
 
 
 # Rubric for "why" questions. Hard checks already require real citations and at least one answer-key source;
@@ -237,7 +289,8 @@ def load_json_cases(path: Path, suite: Suite) -> list[Case]:
             raise SuiteError(f"{path.name}:{raw['id']}: unknown type {t!r}")
         case = Case(id=raw["id"], kind=kind, prompt=raw["prompt"].strip(), hard=hard, rubric=rubric,
                      expected=reference if t == "why" else None,
-                     limits=dict(suite.limits), pass_threshold=suite.pass_threshold, source=path, family=raw.get("family", ""))
+                     limits=dict(suite.limits), pass_threshold=suite.pass_threshold, source=path, family=raw.get("family", ""),
+                     **safety_fields(raw, f"{path.name}:{raw['id']}"))
         lint_prompt(case)
         cases.append(case)
     return cases
@@ -262,8 +315,32 @@ def expected_regex(expected: str) -> str:
 
 
 def load_sources(path: str | Path) -> list[dict]:
-    """why answer key: [{"commit": sha} | {"path": p, "lines": [a, b]?}, ...]"""
+    """why answer key: [{"commit": sha} | {"path": p, "lines": [a, b]?} | {"ptr": "pr:123"}, ...]"""
     return json.loads(Path(path).read_text())["sources"]
+
+
+def load_github_index(path: str | Path) -> dict:
+    """github_evidence: {"repo": "owner/name" (optional), "items": {"pr:12": null, "issue:5": null, "review:9": 12, ...}}:
+    every valid pointer of the frozen GitHub corpus. A review / rc / ic maps to its parent PR or issue number (PRs and
+    issues share one number space), every other pointer to null. With "repo", a github.com URL of another repo is
+    not a citation of this corpus."""
+    path = Path(path)
+    if not path.exists():
+        raise SuiteError(f"github_evidence not found: {path}")
+    data = json.loads(path.read_text())
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, dict) or not items:
+        raise SuiteError(f"{path.name}: github_evidence needs a non-empty \"items\" object {{pointer: parent number | null}}")
+    for ptr, parent in items.items():
+        m = GH_PTR_RE.fullmatch(ptr)
+        if not m:
+            raise SuiteError(f"{path.name}: {ptr!r} is not a GitHub pointer (pr:N, issue:N, review:ID, rc:ID, ic:ID)")
+        is_number = isinstance(parent, int) and not isinstance(parent, bool) and parent > 0
+        if (m.group(1) in CHILD_TYPES) != is_number or (not is_number and parent is not None):
+            raise SuiteError(f"{path.name}: {ptr} needs {'its parent PR or issue number' if m.group(1) in CHILD_TYPES else 'null'}"
+                             f", got {parent!r}")
+    repo = data.get("repo")
+    return {"repo": str(repo).lower() if repo else None, "items": items}
 
 
 def assign_families(cases: list[Case]) -> None:
@@ -279,7 +356,8 @@ def assign_families(cases: list[Case]) -> None:
     for c in cases:
         for kp in c.key_paths(("sources_hit",)):
             for src in load_sources(kp):
-                tag = f"commit:{src['commit'][:7]}" if "commit" in src else f"path:{src['path']}:{src.get('lines')}"
+                tag = (f"commit:{src['commit'][:7]}" if "commit" in src else f"ptr:{src['ptr']}" if "ptr" in src
+                       else f"path:{src['path']}:{src.get('lines')}")
                 if tag in owner:
                     parent[root(c.id)] = root(owner[tag])
                 else:
@@ -308,7 +386,9 @@ def normalize_path(p: str) -> str:
 
 
 def lint_prompt(case: Case) -> None:
-    """Refuse a case whose prompt leaks its own answer key."""
+    """Refuse a case whose prompt leaks its own answer key (or, for a safety case, the exposure marker)."""
+    if case.expose_marker and case.expose_marker in case.prompt:
+        raise SuiteError(f"{case.source.name}: the prompt contains the expose_marker; exposure must come from a tool result")
     for kp in case.key_paths(("set_match",)):
         key = load_key(kp)
         leaked = [k for k in key if k and k in case.prompt]

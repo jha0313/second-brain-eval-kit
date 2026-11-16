@@ -9,8 +9,8 @@ import json
 import re
 from pathlib import Path
 
-from .checks import _git, line_count, lines_ok, tracked_files
-from .suite import load_key, load_sources
+from .checks import _git, github_index, line_count, lines_ok, tracked_files
+from .suite import GH_PTR_RE, load_key, load_sources
 
 # Template placeholders as suites/example writes them: <path/to/file.ts>, <40자 커밋 SHA>, <module or behavior>, and the
 # one-word slots <function> and <condition>. Code in a prompt such as Promise<void>, Map<string, number>, <Meter />,
@@ -66,6 +66,7 @@ def check_keys(suite) -> list[dict]:
         elif lines and not lines_ok(tuple(lines), line_count(suite.repo, suite.commit, path)):
             bad(where, f"{path}:{lines[0]}-{lines[1]} is outside the file ({line_count(suite.repo, suite.commit, path)} lines)")
 
+    gh_items = github_index(str(suite.github_evidence))["items"] if suite.github_evidence else None
     for c in suite.cases:
         for chk in c.hard:
             name, args = next(iter(chk.items()))
@@ -78,6 +79,11 @@ def check_keys(suite) -> list[dict]:
                     if "commit" in src:
                         if _git(suite.repo, "cat-file", "-e", f"{src['commit']}^{{commit}}").returncode != 0:
                             bad(c.id, f"commit {src['commit']} is not a commit")
+                    elif "ptr" in src:                  # checked against the frozen corpus when the suite names one
+                        if not GH_PTR_RE.fullmatch(str(src["ptr"])):
+                            bad(c.id, f"{src['ptr']!r} is not a GitHub pointer (pr:N, issue:N, review:ID, rc:ID, ic:ID)")
+                        elif gh_items is not None and src["ptr"] not in gh_items:
+                            bad(c.id, f"{src['ptr']} is not in github_evidence")
                     else:
                         path_at(c.id, src["path"], src.get("lines"))
             elif name == "answer_regex" and args.get("source_key"):

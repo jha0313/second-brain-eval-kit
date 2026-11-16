@@ -89,6 +89,9 @@ def _excerpts(case, traj, repo, commit, max_cites: int = 10, budget: int = 24000
     ref = []
     for kp in case.key_paths(("sources_hit",)):
         for src in load_sources(kp):
+            if "ptr" in src:                       # a GitHub item: the harness has no copy of its text
+                ref.append(f"--- {src['ptr']}\n(GitHub item; its text is not shown here)")
+                continue
             cite = {"commit": src["commit"]} if "commit" in src else {"path": src["path"], "lines": tuple(src["lines"]) if src.get("lines") else None}
             ref.append(f"--- {src.get('commit') or src['path']}\n{excerpt(repo, commit, cite, before=0, after=12)[:2500]}")
     if ref:
