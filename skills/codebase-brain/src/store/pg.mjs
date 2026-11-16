@@ -5,9 +5,10 @@
 // - Visible at run R: valid_from <= R AND (valid_to IS NULL OR valid_to > R); chunks and refs follow their revision.
 // - Rows keep the Phase 1 SQLite shapes (code.db chunks, github.db items / refs rows, as the mirror writes them) and
 //   the mirror's ids ('c' + chunk_id, 'g' + item_id), so read.mjs shapes both stores alike and ties break as on a mirror
-//   of the same run. The lists follow src/store/sqlite.mjs one by one; FTS is chunk.tsv (brain.brain_english: stop
-//   words kept and the original Porter stemmer, as FTS5's porter, sql/003) ranked by ts_rank instead of FTS5 bm25,
-//   and the trigram lists are ILIKE (pg_trgm index) for every length.
+//   of the same run. The lists follow src/store/sqlite.mjs one by one; FTS is chunk.tsv (simple over brain.fts_text:
+//   tokens and stems as FTS5's, sql/003) ranked by ts_rank instead of FTS5 bm25, and the trigram lists are ILIKE
+//   for every length: a term of 3+ characters one list part each (the pg_trgm indexes when it has a trigram and the
+//   planner takes them), a shorter one (never a trigram) in one shared scan (tr in candidates).
 // - Repo memory pointers: <source>:<path>:<a>-<b>@r<n> (rev n of item <source>:<path>). A Phase 1 @<build> pointer
 //   reads the view run when its build is that run's build, else it is stale. Vault notes are never on the server.
 import { BrainError, NotFoundError, StalePtrError } from '../errors.mjs';
@@ -32,9 +33,10 @@ function statement() {
   const params = [];
   return { params, p: (v) => { params.push(v); return `$${params.length}`; } };
 }
-// v: the run; s: its GitHub sync_state (no row: the run has no GitHub state)
+// v: the run; s: its GitHub sync_state (no row: the run has no GitHub state). refs is taken out once: state is a
+// large toasted jsonb, and rl reads refs for every ref row (Q9: decompressed per row, most of a search's time)
 const head = (runSql) => `v AS (SELECT run_id, commit_sha, published_at, sanitize_version, meta->>'build_id' AS build FROM brain.run WHERE run_id = ${runSql}),
-  s AS (SELECT st.state FROM brain.sync_state st JOIN v USING (run_id) WHERE st.source = 'github')`;
+  s AS MATERIALIZED (SELECT st.state, st.state->'refs' AS refs FROM brain.sync_state st JOIN v USING (run_id) WHERE st.source = 'github')`;
 const atRun = (p, asOf) => `coalesce(${p(asOf ?? null)}::bigint, (SELECT max(run_id) FROM brain.run))`;
 const VIEW = `(SELECT to_jsonb(v) FROM v) AS v, (SELECT state->'row' FROM s) AS sync`;
 
@@ -115,7 +117,10 @@ async function candidates(client, q, opts = {}) {
     ctes.push(`${c} AS (SELECT x.*, row_number() OVER (ORDER BY ${order}) AS o FROM (${select}) x ORDER BY o LIMIT ${CAP + 1})`);
     lists.push(`(SELECT jsonb_build_object('name', '${name}', 'rows', coalesce(jsonb_agg(jsonb_build_array(key, grp, d, ptr, flags) ORDER BY o), '[]'::jsonb)) FROM ${c})`);
   };
-  const tsq = t.ascii.length ? `websearch_to_tsquery('brain.brain_english', ${p(t.ascii.map((w) => `"${w}"`).join(' OR '))})` : null;
+  // each term through brain.fts_text as the indexed text (sql/003), then "t1" OR "t2" …; terms are [A-Za-z0-9_] only.
+  // Made once (MATERIALIZED): the lists read it as tq
+  const tsq = t.ascii.length > 0;
+  if (tsq) ctes.push(`tq AS MATERIALIZED (SELECT websearch_to_tsquery('simple', (SELECT string_agg('"' || brain.fts_text(w) || '"', ' OR ') FROM unnest(${p(t.ascii)}::text[]) w)) AS q)`);
   const P = f.path ? p(f.path) : null;
   const under = (x) => `(${x} = ${P} OR starts_with(${x}, ${P} || '/'))`;
   const seeded = t.names.length > 0;
@@ -127,13 +132,27 @@ async function candidates(client, q, opts = {}) {
       `seeds AS (SELECT id, key, kind FROM hit UNION SELECT nv.id, nv.key, nv.kind FROM hit JOIN nv ON nv.key = hit.path WHERE hit.kind <> 'file')`);
   }
 
+  // a trigram term under 3 characters never has a trigram, so each one was a scan of brain.chunk, twice (items and
+  // chunks; Q9: ~46 ms a scan). Those terms are matched in one scan instead, each title and body lowercased once: in a
+  // UTF-8 database ILIKE is lower() LIKE lower(), so every list is the same. th / hit: the terms (1-based) a chunk's
+  // title matches / its title or body matches
+  const short = t.tri.filter((s) => [...s].length < 3);
+  const shortNo = (s) => short.indexOf(s) + 1;
+  if (short.length && (f.ghKinds.length || f.sources.length)) {
+    ctes.push(`lp AS MATERIALIZED (SELECT n::int AS n, lower(x) AS p FROM unnest(${p(short.map(likeOf))}::text[]) WITH ORDINALITY u(x, n))`,
+      `tr AS MATERIALIZED (SELECT x.chunk_id, x.rev_id, x.ord, ARRAY(SELECT lp.n FROM lp WHERE x.lt LIKE lp.p) AS th,
+          ARRAY(SELECT lp.n FROM lp WHERE x.lt LIKE lp.p OR x.lb LIKE lp.p) AS hit
+        FROM (SELECT chunk_id, rev_id, ord, lower(title) AS lt, lower(body) AS lb FROM brain.chunk OFFSET 0) x
+        WHERE x.lt LIKE ANY(ARRAY(SELECT p FROM lp)) OR x.lb LIKE ANY(ARRAY(SELECT p FROM lp)))`);
+  }
+
   let pending = '0';
   if (f.ghKinds.length) {
     ctes.push(`gi AS (SELECT i.item_id AS id, i.ptr, i.kind, r.rev_id, r.state, r.author, r.source_updated_at AS updated_at, r.meta
       FROM brain.item_rev r JOIN brain.item i USING (item_id) WHERE i.origin = 'github' AND ${vis('r')})`);
     if (seeded || f.path) {
       // refs at R with their ref_link; cur: resolved against this run's build (else pending until the next relink)
-      ctes.push(`rl AS (SELECT gi.ptr, f.kind, f.target, l.status, l.reason, l.resolved_raw, coalesce(${BUILD_OF('s.state->\'refs\'', 'gi', 'f')} = v.build, false) AS cur
+      ctes.push(`rl AS (SELECT gi.ptr, f.kind, f.target, l.status, l.reason, l.resolved_raw, coalesce(${BUILD_OF('s.refs', 'gi', 'f')} = v.build, false) AS cur
         FROM gi JOIN brain.ref f ON f.rev_id = gi.rev_id LEFT JOIN brain.ref_link l ON l.ref_id = f.ref_id AND ${vis('l')} CROSS JOIN v CROSS JOIN s)`);
     }
     if (f.path) {   // sqlite.mjs pathRefs
@@ -160,10 +179,11 @@ async function candidates(client, q, opts = {}) {
       WHERE ${w.join(' AND ')})`);
     const G = (extra = '', from = '') => `SELECT g.id, 'g' || g.id AS key, 'g' || g.gid AS grp, g.d, g.ptr, g.flags${extra} FROM g${from}`;
     const text = ' JOIN brain.chunk c ON c.rev_id = g.rev_id AND c.ord = 0';   // the item's search chunk (title + body)
-    if (tsq) add('items_fts', `${G(', ts_rank(c.tsv, w.q) AS sc', `${text} CROSS JOIN (SELECT ${tsq} AS q) w`)} WHERE c.tsv @@ w.q`, 'sc DESC, id');
+    if (tsq) add('items_fts', `${G(', ts_rank(c.tsv, w.q) AS sc', `${text} CROSS JOIN tq w`)} WHERE c.tsv @@ w.q`, 'sc DESC, id');
     for (const s of t.tri) {
-      const L = p(likeOf(s));
-      add('items_tri', `${G(`, coalesce(c.title ILIKE ${L}, false) AS th`, text)} WHERE (c.title ILIKE ${L} OR c.body ILIKE ${L})`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
+      const k = shortNo(s), L = k ? null : p(likeOf(s));
+      add('items_tri', k ? `${G(`, ${k} = ANY(tr.th) AS th`, ' JOIN tr ON tr.rev_id = g.rev_id AND tr.ord = 0')} WHERE ${k} = ANY(tr.hit)`
+        : `${G(`, coalesce(c.title ILIKE ${L}, false) AS th`, text)} WHERE (c.title ILIKE ${L} OR c.body ILIKE ${L})`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
     }
     const nums = t.prs.flatMap((n) => [`pr:${n.slice(1)}`, `issue:${n.slice(1)}`]);
     if (nums.length) add('items_keys', `${G()} WHERE g.ptr = ANY(${p(nums)}::text[])`, 'id');
@@ -187,10 +207,11 @@ async function candidates(client, q, opts = {}) {
         NULL::text AS flags, c.tsv, c.title, c.body, c.prs, c.sha
       FROM brain.item_rev r JOIN brain.item i USING (item_id) JOIN brain.chunk c USING (rev_id) WHERE i.origin = 'repo' AND ${vis('r')} AND ${w.join(' AND ')})`);
     const K = 'SELECT id, key, grp, d, ptr, flags';
-    if (tsq) add('chunks_fts', `${K}, ts_rank(tsv, w.q) AS sc FROM ch CROSS JOIN (SELECT ${tsq} AS q) w WHERE tsv @@ w.q`, 'sc DESC, id');
+    if (tsq) add('chunks_fts', `${K}, ts_rank(tsv, w.q) AS sc FROM ch CROSS JOIN tq w WHERE tsv @@ w.q`, 'sc DESC, id');
     for (const s of t.tri) {
-      const L = p(likeOf(s));
-      add('chunks_tri', `${K}, coalesce(title ILIKE ${L}, false) AS th FROM ch WHERE title ILIKE ${L} OR body ILIKE ${L}`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
+      const k = shortNo(s), L = k ? null : p(likeOf(s));
+      add('chunks_tri', k ? `${K}, ${k} = ANY(tr.th) AS th FROM ch JOIN tr ON tr.chunk_id = ch.id WHERE ${k} = ANY(tr.hit)`
+        : `${K}, coalesce(title ILIKE ${L}, false) AS th FROM ch WHERE title ILIKE ${L} OR body ILIKE ${L}`, `th DESC, d ${BYTES} DESC NULLS LAST, id`);
     }
     for (const n of t.prs) add('chunks_keys', `${K} FROM ch WHERE (' ' || prs || ' ') LIKE ${p(`% ${n} %`)}`, 'id');
     for (const sha of t.shas) add('chunks_keys', `${K} FROM ch WHERE sha LIKE ${p(`${sha}%`)}`, 'id');
@@ -274,7 +295,11 @@ async function find(client, parsed, asOf, detail) {
         ELSE (SELECT max(run_id) FROM brain.run WHERE run_id < r.valid_to) END AS run) e   -- run ids have gaps (a rolled-back publish)
       LEFT JOIN LATERAL (SELECT state->'refs' AS refs FROM brain.sync_state WHERE run_id = e.run AND source = 'github') es ON true
       LEFT JOIN brain.run eb ON eb.run_id = e.run
-      WHERE h.n = 1) AS found`;
+      WHERE h.n = 1) AS found,
+    -- PRs and issues share numbers: for pr:N the issue:N visible at R, and back (named when pr:N is not found)
+    (SELECT coalesce(jsonb_object_agg(q.i, o.ptr), '{}'::jsonb) FROM q JOIN brain.item o
+      ON o.ptr = CASE split_part(q.ptr, ':', 1) WHEN 'pr' THEN 'issue:' WHEN 'issue' THEN 'pr:' END || split_part(q.ptr, ':', 2)
+      WHERE EXISTS (SELECT 1 FROM brain.item_rev x WHERE x.item_id = o.item_id AND ${vis('x')})) AS also`;
   const r = (await client.query(sql, params)).rows[0];
   const view = viewOf(r, noRun(asOf));
   // a Phase 1 pointer (@<build>) names the state of one build: stale unless it is this run's (checked before any lookup)
@@ -282,7 +307,7 @@ async function find(client, parsed, asOf, detail) {
     if (MEMORY_TYPES.includes(x.type) && x.type !== 'vault' && x.rev === null && x.build !== r.v.build) throw new StalePtrError(formatPtr(x), x.build, r.v.build ?? null);
   }
   const found = new Map(r.found.map((x) => [x.i, x.row]));
-  return { rows: parsed.map((x, i) => { const j = found.get(i); if (!j) throw new NotFoundError(ptrText(x)); return j; }), view };
+  return { rows: parsed.map((x, i) => { const j = found.get(i); if (!j) throw new NotFoundError(ptrText(x), r.also[i] ?? null); return j; }), view };
 }
 
 async function get(client, ptrs, opts = {}) {

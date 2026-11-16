@@ -12,12 +12,16 @@ import { spawn, execFileSync } from 'node:child_process';
 import { copyFileSync, cpSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, symlinkSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { useBranch, neonSkip } from './harness.mjs';
 import { writeRun } from './write-run.mjs';
 import { buildStores, goldenState } from './golden/build-golden.mjs';
 import { githubDbPath } from '../../src/gh-schema.mjs';
-import { readerUrl, secretsOf, ensureMirror, mirrorDir } from '../../src/store/server.mjs';
+import { readerUrl, secretsOf, ensureMirror, mirrorDir, connectReader } from '../../src/store/server.mjs';
+import { READER_LIMITS } from '../../src/pg/contract.mjs';
+import { staleness, startMainHead, footerCells } from '../../src/pg/status.mjs';
+import { gitRepos, createWorld, stubReader, alive } from '../phase3/stub.mjs';
 import { pgStore } from '../../src/store/pg.mjs';
 import { holdLockInChild, killChild } from '../phase1/helpers.mjs';
 
@@ -111,6 +115,113 @@ test('the reader URL: BRAIN_READER_URL from the environment, else from .env.loca
   assert.equal(readerUrl({}, join(work, 'missing')), null);
 });
 
+test('the reader client ends a stalled connect and a stalled query itself (READER_LIMITS; options pass through)', async () => {
+  assert.match(readFileSync(join(KIT, 'sql', '002_roles.sql'), 'utf8'), new RegExp(`ALTER ROLE brain_reader SET statement_timeout = '${READER_LIMITS.statementTimeout}'`));
+  assert.ok(READER_LIMITS.queryMs > Number.parseInt(READER_LIMITS.statementTimeout, 10) * 1000);    // the server ends a query first
+  // a server that takes the connection and never answers; one that answers the startup (AuthenticationOk,
+  // ReadyForQuery) and then no query
+  const socks = new Set();
+  const serve = (startup) => new Promise((res) => {
+    const srv = net.createServer((s) => { socks.add(s); s.once('data', () => { if (startup) s.write(Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0, 0x5a, 0, 0, 0, 5, 0x49])); }); });
+    srv.listen(0, '127.0.0.1', () => res(srv));
+  });
+  const servers = [];
+  // a watchdog: a connect that never ends fails the test instead of hanging it
+  const within = (pr, ms) => { let t; return Promise.race([pr, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`still pending after ${ms} ms`)), ms); })]).finally(() => clearTimeout(t)); };
+  try {
+    servers.push(await serve(false), await serve(true));
+    for (const [srv, opt] of [[servers[0], { connectionTimeoutMillis: 300 }], [servers[1], { query_timeout: 300 }]]) {
+      // ssl: false whatever PGSSLMODE says (the fake servers speak no TLS)
+      await assert.rejects(within(connectReader(`postgresql://brain_reader:${'pw'}x@127.0.0.1:${srv.address().port}/db`, { origin: null, ssl: false, ...opt }), 5000),
+        (e) => { assert.equal(e.code, 'server', e.message); assert.match(e.message, /timeout/i); return true; });
+    }
+  } finally {
+    for (const s of socks) s.destroy();
+    for (const srv of servers) srv.close();
+  }
+});
+
+// a git first on PATH whose ls-remote logs a line to $SLOW_GIT_LOG, writes its pid to $SLOW_GIT_PID, sleeps $SLOW_GIT_S
+// seconds, then prints $SLOW_GIT_MAIN as origin's main (no network) or runs git
+function slowGit() {
+  const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  const dir = mkdtempSync(join(work, 'bin-'));
+  writeFileSync(join(dir, 'git'), `#!/bin/sh
+case " $* " in
+  *" ls-remote "*)
+    [ -z "$SLOW_GIT_LOG" ] || echo ls-remote >> "$SLOW_GIT_LOG"
+    [ -z "$SLOW_GIT_PID" ] || echo $$ > "$SLOW_GIT_PID"
+    sleep "\${SLOW_GIT_S:-0}"
+    [ -z "$SLOW_GIT_MAIN" ] || { printf '%s\\trefs/heads/main\\n' "$SLOW_GIT_MAIN"; exit 0; } ;;
+esac
+exec "${real}" "$@"
+`, { mode: 0o755 });
+  return dir;
+}
+const waitFor = async (ok, ms) => { for (const end = Date.now() + ms; !ok() && Date.now() < end;) await new Promise((r) => setTimeout(r, 25)); return ok(); };
+// the fake ls-remote leads its own process group (runGit spawns it detached). A test kills that group only while it
+// owns it: from reading its pid until it sees it gone
+const pidIn = (file) => (existsSync(file) ? Number(readFileSync(file, 'utf8')) || null : null);
+const killOwned = (pid) => { if (pid) try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } };
+
+test('the footer ls-remote started with the command: the footer waits max(read, ls-remote), not the sum; same cells', async () => {
+  const repos = gitRepos(), clock = { now: () => Date.now() };
+  const world = createWorld({ clock, repos });
+  world.seedRun({ commit: repos.head(), tAgoMs: 3600_000 });
+  const env = { ...process.env, PATH: `${slowGit()}:${process.env.PATH}`, SLOW_GIT_S: '1.5' };
+  const look = (extra) => staleness({ reader: stubReader(world), repoDir: repos.clone, actions: null, env, deadline: Date.now() + 8000, ...extra });
+  let t0 = Date.now();
+  const before = await look({});                                         // as before: ls-remote inside staleness
+  const sequential = Date.now() - t0;
+  t0 = Date.now();
+  const h = startMainHead(repos.clone, { ms: 8000, env });
+  await new Promise((r) => setTimeout(r, 1500));                        // connect + the read of the command
+  const after = await look({ mainHead: h.head });
+  const parallel = Date.now() - t0;
+  assert.equal(before.code.state, 'same', JSON.stringify(before.code));   // the ls-remote answered, in both
+  assert.deepEqual(footerCells(after), footerCells(before));
+  assert.deepEqual({ code: after.code, memory: after.memory.state }, { code: before.code, memory: before.memory.state });
+  assert.ok(sequential >= 1500 && parallel < 2500, `read 1.5 s + ls-remote 1.5 s: ${parallel} ms (the sum is 3 s; staleness alone ${sequential} ms)`);
+  // stop(): the ls-remote is killed (its process group), and the head settles at once
+  const pidFile = join(work, `ls-remote-${Date.now()}.pid`);
+  const slow = startMainHead(repos.clone, { ms: 8000, env: { ...env, SLOW_GIT_S: '30', SLOW_GIT_PID: pidFile } });
+  let owned = null;
+  try {
+    assert.ok(await waitFor(() => pidIn(pidFile), 5000), 'ls-remote started');
+    owned = pidIn(pidFile);
+    t0 = Date.now();
+    slow.stop();
+    assert.equal((await slow.head).ok, false);
+    assert.ok(Date.now() - t0 < 2000);
+    assert.ok(await waitFor(() => !alive(owned), 2000), `ls-remote ${owned} still alive`);
+    owned = null;
+  } finally { slow.stop(); killOwned(owned); }
+});
+
+test('a server answer that fails before its footer: the ls-remote it started is killed, the CLI exits at once', async () => {
+  const home = mkdtempSync(join(work, 'home-')), cwd = checkout();
+  const pidFile = join(work, `cli-ls-remote-${Date.now()}.pid`);
+  const socks = new Set();
+  const srv = net.createServer((x) => { socks.add(x); setTimeout(() => x.destroy(), 500); });   // the connect fails after 0.5 s
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  let owned = null;
+  try {
+    const t0 = Date.now();
+    const r = await brain(['search', 'credits'], { cwd, homeDir: home, env: { PATH: `${slowGit()}:${process.env.PATH}`, SLOW_GIT_S: '30', SLOW_GIT_PID: pidFile,
+      BRAIN_READER_URL: `postgresql://brain_reader:${'pw'}123456@127.0.0.1:${srv.address().port}/db?sslmode=disable` } });
+    owned = pidIn(pidFile);
+    assert.match(r.stdout, /brain error \(server\)/, r.stdout + r.stderr);
+    assert.ok(Date.now() - t0 < 5000, `exited after ${Date.now() - t0} ms`);
+    assert.ok(owned, 'the ls-remote started with the command, before the connect');
+    assert.ok(await waitFor(() => !alive(owned), 2000), `ls-remote ${owned} outlived the CLI`);
+    owned = null;
+  } finally {
+    killOwned(owned);
+    for (const x of socks) x.destroy();
+    srv.close();
+  }
+});
+
 test('the reader password is cut from every output before any input is checked; a short one is refused', async () => {
   const pw = 'pw' + '123456';
   const url = `postgresql://brain_reader:${pw}@host.invalid/neondb?sslmode=require`;
@@ -184,6 +295,21 @@ test('search / get / source read the newest server run; the footer and --json na
   assert.doesNotMatch(old.stdout, /Reserve first, then charge/);
   assert.match((await brain(['source', `${DOC}@r2`], { env: reader() })).stdout, /Reserve first, then charge/);
   assert.equal(existsSync(join(repo, '.codebase-brain')), false);                    // nothing local was read or written
+});
+
+test('a server answer runs one ls-remote, started with the command, and its footer uses it (search: server store; find: mirror)', { skip }, async () => {
+  await ready();
+  const log = join(work, `ls-remote-${Date.now()}.log`);
+  // origin's main is run 3's commit: the code cell can say "= main" only from that one answer
+  const env = { ...reader(), PATH: `${slowGit()}:${process.env.PATH}`, SLOW_GIT_LOG: log, SLOW_GIT_MAIN: SHA(2) };
+  const own = mkdtempSync(join(work, 'home-'));                        // its own mirror: the tests below count pulls
+  for (const args of [['search', 'credits', '--kind', 'doc'], ['find', 'reserve']]) {
+    writeFileSync(log, '');
+    const r = await brain(args, { env, homeDir: own });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /freshness: brain data: run 3 @aaaaaaa2.* = main/, r.stdout);
+    assert.equal(readFileSync(log, 'utf8'), 'ls-remote\n', `${args[0]}: exactly one ls-remote`);
+  }
 });
 
 test('--as-of: the run it names; the footer says so and names the newest run', { skip }, async () => {

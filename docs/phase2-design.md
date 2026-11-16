@@ -708,6 +708,7 @@ flowchart LR
 - 마스킹이 놓친 비밀은 revision에 영원히 남는다. 지우려면 owner의 비상 migration(R15)이 필요하다. "덮어쓰지 않음"의 예외는 이것 하나다.
 - 첫 지도 명령은 mirror를 전부 받느라 느린 망에서 몇 초 걸린다. 그 뒤는 delta만 받는다.
 - Postgres FTS와 SQLite FTS5는 순위가 다르다. 기억 검색 결과 순서가 로컬과 다를 수 있다. eval로 재고, 지도 명령은 mirror라 같다.
+- 무엇을 찾는지는 영어·코드 글에서 맞췄다(sql/003 `brain.fts_text`: FTS5 unicode61처럼 글자·숫자·`_` 밖에서 토큰을 나누고(`foo_bar`는 한 토큰, `src/lib/credits.ts`·`next.js`·`12.34`는 여러 토큰), 발음 기호를 지우고, stop word를 남기고, 원래 Porter stemmer로 3~64바이트 토큰만 stem한다). 남은 차이는 받아들인다. unaccent가 ß·æ·œ와 ©·™·½ 같은 기호를 글자로 펼치고(`Straße`·`æther`·`™`이 서버에서만 `strasse`·`aether`·`tm`으로 찾힌다), 드문 유니코드(결합 문자, 사용자 정의 영역 문자, 접으면 바이트 길이가 바뀌는 글자)는 경계나 길이가 다르고, 2047바이트를 넘는 토큰은 서버가 버린다.
 - Neon compute가 잠들어 있으면(Free는 5분 쉬면 잠들고 끌 수 없다) 첫 질의가 늦다. Neon은 깨는 데 보통 수백 ms라고 적는다([Neon connection latency](https://neon.com/docs/connect/connection-latency)). 연결 수립을 더한 실제 값은 잰다.
 - `idle_in_transaction_session_timeout`(5분)은 트랜잭션을 연 채 쉬는 세션만 끊는다. 트랜잭션 전체 시간은 `transaction_timeout`(R9)이 막는다. CI는 쓰기 직전에 새로 연결한다(R2).
 - 전송 한도(월 5 GB)를 넘으면 다음 주기까지 서버 읽기가 멈춘다. 그동안은 로컬 모드로 쓴다.

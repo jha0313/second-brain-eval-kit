@@ -20,6 +20,7 @@ import pg from 'pg';
 import { BrainError, LockBusyError } from '../errors.mjs';
 import { withWriteLock } from '../gh-schema.mjs';
 import { pullMirror, MIRROR_DB } from '../pg/mirror.mjs';
+import { READER_LIMITS } from '../pg/contract.mjs';
 
 export const ENV_FILE = fileURLToPath(new URL('../../.env.local', import.meta.url));
 export const LOCK_WAIT_MS = 30e3;
@@ -45,11 +46,14 @@ export function secretsOf(url) {
 
 /**
  * Connect with the reader URL and refuse anything but the reader of this checkout's brain.
- * @param {string} url @param {{ origin: { owner: string, repo: string } | null }} o the checkout's origin remote
+ * @param {string} url
+ * @param {{ origin: { owner: string, repo: string } | null } & import('pg').ClientConfig} o the checkout's origin
+ *   remote; any other key is a pg.Client option (default connectionTimeoutMillis and query_timeout: READER_LIMITS)
  * @returns {Promise<{ client: import('pg').Client, binding: { id: string, repo: string } }>}
  */
-export async function connectReader(url, { origin }) {
-  const client = new pg.Client({ connectionString: url, application_name: 'brain' });
+export async function connectReader(url, { origin, ...options }) {
+  const client = new pg.Client({ connectionTimeoutMillis: READER_LIMITS.connectMs, query_timeout: READER_LIMITS.queryMs, ...options,
+    connectionString: url, application_name: 'brain' });
   client.on('error', () => {});
   try {
     await client.connect();

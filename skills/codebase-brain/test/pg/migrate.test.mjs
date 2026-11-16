@@ -227,6 +227,9 @@ test('V14: Korean trigram — show_trgm, 크레딧 and 크레딧 예약 match th
     await c.query('SET LOCAL enable_seqscan = off');
     const plan = (await c.query("EXPLAIN SELECT chunk_id FROM brain.chunk WHERE body ILIKE '%크레딧%'")).rows.map((r) => r['QUERY PLAN']).join('\n');
     assert.match(plan, /chunk_body_trgm/, 'the GIN trigram index serves the Korean query');
+    const orPlan = (await c.query("EXPLAIN SELECT chunk_id FROM brain.chunk WHERE title ILIKE '%크레딧%' OR body ILIKE '%크레딧%'")).rows.map((r) => r['QUERY PLAN']).join('\n');
+    assert.match(orPlan, /chunk_title_trgm/, `title ILIKE takes the title index (sql/004): ${orPlan}`);
+    assert.match(orPlan, /chunk_body_trgm/, orPlan);
     const two = await ptrs('ch.title ILIKE $1 OR ch.body ILIKE $1', ['%예약%']);
     const twoPlan = (await c.query("EXPLAIN SELECT chunk_id FROM brain.chunk WHERE body ILIKE '%예약%'")).rows.map((r) => r['QUERY PLAN']).join(' | ');
     await c.query('ROLLBACK');

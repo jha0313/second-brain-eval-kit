@@ -43,10 +43,10 @@ const LOOKUPS_MAX = 3;   // single-run GETs for running DB attempts that are not
  * @typedef {{ ghaRunId: number, ghaAttempt: number, shown: string, stage: string|null, sourceSha: string|null,
  *   startedMs: number }} Execution  one Actions attempt, DB and Actions merged (§6.5 table)
  */
-export async function staleness({ reader, repoDir, actions = null, now = Date.now, deadline, env = process.env }) {
+export async function staleness({ reader, repoDir, actions = null, now = Date.now, deadline, env = process.env, mainHead = null }) {
   const end = deadline ?? now() + REFRESH_LIMITS.callMs;
   const left = () => end - now();
-  let [db, head] = await Promise.all([readServer(reader, left), lsRemoteMain(repoDir, left, env)]);
+  let [db, head] = await Promise.all([readServer(reader, left), mainHead ?? lsRemoteMain(repoDir, left, env)]);
 
   let gh = { ok: false, error: actions ? 'no-binding' : 'no-token', runs: [] };
   if (actions && db.ok && db.binding) {
@@ -138,9 +138,10 @@ export function withDeadline(p, ms, onTimeout = () => {}) {
  * git with a child-process timeout. The child runs in its own process group (detached, so also without a controlling
  * terminal: no password prompt can hang it); on timeout the whole group gets SIGKILL, remote helpers included.
  * git never sees a GitHub token or brain's settings (files.mjs gitEnv: no GH_*, GITHUB_*, BRAIN_* variable).
+ * signal: abort kills the group too (the result is then code null).
  * @returns {Promise<{ code: number|null, stdout: string, timedOut: boolean }>}
  */
-export function runGit(args, { cwd, timeoutMs, env = process.env }) {
+export function runGit(args, { cwd, timeoutMs, env = process.env, signal = null }) {
   return new Promise((resolve) => {
     if (!(timeoutMs > 0)) { resolve({ code: null, stdout: '', timedOut: true }); return; }
     let child;
@@ -148,7 +149,9 @@ export function runGit(args, { cwd, timeoutMs, env = process.env }) {
       child = spawn('git', args, { cwd, env: { ...gitEnv(env), GIT_TERMINAL_PROMPT: '0' }, stdio: ['ignore', 'pipe', 'ignore'], detached: true });
     } catch { resolve({ code: null, stdout: '', timedOut: false }); return; }
     let out = '', timedOut = false, settled = false;
-    const done = (code) => { if (!settled) { settled = true; clearTimeout(timer); resolve({ code, stdout: out, timedOut }); } };
+    const kill = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } } };
+    const done = (code) => { if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener('abort', kill); resolve({ code, stdout: out, timedOut }); } };
+    if (signal?.aborted) kill(); else signal?.addEventListener('abort', kill, { once: true });
     const timer = setTimeout(() => {
       timedOut = true;
       try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
@@ -162,8 +165,24 @@ export function runGit(args, { cwd, timeoutMs, env = process.env }) {
   });
 }
 
-async function lsRemoteMain(repoDir, left, env) {
-  const r = await runGit(['ls-remote', 'origin', 'refs/heads/main'], { cwd: repoDir, timeoutMs: Math.min(left(), GIT_MAX_MS), env });
+/**
+ * `git ls-remote origin` started now, for a staleness() call later (its mainHead): an answer's footer starts it with the
+ * command, beside connect and the read, since it takes as long as they do (Q9: ~0.75 s). Its time limit is ms from now
+ * (at most GIT_MAX_MS), as when staleness() starts it. stop() kills it: for a command that ends before its footer.
+ * A signal (Ctrl-C, a harness's SIGTERM) ends the CLI without 'exit': the git, in its own process group, then outlives
+ * it, so an HTTP transfer under 1000 B/s for 10 s ends it by itself (the 8 s timer comes first while the CLI lives).
+ * @returns {{ head: Promise<{ ok: boolean, sha?: string, error?: string }>, stop: () => void }}
+ */
+export function startMainHead(repoDir, { ms, env = process.env, now = Date.now }) {
+  const end = now() + ms, ac = new AbortController();
+  const bounded = { GIT_HTTP_LOW_SPEED_LIMIT: '1000', GIT_HTTP_LOW_SPEED_TIME: '10', ...env };
+  // runGit never rejects; the catch keeps a pending head that nobody awaits from ever being an unhandled rejection
+  const head = lsRemoteMain(repoDir, () => end - now(), bounded, ac.signal).catch(() => ({ ok: false, error: 'ls-remote' }));
+  return { head, stop: () => ac.abort() };
+}
+
+async function lsRemoteMain(repoDir, left, env, signal) {
+  const r = await runGit(['ls-remote', 'origin', 'refs/heads/main'], { cwd: repoDir, timeoutMs: Math.min(left(), GIT_MAX_MS), env, signal });
   const sha = r.code === 0 ? /^([0-9a-f]{40})\trefs\/heads\/main$/m.exec(r.stdout)?.[1] : null;
   return sha ? { ok: true, sha } : { ok: false, error: r.timedOut ? 'timeout' : r.code === 0 ? 'no-main' : 'ls-remote' };
 }

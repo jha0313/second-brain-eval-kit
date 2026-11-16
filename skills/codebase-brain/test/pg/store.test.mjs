@@ -200,6 +200,16 @@ test('parity: the Postgres store and a mirror of the same run read by the SQLite
     assert.deepEqual((await getIn(store, [`${DOC}@${build}`])).items.map(noPtr), [local.items[0]].map(noPtr));   // this run's build
     await rejects(getIn(store, [`${DOC}@golden01`]), 'stale-pointer');
     await rejects(getIn(store, [`vault:n.md:1-2@${build}`]), 'not-found');      // vault is local only
+    // PRs and issues share numbers: a miss on one kind names the other where it exists, the same on both stores
+    for (const [miss, also] of [['pr:45', 'issue:45'], ['issue:1121', 'pr:1121'], ['pr:9999', undefined], ['review:45', undefined]]) {
+      for (const read of [(s) => getIn(s, ['pr:1121', miss]), (s) => sourceIn(s, miss)]) {
+        const [e, l] = [await read(store).catch((x) => x), await read(sqliteStore(ctx)).catch((x) => x)];
+        assert.equal(code(e), 'not-found', miss);
+        assert.deepEqual([e.also, e.message], [l.also, l.message], miss);
+        assert.equal(e.also, also, miss);
+      }
+    }
+    assert.equal((await getIn(store, ['pr:45@r1']).catch((x) => x)).also, 'issue:45');
     for (const [ptr, mine] of [['issue:45', 'issue:45'], ['rc:7', 'rc:7'], [`${DOC}@${build}`, `${DOC}@r3`], [COMMIT, COMMIT]]) {
       const { view, ...s } = await sourceIn(store, mine);
       assert.deepEqual({ ...s, ptr: null }, { ...source(ctx, ptr), ptr: null }, ptr);
