@@ -32,8 +32,8 @@ async function run(s, snap, { full = false, fail = {}, failAt = null, client = f
   } finally { delete process.env.BRAIN_FAIL_AT; }
 }
 
-function crash(s, at, full = false) {
-  const c = spawnSync(process.execPath, [CHILD, 'v2', s.codeDbPath, ...(full ? ['--full'] : [])],
+function crash(s, at, full = false, snap = 'v2') {
+  const c = spawnSync(process.execPath, [CHILD, snap, s.codeDbPath, ...(full ? ['--full'] : [])],
     { encoding: 'utf8', env: { ...process.env, BRAIN_CRASH_AT: at } });
   assert.equal(c.signal, 'SIGKILL', `the child was not killed at ${at}: ${c.stdout}${c.stderr}`);
 }
@@ -136,6 +136,8 @@ test('first sync: every kind stored, R10 states, only sanitized values bound, cu
   assert.deepEqual(pr2.flags.split(' ').sort(), ['files-truncated', 'suspicious']);
   assert.match(pr2.body, /^S\|Simpler.*\ntoken: `\[REDACTED:github-token\]`\n/);
   assert.equal(get('pr:5').head, 'L|erin/[REDACTED:github-token]');
+  assert.deepEqual(pick(get('pr:5'), ['redactions', 'flags']), { redactions: 1, flags: '' });            // counted outside the body too
+  assert.deepEqual(pick(get('issue:11'), ['redactions', 'flags']), { redactions: 0, flags: 'suspicious' }); // injection text in a title
   withDb(s.ghPath, (db) => {
     for (const it of rows(db, 'SELECT * FROM items')) {
       for (const c of LINE_COLS) if (it[c] != null) assert.ok(it[c].startsWith('L|'), `${it.ptr}.${c} = ${it[c]}`);
@@ -256,13 +258,16 @@ for (const [at, full = false] of [...FAILPOINTS, ['sync:relink']]) {
   });
 }
 
-test('a run left marked running by a crash is marked interrupted by the next run', async () => {
+test('a run left marked running by a crash is marked interrupted by the next run (a refused run writes nothing)', async () => {
   const s = await base();
   crash(s, 'sync:page:2');
   assert.equal(stateOf(s.ghPath).run_status, 'running');
+  const before = readFileSync(s.ghPath);
   const fork = fakeClient({ ...loadSnapshot('v2'), repo: { id: 999, full_name: 'x/fork' } });
-  const { r } = await run(s, 'v2', { client: fork });                     // refused before it writes its own state
-  assert.deepEqual(pick(r, ['status', 'staleLock']), { status: 'failed', staleLock: true });
+  assert.deepEqual(pick((await run(s, 'v2', { client: fork })).r, ['status', 'staleLock']), { status: 'failed', staleLock: true });
+  assert.ok(readFileSync(s.ghPath).equals(before), 'S9: nothing written, the dead run is not marked either');
+  // a --full that fails keeps the old store, which now says how its last run ended
+  assert.equal((await run(s, 'v2', { full: true, fail: { 'pulls:2': boom('pulls') } })).r.status, 'failed');
   assert.deepEqual(pick(stateOf(s.ghPath), ['run_status', 'cursor']), { run_status: 'interrupted', cursor: T1 });
 });
 
@@ -378,6 +383,19 @@ test('S8 incremental sync on a store masked by an older sanitizer: GuardError, n
   const { r } = await run(s, 'v2', { full: true });
   assert.equal(r.status, 'ok');
   assert.equal(stateOf(s.ghPath).sanitize_version, SANITIZE_VERSION);
+});
+
+test('S8 a first sync that died part-way (rows, no cursor) records its sanitizer and is refused after an upgrade', async () => {
+  const s = store();
+  crash(s, 'sync:page:2', false, 'v1');
+  assert.deepEqual(pick(stateOf(s.ghPath), ['cursor', 'run_status', 'sanitize_version']), { cursor: null, run_status: 'running', sanitize_version: SANITIZE_VERSION });
+  withDb(s.ghPath, (db) => writeSyncState(db, { sanitize_version: SANITIZE_VERSION - 1 }));   // as if an older sanitizer wrote the rows
+  const before = readFileSync(s.ghPath);
+  await assert.rejects(run(s, 'v1'), (e) => e instanceof GuardError && e.store === 'github');
+  assert.ok(readFileSync(s.ghPath).equals(before), 'nothing written, the dead run is not marked either');
+  assert.equal((await run(s, 'v1', { full: true })).r.status, 'ok');
+  const clean = store(); await run(clean, 'v1', { full: true });
+  assert.deepEqual(dump(s.ghPath), dump(clean.ghPath));
 });
 
 test('S9 repo id mismatch: failed, nothing written, nothing else requested', async () => {

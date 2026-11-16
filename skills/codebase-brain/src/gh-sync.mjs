@@ -91,10 +91,11 @@ async function runLocked(run) {
   try {
     const state = main ? readSyncState(main) : {};
     result.cursor = state.cursor ?? null;
-    // this run holds the lock, so a run still marked running died (its lock was stale)
-    if (state.run_status === 'running') writeSyncState(main, { run_status: 'interrupted' });
+    // rows stored by an older sanitizer: after a successful sync, or a first sync that failed part-way (no cursor)
     const have = state.sanitize_version ?? -1;
-    if (!full && state.cursor && have < SANITIZE_VERSION) throw new GuardError('github', have, SANITIZE_VERSION);
+    if (!full && have < SANITIZE_VERSION && (state.cursor || main.prepare('SELECT 1 FROM items LIMIT 1').get())) {
+      throw new GuardError('github', have, SANITIZE_VERSION);
+    }
     try {
       const repo = await client.getRepo();
       const T = time(repo.serverDate);
@@ -104,16 +105,20 @@ async function runLocked(run) {
         return result;
       }
       failpoint('sync:after-repo');
+      // this run holds the lock, so a run still marked running died (its lock was stale)
+      if (state.run_status === 'running') writeSyncState(main, { run_status: 'interrupted' });
       if (full) { removeStore(tmpPath); db = openGithubDb(tmpPath, { create: true }); } else db = main;
       relinkAfter = !full;
+      // a first or full sync stamps the sanitizer version with its first write, so even a partial store records it
       writeSyncState(db, { run_status: 'running', run_pid: process.pid, run_started_at: run.now(), last_error: null,
-        repo_id: Number(repo.id), repo: deps.sanitizeLine(String(repo.fullName)) });
+        repo_id: Number(repo.id), repo: deps.sanitizeLine(String(repo.fullName)),
+        ...(full || !state.cursor ? { sanitize_version: SANITIZE_VERSION } : {}) });
       const W = state.cursor && !full ? iso(Date.parse(state.cursor) - HOUR) : null;   // R2
       await collect(run, db, { W, T, selfRepo: String(repo.fullName) });
       failpoint('sync:final:before');
       tx(db, () => {   // R11: the cursor moves only here
         writeSyncState(db, { cursor: T, run_status: 'ok', last_ok_at: run.now(), last_error: null, limits: limitsOf(db),
-          ...(full || !state.cursor ? { sanitize_version: SANITIZE_VERSION } : {}), ...(full ? { last_full_at: run.now() } : {}) });
+          ...(full ? { last_full_at: run.now() } : {}) });
         failpoint('sync:final:inside');
       });
       if (full) {
@@ -261,11 +266,17 @@ export function ingestRaw(db, kind, raws, { selfRepo, deps = {} } = {}) {
 
 // Raw REST object -> items row. GitHub strings pass deps.sanitize (bodies) or deps.sanitizeLine before any bind;
 // times, SHAs and numbers are re-parsed into values built here, so no raw text is stored through them.
+// redactions and 'suspicious' cover every stored string of the item, not only the body.
 function toRow(kind, raw, deps) {
-  const line = (v) => (v == null ? null : deps.sanitizeLine(String(v)));
-  const b = raw.body == null ? null : deps.sanitize(String(raw.body));
-  const row = { kind, author: line(raw.user?.login), author_assoc: line(raw.author_association), body: b ? b.text : null,
-    url: line(raw.html_url), redactions: b ? b.redactions : 0, flags: b?.suspicious ? 'suspicious' : '' };
+  let redactions = 0, suspicious = false;
+  const check = (s) => { const r = deps.sanitize(s); redactions += r.redactions; suspicious ||= r.suspicious; return r.text; };
+  const line = (v) => { if (v == null) return null; check(String(v)); return deps.sanitizeLine(String(v)); };
+  const row = fieldsOf(kind, raw, line, (v) => (v == null ? null : check(String(v))));
+  return { ...row, redactions, flags: suspicious ? 'suspicious' : '' };
+}
+
+function fieldsOf(kind, raw, line, text) {
+  const row = { kind, author: line(raw.user?.login), author_assoc: line(raw.author_association), body: text(raw.body), url: line(raw.html_url) };
   const dates = { created_at: time(raw.created_at), updated_at: time(raw.updated_at) };
   if (kind === 'pr') {
     const n = id(raw.number);
