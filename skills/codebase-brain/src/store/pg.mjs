@@ -323,7 +323,7 @@ async function resolveAsOf(client, spec) {
       commits = `(SELECT count(DISTINCT commit_sha) FROM brain.run WHERE starts_with(commit_sha, ${sha}))`;
     } else run = `(SELECT max(run_id) FROM brain.run WHERE published_at < ${p(dayEnd(spec, m[3], m[4]))}::timestamptz)`;   // run ids follow publish order
   }
-  const r = (await client.query(`WITH ${head(run)} SELECT ${VIEW}, ${commits} AS commits`, params)).rows[0];
+  const r = (await client.query(`WITH ${head(run)} SELECT ${VIEW}, ${commits} AS commits, (SELECT max(run_id) FROM brain.run) AS latest`, params)).rows[0];
   if (Number(r.commits) > 1) throw new BrainError('ambiguous', `--as-of commit:${m[2]} matches ${r.commits} published commits: give more of the SHA`);
   const view = viewOf(r, () => {
     if (spec == null) return new BrainError('not-found', 'the server has no published run yet');
@@ -331,7 +331,7 @@ async function resolveAsOf(client, spec) {
     e.message = `no published run matches --as-of ${String(spec).trim()}`;
     return e;
   });
-  return { run: view.run, view };
+  return { run: view.run, latest: Number(r.latest), view };
 }
 
 /**

@@ -10,8 +10,11 @@ import { ext, plural } from './fmt.mjs';
  * @typedef {{
  *   code: { state: 'fresh'|'stale'|'unknown', commit: string|null, head: string|null, behind: number|null, diverged: boolean, changed: number, files: string[] },
  *   github: { state: 'never'|'ok'|'stale'|'failed'|'interrupted'|'running', asOf: string|null, syncedAt: string|null, fullAt: string|null,
- *             runAt: string|null, pid: number|null, error: string|null }
+ *             runAt: string|null, pid: number|null, error: string|null },
+ *   brain?: { run: number, commit: string|null, publishedAt: string|null, asOf: boolean, latest: number|null }
  * }} Freshness
+ *   brain: server mode only (Phase 2 §6.4): the run the answer read (meta brain_* of a mirror or of a store's view),
+ *   asOf: picked by --as-of, latest: the newest run then (ctx.at)
  * @typedef {{ truncated?: boolean, unresolvedLocal?: number, lines?: { from: number, to: number, total: number } } & Partial<import('./read.mjs').ReadFacts>} CoverageFacts
  *   githubPresent (ReadFacts) marks an answer that reads GitHub memory: only then does the sync state count.
  *   lines: the page `source` printed.
@@ -69,12 +72,14 @@ function codePart(ctx, f) {
  * @returns {Freshness}
  */
 export function freshness(ctx, { now = Date.now(), phase0 } = {}) {
-  const s = ctx.sync;
+  const s = ctx.sync, m = ctx.meta ?? {};
   const state = githubState(s, now);
   return {
     code: codePart(ctx, phase0),
     github: { state, asOf: s?.cursor ?? null, syncedAt: s?.last_ok_at ?? null, fullAt: s?.last_full_at ?? null,
       runAt: s?.run_started_at ?? null, pid: s?.run_pid ?? null, error: ['failed', 'interrupted'].includes(state) ? s?.last_error ?? null : null },
+    ...(m.brain_run != null && { brain: { run: Number(m.brain_run), commit: m.brain_run_commit ?? null, publishedAt: m.brain_published_at ?? null,
+      asOf: !!ctx.at?.asOf, latest: ctx.at?.latest ?? null } }),
   };
 }
 
@@ -109,10 +114,17 @@ function githubLine(g, now) {
   }
 }
 
+// brain data: run 42 @9f3c2e1a (published 3h ago) | brain data as of run 17 @6b820f87 (2026-10-01, as-of) · latest run 42
+function brainLine(b, now) {
+  const run = `run ${b.run}${b.commit ? ` @${b.commit.slice(0, 8)}` : ''}`;
+  if (!b.asOf) return `brain data: ${run} (published ${b.publishedAt ? `${age(b.publishedAt, now)} ago` : '?'})`;
+  return `brain data as of ${run} (${b.publishedAt ? b.publishedAt.slice(0, 10) : '?'}, as-of)${b.latest != null ? ` · latest run ${b.latest}` : ''}`;
+}
+
 /** @param {{ coverage: Coverage, freshness: Freshness, now?: number }} a @returns {[string, string]} plain text, no color */
 export function footer({ coverage: cov, freshness: fr, now = Date.now() }) {
   const c = cov.state + (cov.reasons.length ? ` · ${cov.reasons.join(' · ')}` : '');
-  return [`  coverage: ${c}`, `  freshness: ${codeLine(fr.code)} · ${githubLine(fr.github, now)}`];
+  return [`  coverage: ${c}`, `  freshness: ${fr.brain ? `${brainLine(fr.brain, now)} · ` : ''}${codeLine(fr.code)} · ${githubLine(fr.github, now)}`];
 }
 
 /**

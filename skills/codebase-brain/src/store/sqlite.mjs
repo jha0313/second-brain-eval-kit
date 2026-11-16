@@ -202,7 +202,7 @@ function source(ctx, ptr) {
 
 function resolveAsOf(ctx, spec) {
   if (spec != null) throw needsServer('--as-of');
-  return { run: view(ctx).run, view: view(ctx) };
+  return { run: view(ctx).run, latest: view(ctx).run, view: view(ctx) };
 }
 
 /** the same functions, synchronous (read.mjs Phase 1 API) */
