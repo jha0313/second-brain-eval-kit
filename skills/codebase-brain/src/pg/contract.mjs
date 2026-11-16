@@ -359,34 +359,45 @@ export function checksum(state, shapes = ['code', 'github']) {
  * @typedef {{ run: number|null, runCommit: string|null, publishedAt: string|null, sync: Record<string, any>|null,
  *   codeSanitizeVersion: number|null, githubSanitizeVersion: number|null }} View
  *   §6.4: what one command looked at. The Postgres store reads it in the SAME SQL statement as the rows (CTE); the
- *   SQLite store fills it from ctx.meta / ctx.sync with run = null. footer (answer.freshness) and guard use only this.
+ *   SQLite store fills it from ctx.meta / ctx.sync with run = meta brain_run (a mirror) or null (a local build).
+ *   sync: the github.db sync_state row as context.mjs reads it (limits parsed). footer (answer.freshness) and guard use only this.
  *
  * @typedef {{ asOf?: number|null }} AtRun   run id from resolveAsOf; null / missing = latest run
  *
  * Store (lane C, src/store/sqlite.mjs and src/store/pg.mjs). Every method is async, is ONE SQL statement in the
  * Postgres store, and returns `view` from that statement. A command that calls several methods passes the first
- * result's view.run as `asOf` to the others, so the whole command reads one run (§6.4, V16). Rows are hydrated: they
- * keep the Phase 1 SQLite shapes (github.db items / refs rows, code.db chunks rows) plus `ptr`, `rev` and the fields
- * below, so read.mjs keeps its ranking (RRF), grouping and rendering without another query.
- * @typedef {Record<string, any> & { ptr: string, rev: number, origin: 'github'|'repo', parentPtr: string|null }} StoreRow
- *   GitHub: the items row columns (+ meta columns); repo: the chunks row columns; parentPtr: the PR / issue a
- *   review or comment rolls up to
+ * result's view.run as `asOf` to the others, so the whole command reads one run (§6.4, V16); a committed run's visible
+ * rows never change, so a later statement at that run reads the same data. search = candidates, then rows of the shown
+ * groups (read.mjs ranks between them): candidates stay light so a search moves keys, not bodies (§6.9).
+ * @typedef {{ key: string, grp: string, d: string|null, ptr?: string|null, flags?: string|null }} Candidate
+ *   key / grp opaque ('c' + chunk id, 'g' + GitHub item id; the mirror's ids): equal keys = the same row; grp = the row
+ *   it ranks as (a review / comment ranks as its PR, else issue). d: the group's date (tie-break). GitHub rows carry ptr
+ *   and flags (a matched child is shown by those alone).
+ * @typedef {Record<string, any> & { key: string, ptr: string, rev: number|null, origin: 'github'|'repo'|'vault', parentPtr: string|null }} StoreRow
+ *   GitHub: the github.db items row columns; repo / vault: the code.db chunks row columns. ptr: GitHub items without a
+ *   revision, repo memory `<source>:<path>:<a>-<b>@r<n>` (server) or `@<build>` (local), commits `commit:<sha8>`.
+ *   rev: the revision number (null in the SQLite store). parentPtr: the PR / issue a review or comment rolls up to
  * @typedef {{
  *   candidates(q: string, opts: import('../read.mjs').SearchOpts & AtRun): Promise<{
- *     lists: { name: string, rows: (StoreRow & { rank: number })[], truncated: boolean }[],   // max 2,000 per list
+ *     lists: { name: string, rows: Candidate[], truncated: boolean }[],   // in rank order, max 2,000 per list
  *     facts: { pathRefsPending: number, filesTruncated: number, githubPresent: boolean }, view: View }>,
- *   get(ptrs: string[], opts?: AtRun): Promise<{ items: (StoreRow & { revs: { rev: number, run: number, publishedAt: string, state: string|null }[],
- *     thread: StoreRow[], refs: Record<string, any>[] })[], view: View }>,
- *   thread(ptr: string, opts?: AtRun): Promise<{ rows: StoreRow[], view: View }>,
- *   refs(ptr: string, opts?: AtRun): Promise<{ rows: Record<string, any>[], view: View }>,   // github.db refs row shape
+ *   rows(keys: string[], opts?: AtRun): Promise<{ rows: StoreRow[], view: View }>,   // unknown keys left out
+ *   get(ptrs: string[], opts?: AtRun): Promise<{ items: (StoreRow & {
+ *     revs: { rev: number, run: number, publishedAt: string, state: string|null }[] | null,   // null in the SQLite store
+ *     thread: Record<string, any>[],        // a PR / issue's reviews and comments at the run (github.db items rows), by time
+ *     refs: Record<string, any>[],          // github.db refs rows + stale (resolved against another build than the run's)
+ *     prPtr?: string|null                   // commits: the merged PR whose merge commit this is
+ *   })[], view: View }>,
  *   source(ptr: string, opts?: AtRun): Promise<{ row: StoreRow, view: View }>,
- *   resolveAsOf(spec: string|null): Promise<{ run: number, view: View }>,
+ *   resolveAsOf(spec: string|null): Promise<{ run: number|null, latest: number|null, view: View }>,   // latest: the newest run (footer)
  *   close(): Promise<void>
  * }} Store
- *   source / get accept `<ptr>@r<n>` (parseRevPtr). resolveAsOf: 'run:42' | 'commit:<sha>' | 'YYYY-MM-DD' with optional
- *   '+09:00' offset (end of that day); null = latest. Not found -> NotFoundError.
+ *   source / get accept `<ptr>@r<n>` (parseRevPtr): revision n, if the run has seen it. resolveAsOf: 'run:42' |
+ *   'commit:<sha prefix>' (the newest run of that commit; a prefix of two commits: code 'ambiguous') | 'YYYY-MM-DD' with
+ *   optional '+09:00' offset (end of that day); null = latest. Not found -> NotFoundError; a bad spec -> code 'usage'.
+ *   The SQLite store refuses revision pointers and any asOf but its own run (code 'needs-server').
  */
-export const STORE_METHODS = Object.freeze(['candidates', 'get', 'thread', 'refs', 'source', 'resolveAsOf', 'close']);
+export const STORE_METHODS = Object.freeze(['candidates', 'rows', 'get', 'source', 'resolveAsOf', 'close']);
 
 /** pg_advisory_xact_lock key of the publish lock (R9, R11, R12). sql/001_init.sql takes the same lock for a run row. */
 export const PUBLISH_LOCK_KEY = 2026111601;

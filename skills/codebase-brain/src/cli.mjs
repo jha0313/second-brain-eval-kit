@@ -222,12 +222,14 @@ const cmds = {
       if (opt.json) out(JSON.stringify({ db: dbPath, ...fields, coverage: cov, freshness: jsonFresh(fr) }));
       else finish(fr, cov, say);                         // build's text goes to stderr, so its footer does too
     };
-    // --if-stale: keep an index of this repo, built with the same options and the current sanitizer, that still
-    // matches the checkout. A vault always rebuilds: its notes are outside git, so nothing tells us they did not change
+    // --if-stale: keep an index, built with the same options and the current sanitizer, that still matches THIS
+    // checkout (f.repo: freshness was checked here, not at the path the index was built in). An index copied into
+    // another clone at the same commit is kept too: rebuilding it would only re-read the same commit. A vault always
+    // rebuilds: its notes are outside git, so nothing tells us they did not change
     if (opt['if-stale'] && existsSync(dbPath) && !opt.vault) {
       const db = openDb(dbPath), f = freshness(db, repo);
       db.close();
-      if (f.state === 'fresh' && Number(f.meta.sanitize_version ?? -1) >= SANITIZE_VERSION && f.meta.repo === repo && !f.meta.vault
+      if (f.state === 'fresh' && Number(f.meta.sanitize_version ?? -1) >= SANITIZE_VERSION && f.repo === repo && !f.meta.vault
         && JSON.stringify(f.meta.options) === JSON.stringify(options)) {
         say(`brain build: index @${f.commit.slice(0, 8)} is fresh — skipped (drop --if-stale to rebuild)`);
         return report({ skipped: true });

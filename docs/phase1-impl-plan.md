@@ -149,9 +149,9 @@ flowchart LR
 
 - **추출(순수, 색인 없음):** `extractRefs(item, { selfRepo })`가 문법만 보고 후보를 낸다. 경로 모양 → `file`(끝이 `/`면 `dir`), 백틱 식별자 → `symbol`, 7–40자 hex → `commit`, `#N`·같은 repo URL → `item`, `/api/…` 모양 → `route`, 그 밖의 이름 → `name`. 공유 정규식은 `index-knowledge.mjs`의 `PATH_RE` · `IDENT_RE`(전역 플래그: `matchAll` 또는 복사본만).
 - **해석(색인 있음):** `relink()`가 `pathIndex(tracked).resolvePath` · `resolveBase`(유일한 basename), code.db `nodes`, `git cat-file`, github.db `items`로 푼다. "이미 file로 풀린 이름은 name으로 다시 풀지 않는다"는 relink에서 본다.
-- `git grep`은 `execFile`(셸 없음), `--no-color -n -z -I -F -f <토큰 파일> <commit> --`. 대상이 `-`로 시작하거나 `$(…)`를 담아도 인자가 되지 않는다. `-z`가 없으면 git이 한국어 경로를 C 인용하고 경로 속 `:`가 `path:line` 나누기를 깬다. `color.grep=always`는 ANSI를 넣는다(A16).
+- 토큰 검색은 git을 셸 없이 부른다: `ls-tree -r -z <commit>`으로 blob 목록, `cat-file --batch`로 내용을 흘려 받아 한 번에 찾는다(A31). 토큰은 어떤 명령줄에도 오르지 않는다(`-x`, `$(…)`도 그대로 고정 문자열). 경로는 `-z` 출력 그대로라 한국어 경로·경로 속 `:`가 깨지지 않는다(A16).
 - file·dir 해석은 `git ls-tree -r -z --name-only <meta.commit>`(색인한 커밋의 경로). commit은 `git cat-file --batch-check` 한 프로세스. relink는 reason `not-synced`인 `item` ref도 다시 푼다.
-- 예산 `{ bytes: 16e6, ms: 20000 }`을 넘으면 남은 refs는 `pending`, reason `budget`. `resolved_build`가 지금 build id와 다르면 다시 푼다.
+- 예산 `{ bytes: 2e9, ms: 20000 }`(git에서 읽은 blob 바이트, 시간)을 넘으면 남은 refs는 `pending`, reason `budget`. `resolved_build`가 지금 build id와 다르면 다시 푼다.
 - 반환 `RelinkResult = { linked, ambiguous, unlinked, pending, build }`, github.db가 없으면 `null`. 실패는 throw. build와 sync는 그것을 결과의 `relink: { error }`로 적고 실패로 만들지 않는다(§3.1).
 - `RefSource`에 `state` · `merged_at`이 있다. merge-sha commit ref는 머지된 PR에서만 만든다(열린 PR의 `merge_commit_sha`는 GitHub의 시험 머지).
 
@@ -351,6 +351,7 @@ flowchart LR
 | A28 | `sweepSecrets`는 노드 키를 통째로 가리지 않고 부분(경로, 이름, 부모 이름)을 따로 가린 뒤 다시 잇는다: file `path`, dir `dir:path`, symbol `path#[Parent.]Name[@kind]`. 그 밖의 모양만 통째로 가린다 | Phase 2 레인 B가 찾은 버그. `token=…` 꼴 경로는 키를 통째로 가리면 할당 규칙의 값이 `#Name`까지 먹어서 키의 표시가 자기 경로의 표시와 달라졌고, Phase 2 `canonicalNodeKey`가 그 키에서 throw했다(게시 안 됨, 새는 것 없음). 다시 이은 키에는 이미 가려진 path·name 열에 있는 글만 들어간다 |
 | A29 | brain이 부르는 git(`files.mjs` `git()`, relink의 `cat-file`·`grep`, repo 루트 찾기)은 `GH_*`·`GITHUB_*`·`BRAIN_*` 변수를 뺀 env로 돈다(`gitEnv()`; PATH·HOME·`GIT_*`는 그대로) | Phase 2 레인 B 요청. git에는 토큰이 필요 없다. 테스트: PATH 앞의 git 래퍼가 받은 변수 이름을 적고, build·sync·relink 뒤 0개 |
 | A30 | `detectSecrets`는 redaction 표시 사이의 조각을 따로 검사한다(표시가 match를 끝낸다). `mask()`의 규칙은 그대로(`SANITIZE_VERSION` 그대로) | Codex 최종 리뷰: A28로 다시 이은 키 `src/token=[REDACTED:assignment:…]#Name`을 할당 규칙이 새 값으로 읽어 Phase 2 R16 검사가 거부했다. 표시 뒤의 모양 있는 비밀(`ghp_…` 등)은 여전히 잡는다 |
+| A31 | relink의 토큰 검색을 `git grep -F -f` 한 번에서 blob 한 번 읽기 + 바이트 Aho–Corasick으로 바꾼다. 답은 같다(파일마다 첫 줄, 트리 순서, `-I`, 파일 10개 넘으면 `too-many`). 예산 bytes는 읽은 blob 바이트(2 GB) | 실측(실제 서비스 repo, 6,647 blob 73 MB): budget으로 남은 토큰 3,291개를 `git grep -c -F -f`로 한 번에 찾는 데 1,096초, 출력은 3,993줄뿐(출력량이 아니라 패턴 수 × 줄 수). 토큰 하나씩은 0.24초. 그래서 relink마다 20초에 끊겨 같은 refs 7,546개가 영원히 `pending`. 바꾼 뒤: 한 번의 relink로 pending 0, 0.8초(전체 59,124 refs 재판정 2.0초), 표본 60개가 `git grep -n -I -F`와 같은 답 |
 
 Phase 2가 Phase 1에 요청한 것 중 이미 맞는 것: T = 첫 응답(`getRepo`)의 `Date`(G가 이미 그렇다), 링크 결과는 노드 키 문자열(D: file → 경로, symbol → `path#Name`, grep → `path:line`; Phase 2 `canonicalResolved`가 정규 키로 바꾼다), vault는 로컬 전용(Phase 2 snapshot이 vault 청크를 거부한다). async store와 `@r<n>`은 Phase 2 레인 C 몫이다.
 

@@ -1,6 +1,6 @@
 ---
 name: codebase-brain
-description: Find every file that imports a module (directly or through N hops), every reference or call site of a symbol, and every file, test, page or route that may be affected by a change, across a whole TypeScript/JavaScript repo, from a compiler-built index instead of grep. Also answers "why is X built this way / what went wrong before / which PR changed it" with doc and commit citations, and, after `brain sync`, from GitHub PRs, reviews, review comments and issues ("what did reviewers say about X", "was this tried and rejected"). Use it for "which files import X", "what is affected if I change X", "list every caller/use of X", "which tests cover X", "what do A and B share", and the same in Korean: "X를 import하는 파일 전부", "X를 바꾸면 어디가 영향받아?", "X를 부르는 곳 다 찾아줘", "X는 왜 이렇게 만들었어?", "전에 뭐가 깨졌어?", "이거 리뷰에서 뭐라고 했어?". Do not use it for a small task inside one file you already know ("이 파일 오타 고쳐줘"), or to find who uses a URL, SQL table or env var (grep the string).
+description: Find every file that imports a module (directly or through N hops), every reference or call site of a symbol, and every file, test, page or route that may be affected by a change, across a whole TypeScript/JavaScript repo, from a compiler-built index instead of grep. Also answers "why is X built this way / what went wrong before / which PR changed it" with doc and commit citations, and, after `brain sync`, from GitHub PRs, reviews, review comments and issues ("what did reviewers say about X", "was this tried and rejected", "is anyone already working on these files"). Use it for "which files import X", "what is affected if I change X", "list every caller/use of X", "which tests cover X", "what do A and B share", and the same in Korean: "X를 import하는 파일 전부", "X를 바꾸면 어디가 영향받아?", "X를 부르는 곳 다 찾아줘", "X는 왜 이렇게 만들었어?", "전에 뭐가 깨졌어?", "이거 리뷰에서 뭐라고 했어?". Do not use it for a small task inside one file you already know ("이 파일 오타 고쳐줘"), or to find who uses a URL, SQL table or env var (grep the string).
 ---
 
 # codebase-brain (prototype)
@@ -41,6 +41,7 @@ run it again.
 | Why is it built so / what broke / which PR | `brain why "<question>"` → read the cited lines | guessing from code |
 | What PRs, reviews, issues say about X (after `brain sync`) | `brain search "<q>"` → `brain get <ptr>` → `brain source <ptr>` | `gh` or web searches |
 | Was this tried and rejected / who decided | `brain search "<q>" --state closed-unmerged` (or `--kind review,comment`) | reading PR lists |
+| Is anyone already working on these files / which open PR touches X | `brain search --path <file or dir> --state open` (add a question to narrow) | `gh pr list` (needs a token and network) |
 | See it | `brain viz <ID> --out graph.html` | — |
 | Who uses a URL path, SQL table, env var or config key | grep the string (the map has no edge for it) | `brain impact` (0 there is not "unused") |
 | Small task in one known file | **do not call brain.** Read the file. | an index round-trip |

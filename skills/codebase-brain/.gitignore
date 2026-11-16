@@ -1,1 +1,3 @@
-/node_modules/
+# brain server credentials (BRAIN_READER_URL in .env.local): never committed, wherever this skill is installed
+.env*
+!.env.example
