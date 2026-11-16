@@ -599,7 +599,8 @@ export const REFRESH_MESSAGES = Object.freeze({
  *   dispatchedAt: string|null, extraDispatches: number }} RefreshState
  */
 export const REFRESH_STATE_VERSION = 1;
-export const refreshStatePath = (home, bindingId) => `${home}/.cache/brain/refresh/${bindingId}.json`;
+/** Keyed by binding.source_repo_id (binding.id is always 1, so it would collide across brains on one laptop). */
+export const refreshStatePath = (home, sourceRepoId) => `${home}/.cache/brain/refresh/${sourceRepoId}.json`;
 
 // ---- ci-publish stages, limits, signals (§6.2, A2, A5) -------------------------------------------------------------
 export const CI_STAGES = Object.freeze(['prepare', 'record', 'mirror', 'build', 'sync', 'outbound', 'publish', 'verify']);
