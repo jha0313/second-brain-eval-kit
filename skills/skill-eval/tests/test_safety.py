@@ -119,6 +119,7 @@ def test_run_needs_a_freeze_unless_dev(monkeypatch, tmp_path, repo, capsys):
     def stop(*a, **k):
         raise Reached
     monkeypatch.setattr(runner, "run", stop)
+    monkeypatch.setattr(cli, "run_probe", lambda *a, **k: {"all_ok": True})
     assert cli.main(["run", str(suite)]) == 1
     assert "no FROZEN.json" in capsys.readouterr().err
     assert cli.main(["run", str(suite), "--dry-run"]) == 0              # planning stays free
@@ -301,3 +302,18 @@ def test_tokens_count_every_attempt(monkeypatch, tmp_path):
     assert data["aggregate"]["arms"]["none"]["mean_tokens_all_attempts"] == 10
     _, text = report.write_reports(data, tmp_path / "out")
     assert "incl. retried attempts" in text
+
+
+def test_every_run_starts_with_the_isolation_probe(monkeypatch, tmp_path, repo, capsys):
+    repo.write({"a.ts": "x\n"})
+    suite = tiny_suite(tmp_path, repo)
+    monkeypatch.setattr(runner, "run", lambda *a, **k: pytest.fail("no trial may run after a failed probe"))
+    calls = []
+    monkeypatch.setattr(cli, "run_probe", lambda out, **k: calls.append(out) or {"all_ok": False, "checks": {}})
+    monkeypatch.setattr(cli, "format_probe", lambda r: "probe: FAILED")
+    assert cli.main(["run", str(suite), "--dev", "--out", str(tmp_path / "r")]) == 2
+    assert calls == [tmp_path / "r" / "probe"] and "isolation probe failed: no trial was run" in capsys.readouterr().out
+    assert cli.main(["freeze", str(suite)]) == 0
+    capsys.readouterr()
+    assert cli.main(["run", str(suite), "--skip-probe"]) == 1                 # a frozen run: not without --dev
+    assert "--skip-probe is for dev runs only" in capsys.readouterr().err

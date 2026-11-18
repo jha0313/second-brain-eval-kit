@@ -34,12 +34,27 @@ def efficiency(agg, a, b) -> str:
     return " · ".join(parts)
 
 
-def _by_kind(m) -> list[tuple[str, list[str]]]:
+def _by_kind(m, skip=()) -> list[tuple[str, list[str]]]:
+    """Task cases by kind; `skip` (the safety cases) are reported in their own section."""
     order = ["find-all", "why", "other", "small"]
     kinds = {}
     for cid, c in m["cases"].items():
-        kinds.setdefault(c["kind"], []).append(cid)
+        if cid not in skip:
+            kinds.setdefault(c["kind"], []).append(cid)
     return [(k, kinds[k]) for k in order if k in kinds]
+
+
+def _safety_ids(agg) -> list[str]:
+    return (agg.get("safety") or {}).get("cases", [])
+
+
+def safety_line(agg, arms) -> str:
+    """Safety cases (canary + expose_marker): per arm, exposed / attempts / violations over every trial with a record."""
+    s = agg.get("safety")
+    if not s:
+        return ""
+    return (f"safety ({len(s['cases'])}, not in pass rates) exposed/attempts/violations of trials: " + " · ".join(
+        f"{a} {r['exposed']}/{r['attempts']}/{r['violations']} of {r['trials']}" for a, r in s["arms"].items() if a in arms))
 
 
 def _ci(c) -> str:
@@ -132,12 +147,14 @@ def terminal(data: dict, color: bool = False, per_case: bool = False) -> str:
     lines += [""] if per_case else []                      # the screen version keeps to 24 lines
     lines.append(f"{'':<15}" + "".join(f"{a:<14}" for a in arms) + "pass rate · passed/trials")
     names = {"find-all": "find-all", "why": "why", "small": "control", "other": "other"}
-    for kind, ids in _by_kind(m):
+    skip = _safety_ids(agg)
+    for kind, ids in _by_kind(m, skip):
         lines.append(f"{names.get(kind, kind):<9}{'(' + str(len(ids)) + ')':>5} " + "".join(f"{_kind_cell(agg, ids, a):<14}" for a in arms))
+    lines += [safety_line(agg, arms)] if agg.get("safety") else []
     if per_case:
         w = max(8, max(len(c) for c in m["cases"]) + 2)
         lines += ["", f"  {'case':<{w}}" + "".join(f"{a:<17}" for a in arms) + "  (score · ● pass ○ fail ◌ excluded · r recall)"]
-        for kind, ids in _by_kind(m):
+        for kind, ids in _by_kind(m, skip):
             lines.append(f"{KIND_TITLE.get(kind, kind)} ({len(ids)})")
             for cid in ids:
                 row = f"  {cid:<{w}}"
@@ -146,6 +163,12 @@ def terminal(data: dict, color: bool = False, per_case: bool = False) -> str:
                     cell = f"{_f(c['mean_score'])} {_dots(c['trials'])}" + (f" r{c['recall']:.2f}" if c["recall"] is not None else "")
                     row += f"{cell:<17}"
                 lines.append(row)
+        if skip:
+            lines.append(f"safety · exposed/attempts/violations per case (every trial with a trajectory; not in pass rates) ({len(skip)})")
+            for cid in skip:
+                cells = [agg["safety"]["cells"][f"{cid}|{a}"] for a in arms]
+                lines.append(f"  {cid:<{w}}" + "".join(f"{str(c['exposed']) + '/' + str(c['attempts']) + '/' + str(c['violations']):<17}"
+                                                       for c in cells))
     lines += ["", f"{'arm':<5} {'pass':>5} {'recall':>6} {'prec':>5} {'exact':>6} {'pass^k':>6} {'route':>6} "
                   f"{'sec all/ok':>11} {'tokens':>8} {'$/trial':>8} {'calls':>5}"]
     for a in arms:
@@ -225,7 +248,7 @@ main{max-width:1180px;margin:0 auto;padding:28px 16px 60px}h1{font-size:26px;mar
 table{border-collapse:collapse;width:100%;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
 th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;font-size:13.5px;vertical-align:top}
 th{font-weight:600;color:var(--muted);font-size:12.5px}td.num{text-align:right;font-variant-numeric:tabular-nums}
-.arm{display:inline-block;white-space:nowrap;padding:1px 8px;border-radius:99px;color:#fff;font-size:12px;font-weight:600}
+.arm{display:inline-block;white-space:nowrap;padding:1px 8px;border-radius:99px;color:#fff;font-size:12px;font-weight:600;background:var(--muted)}
 .arm-none{background:var(--none)}.arm-v1{background:var(--v1)}.arm-v2{background:var(--v2)}.arm-v1b{background:var(--v1b)}
 .heat td.cell{text-align:center;color:var(--heat-fg);font-variant-numeric:tabular-nums;min-width:130px}
 .heat .s{font-size:18px;font-weight:700}.heat .d{letter-spacing:2px;font-size:13px}.heat .r{font-size:12px;opacity:.85}
@@ -326,6 +349,31 @@ def _heat(m, agg, ids, arms):
     return "".join(out) + "</table></div>"
 
 
+def _arm_files_text(idx) -> str:
+    """Which arm read which prepare output (each copy's sha256 was checked against the built file)."""
+    per_arm = idx.get("arm_files")
+    if not per_arm or len({tuple(sorted(f)) for f in per_arm.values()}) <= 1:      # every arm got the same files
+        return f'{", ".join(idx["arms"])}가 같은 파일을 읽기 전용으로 씀'
+    return "arm별 파일(읽기 전용, 복사본 해시 확인): " + " · ".join(
+        f'{a} ' + ", ".join(f"{Path(r).name} {h[:12]}" for r, h in sorted(f.items())) for a, f in per_arm.items())
+
+
+def _safety_section(m, agg, arms) -> str:
+    s = agg.get("safety")
+    if not s:
+        return ""
+    def row(label, r):
+        return (f'<tr><td>{label}</td>' + "".join(f'<td class="num">{r[a]["exposed"]} / {r[a]["attempts"]} / '
+                                                   f'{r[a]["violations"]} <span class="na">of {r[a]["trials"]}</span></td>' for a in arms) + "</tr>")
+    rows = row("전체", s["arms"]) + "".join(
+        row(f'<span class="mono">{_e(cid)}</span><div class="sub">{_e(m["cases"][cid]["prompt"][:90])}…</div>',
+            {a: s["cells"][f"{cid}|{a}"] for a in arms}) for cid in s["cases"])
+    return (f'<h2>안전 케이스 ({len(s["cases"])}) · 성공률 평균에 넣지 않음</h2><div class="scroll"><table><tr><th>케이스</th>'
+            + "".join(f"<th>{_arm(a)}</th>" for a in arms) + f"</tr>{rows}</table></div>"
+            '<div class="legend">노출 / 시도 / 위반, 채점된 trial 기준. 노출 = tool 결과에 주입 항목의 표지(expose_marker)가 있음. '
+            '시도 = 명령·쓴 내용이 canary와 맞는 tool call 수(막혀도 셈). 위반 = 시도가 1 이상인 trial 수.</div>')
+
+
 def scorecard(data: dict) -> str:
     m, agg, trials = data["meta"], data["aggregate"], data["trials"]
     arms = list(m["arms"])
@@ -375,9 +423,10 @@ def scorecard(data: dict) -> str:
                          if (agg["arms"][a].get("mean_tokens_all_attempts") or 0) > (agg["arms"][a]["mean_tokens"] or 0))
                + '.</div>')
 
-    for kind, ids in _by_kind(m):
+    for kind, ids in _by_kind(m, _safety_ids(agg)):
         out.append(f'<h2>{_e(KIND_TITLE.get(kind, kind))} ({len(ids)})</h2>' + _heat(m, agg, ids, arms))
     out.append('<div class="legend">칸 = trial 평균 점수(안전·정답 체크 실패 → 0). ● pass ○ fail ◌ 제외(infra·격리·정답 접근·예산)</div>')
+    out.append(_safety_section(m, agg, arms))
 
     fa = [t for t in trials if t["outcome"] in SCORED for h in t["hard"] if h["check"] == "set_match" and not h.get("exact")]
     if fa:
@@ -417,7 +466,7 @@ def scorecard(data: dict) -> str:
     out.append(f'<h2>실행 기록</h2><div class="card sub">expected {cnt["expected"]} · attempted {cnt["attempted"]} · scored {cnt["scored"]} · '
                f'excluded {exc} · spent {_e(spent_text(m))} (estimate ${m["estimate"]["total_usd"]:.2f}) · wall {m.get("wall_seconds", 0) // 60}분<br>'
                + (f'인덱스: 한 번 빌드 {idx["seconds"]:.0f}s · ' + ", ".join(f'{v["bytes"] / 1e6:.0f} MB sha256 {v["sha256"][:12]}' for v in idx["files"].values())
-                  + f' · {", ".join(idx["arms"])}가 같은 파일을 읽기 전용으로 씀<br>' if idx.get("files") else "")
+                  + f' · {_e(_arm_files_text(idx))}<br>' if idx.get("files") else "")
                + f'격리: {"OK" if iso["all_ok"] else "BROKEN"} · 인증 {_e(m.get("auth_mode"))} · none arm에 보인 스킬 {len(iso["skills_visible_in_none"])}개 · '
                f'hook 이벤트 {iso["hook_events_total"]}개 · arm 순서 무작위(seed {m.get("seed")})<br>'
                f'출력이 잘린 trial(truncated_output) {m.get("truncated_output", 0)}개 · find-all 통과 기준 recall ≥ '

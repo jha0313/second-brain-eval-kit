@@ -100,6 +100,8 @@ def cmd_run(a):
     print(plan_table(suite, specs, arms, k, est, a, frozen, diffs))
     if a.dry_run:
         return 0
+    for x in arms:                                # secret_env values: read from the host now and registered for redaction
+        runner.secret_env(suite, x)               # before anything is saved; a missing one stops the run here
     if frozen is None and not a.unfrozen:
         raise SuiteError("no FROZEN.json: run `skill-eval freeze SUITE` first (it fixes cases, keys and grading rules "
                          "before any result is seen), or pass --dev for a dev run")
@@ -111,9 +113,22 @@ def cmd_run(a):
     if a.max_usd is not None and est["total_usd"] > a.max_usd:
         print(f"\nnote: estimate ${est['total_usd']:.2f} is above --max-usd {a.max_usd:.2f}; trials past the cap are skipped.")
     out = Path(a.out or Path(suite.dir) / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S")).resolve()
+    # plan 6.4: every execution starts with the isolation probe (no GitHub / git credential, no user config, denied
+    # paths unreadable); a failing probe runs no trial. --skip-probe exists for dev runs only.
+    if a.skip_probe and not a.unfrozen:
+        raise SuiteError("--skip-probe is for dev runs only (--dev): a frozen run starts with the isolation probe")
+    probe_rec = {"skipped": True}
+    if not a.skip_probe:
+        pr = run_probe(out / "probe", model=a.probe_model, control=False)
+        probe_rec = {"all_ok": bool(pr["all_ok"]), "file": runner.short(out / "probe" / "probe.json")}
+        if not pr["all_ok"]:
+            print(format_probe(pr))
+            print(f"\nisolation probe failed: no trial was run ({probe_rec['file']})")
+            return 2
     data = runner.run(suite, specs, out, a.jobs, a.max_usd, est, use_judge=not a.no_judge, keep_ws=a.keep_workspaces,
                       seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None,
                       stop_after_denials=a.stop_after_denials, canary=not a.no_canary)
+    data["meta"]["probe"] = probe_rec
     html_path, text = report.write_reports(data, out)
     scan = scan_saved(out)                        # grep every saved file for the token (redacts any hit)
     data["meta"]["token_scan"] = scan
@@ -144,7 +159,9 @@ def plan_table(suite, specs, arms, k, est, a, frozen=None, diffs=()) -> str:
              f" + probe ${est['probe_usd']:.2f} = ${est['total_usd']:.2f} · ~{est['wall_minutes']:.0f} min with -j {a.jobs}"]
     for arm, r in sorted(est["by_arm"].items(), key=lambda x: list(suite.arms).index(x[0])):
         lines.append(f"    {arm:<5} {r['trials']:>3} trials  ${r['agent_usd'] + r['judge_usd']:.2f}")
-    copies = [x for x in arms if x != "v1" and "v1" in arms and suite.arms[x] == suite.arms["v1"] and x not in suite.patches]
+    copies = [x for x in arms if x != "v1" and "v1" in arms and suite.arms[x] == suite.arms["v1"] and x not in suite.patches
+              and runner.arm_outputs(suite, x) == runner.arm_outputs(suite, "v1")      # same skill, same files, same env
+              and suite.arm_env.get(x) == suite.arm_env.get("v1")]
     if copies:
         lines.append(f"  A/A    {', '.join(copies)} = same bytes as v1 (its Δ should be ~0)")
     else:
@@ -204,6 +221,8 @@ def cmd_grade(a):
         hard = checks.run_hard_checks(case, traj, rec["arm"], suite.repo, suite.commit, deny)
         failed = any(h["gate"] and h["ok"] is False for h in hard)
         regraded += 1
+        if case.canary:
+            rec["safety"] = checks.safety_accounting(case, traj)
         if case.rubric and not failed and not a.no_judge:
             votes = judge.judge(case, traj, suite.judge_model, suite.votes, suite.repo, suite.commit)
             judged += 1
@@ -225,7 +244,8 @@ def cmd_grade(a):
         rec.pop("grader_exception", None)
         rec["metrics"]["judge_usd"] = sum(v.get("cost_usd", 0) for v in votes or [])
     arms = list(data["meta"]["arms"])
-    data["aggregate"] = stats.aggregate(data["trials"], arms, list(data["meta"]["cases"]), suite.compare, suite.sensitivity)
+    data["aggregate"] = stats.aggregate(data["trials"], arms, list(data["meta"]["cases"]), suite.compare, suite.sensitivity,
+                                        runner.safety_case_ids(suite))
     m = data["meta"]
     m["regraded"] = datetime.now().isoformat(timespec="seconds")
     if was != checks.GRADING_VERSION:
@@ -303,6 +323,8 @@ def main(argv=None):
     r.add_argument("--stop-after-denials", type=int, default=3, metavar="N",
                    help="stop the run after N trials with permission denials (0 = never; default 3)")
     r.add_argument("--no-canary", action="store_true", help="skip the 1-trial-per-arm canary before the rest")
+    r.add_argument("--skip-probe", action="store_true", help="dev only (with --dev): do not run the isolation probe first")
+    r.add_argument("--probe-model", default="haiku", help="model of the isolation probe calls (default haiku)")
     r.set_defaults(fn=cmd_run)
     rp = sub.add_parser("report", help="rebuild reports from results.json")
     rp.add_argument("run_dir")

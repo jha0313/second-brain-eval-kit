@@ -1,0 +1,44 @@
+<style>
+.runbar { position: relative; display: flex; height: 34px; border-radius: 8px; border: 1px solid var(--line); background: var(--sunk); margin: 6px 0 26px; }
+.runbar .st:first-child { border-radius: 7px 0 0 7px; }
+.runbar .st { height: 100%; font: 10.5px/34px var(--font-mono); text-align: center; color: var(--fg); border-right: 1px solid var(--surface); white-space: nowrap; overflow: hidden; transition: background .2s, opacity .2s; }
+.runbar .st.todo { opacity: .45; }
+.runbar .st.run { background: var(--accent-soft); }
+.runbar .st.done { background: var(--ok-soft); }
+.runbar .st.fail { background: var(--bad-soft); color: var(--bad); }
+.runbar .st.skip { background: var(--amber-soft); }
+.runbar .slo { position: absolute; top: -4px; bottom: -20px; border-left: 2px dashed var(--bad); }
+.runbar .slo span { position: absolute; bottom: 0; left: 4px; font: 10.5px var(--font-mono); color: var(--bad); white-space: nowrap; }
+.runstate { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 10px 0 12px; }
+.runstate div { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--sunk); font-size: 12.5px; }
+.runstate b { display: block; font: 600 13px var(--font-mono); margin-top: 2px; }
+@media (max-width: 720px) { .runstate { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+</style>
+<div class="widget" id="w-run">
+  <div class="w-head"><b>직접 돌려 보기 · publish 한 번</b><small>데모 시간 · 막대 폭 = 보통 걸리는 시간 · 빨간 점선 = SLO 10분</small></div>
+  <div class="controls">
+    <label for="runFault">실패 주입
+      <select id="runFault">
+        <option value="none">없음</option>
+        <option value="dup">이미 같은 커밋으로 방금 publish됨 (중복 dispatch)</option>
+        <option value="build">S3 build 시간 초과 (3분)</option>
+        <option value="gh500">S4 GitHub 500</option>
+        <option value="outbound">S5 전 업로드 검사에 걸림</option>
+        <option value="mid">S5 트랜잭션 안: 노드 쓴 뒤 오류</option>
+        <option value="kill">S5 트랜잭션 중 kill -9</option>
+        <option value="lostok">S5 COMMIT 응답 유실 (커밋은 됨)</option>
+        <option value="stale">S5 기준 run이 바뀜 (다른 publish가 먼저)</option>
+        <option value="after">COMMIT 뒤, S6 전에 프로세스 죽음</option>
+      </select></label>
+    <label><input type="checkbox" id="runCold"> compute 잠듦</label>
+    <label><input type="checkbox" id="runNoCache"> mirror cache 없음</label>
+    <button type="button" class="btn primary" id="runGo">run 실행</button>
+    <button type="button" class="btn" id="runReset">처음으로</button>
+  </div>
+  <div class="runbar" aria-label="단계별 시간"></div>
+  <div class="runstate" aria-live="polite"></div>
+  <div class="sim-out">
+    <div class="reqlog"><div class="dim"># "run 실행"을 누르면 단계별 기록이 여기에 쌓입니다</div></div>
+    <div class="result" id="runRes">실패 지점을 고르고 실행해 보세요. 어디서 실패하든 서버의 run · 지도 · 기억 · cursor는 함께 그대로입니다. COMMIT 뒤의 실패만 데이터가 남습니다.</div>
+  </div>
+</div>

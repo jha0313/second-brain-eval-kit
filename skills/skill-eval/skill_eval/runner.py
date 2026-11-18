@@ -21,16 +21,16 @@ from pathlib import Path
 
 from . import checks, judge, report, stats
 from .stats import EXCLUDED, SCORED
-from .isolation import TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact, trial_settings
+from .isolation import TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact, register_secret, trial_settings
 from .trajectory import parse_stream
 
 # Rough $ per trial before any calibration. `--calibrate` replaces these with measured means.
 DEFAULT_AGENT_USD = {
     "haiku": {"find-all": 0.15, "why": 0.10, "small": 0.03, "other": 0.10},
-    "sonnet": {"find-all": 0.80, "why": 0.50, "small": 0.12, "other": 0.50},
+    "sonnet": {"find-all": 0.80, "why": 0.17, "small": 0.12, "other": 0.50},     # why: measured mean, Phase 1 dev runs
     "opus": {"find-all": 1.50, "why": 1.00, "small": 0.25, "other": 1.00},
 }
-DEFAULT_JUDGE_VOTE_USD = {"haiku": 0.02, "sonnet": 0.04, "opus": 0.07}
+DEFAULT_JUDGE_VOTE_USD = {"haiku": 0.02, "sonnet": 0.04, "opus": 0.122}   # opus: measured per vote, Phase 1 dev runs
 PROBE_USD = 0.10                 # isolation probe before the run (haiku, a few calls)
 RETRY_SHARE = 0.10               # reserve for infra retries (a trial is retried up to 2 times)
 DEFAULT_SECONDS = {"find-all": 240, "why": 150, "small": 45, "other": 120}
@@ -121,33 +121,53 @@ def build_template(suite, arm: str, root: Path) -> Path:
     return t
 
 
+def arm_outputs(suite, arm: str) -> list[str]:
+    """The prepare outputs an arm gets: the arm's own `outputs` list, else every output if it has a skill (none: nothing)."""
+    if arm in suite.arm_outputs:
+        return list(suite.arm_outputs[arm])
+    return list(suite.prepare_outputs) if suite.arms[arm] else []
+
+
 def build_index(suite, root: Path, templates: dict[str, Path]) -> dict:
     """`prepare` runs ONCE, on the host, in a checkout with no skill in it. Its outputs are copied read-only into
-    every skill arm, so v1 and v2 query the same bytes. The none arm gets nothing."""
+    the arms that get them (by default every skill arm, so v1 and v2 query the same bytes; the none arm gets nothing).
+    prepare sees SKILL_DIR (the first skill arm's copy) and SKILL_DIR_<ARM> for every skill arm of this run.
+    Every copy is hashed against the built file, and an arm that does not get a file must not have it."""
     skill_arms = [a for a in templates if suite.arms[a]]
-    if not suite.prepare or not skill_arms:
+    receivers = {a: arm_outputs(suite, a) for a in templates}
+    if not suite.prepare or not (skill_arms or any(receivers.values())):
         return {}
     idx = _checkout(suite, root / f"idx-{secrets.token_hex(6)}")
-    skill_copy = templates[skill_arms[0]] / ".claude" / "skills" / suite.skill
-    env = {**clean_env(), **skill_env(suite, idx), "SKILL_DIR": str(skill_copy), "REPO_DIR": str(idx)}
+    copies = {a: templates[a] / ".claude" / "skills" / suite.skill for a in skill_arms}
+    env = {**clean_env(), **skill_env(suite, idx), **secret_env(suite), "REPO_DIR": str(idx)}
+    env.update({f"SKILL_DIR_{a.upper()}": str(p) for a, p in copies.items()})
+    if skill_arms:
+        env["SKILL_DIR"] = str(copies[skill_arms[0]])
     start = time.time()
     r = subprocess.run(suite.prepare, shell=True, cwd=idx, env=env, capture_output=True, text=True)
     seconds = time.time() - start
     if r.returncode != 0:
-        raise RuntimeError(f"prepare failed ({r.returncode}):\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
-    files = {}
+        raise RuntimeError(redact(f"prepare failed ({r.returncode}):\n{r.stdout[-2000:]}{r.stderr[-2000:]}"))
+    files, arm_files = {}, {}
     for rel in suite.prepare_outputs:
         src = idx / rel
         digest = hashlib.sha256(src.read_bytes()).hexdigest()
-        for a in skill_arms:
+        for a, outs in receivers.items():
             dst = templates[a] / rel
+            if rel not in outs:
+                if dst.exists():
+                    raise RuntimeError(f"{rel}: arm {a} has this file but does not get it (does the repo track it?)")
+                continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             os.chmod(dst, 0o444)
-            if hashlib.sha256(dst.read_bytes()).hexdigest() != digest:
+            got = hashlib.sha256(dst.read_bytes()).hexdigest()
+            if got != digest:
                 raise RuntimeError(f"{rel}: copy for arm {a} differs from the built file")
+            arm_files.setdefault(a, {})[rel] = got
         files[rel] = {"sha256": digest, "bytes": src.stat().st_size, **sqlite_meta(src)}
-    return {"checkout": idx, "seconds": round(seconds, 1), "files": files, "arms": skill_arms, "command": suite.prepare}
+    return {"checkout": idx, "seconds": round(seconds, 1), "files": files, "arms": [a for a in receivers if receivers[a]],
+            "arm_files": arm_files, "command": suite.prepare}
 
 
 def sqlite_meta(path: Path) -> dict:
@@ -166,9 +186,25 @@ def sqlite_meta(path: Path) -> dict:
     return {"meta": {k: val(rows[k]) for k in ("vault", "commit") if k in rows}, "meta_keys": sorted(rows)}
 
 
-def skill_env(suite, ws: Path) -> dict:
-    """Extra environment for arms that install the skill only, e.g. BRAIN_DB: "{ws}/.codebase-brain/brain.db"."""
-    return {k: v.format(ws=ws) for k, v in suite.skill_env.items()}
+def skill_env(suite, ws: Path, arm: str | None = None) -> dict:
+    """Extra environment, e.g. BRAIN_DB: "{ws}/.codebase-brain/brain.db": suite skill_env for arms that install the skill,
+    with the arm's own `env` on top. arm None (prepare): skill_env alone."""
+    env = dict(suite.skill_env) if arm is None or suite.arms[arm] else {}
+    env.update(suite.arm_env.get(arm, {}) if arm else {})
+    return {k: v.format(ws=ws) for k, v in env.items()}
+
+
+def secret_env(suite, arm: str | None = None) -> dict:
+    """The values of the arm's `secret_env` names (arm None: every arm's, for prepare on the host), read from the host
+    environment and registered for redaction. A name that is not set stops the run before anything starts."""
+    names = suite.arm_secret_env.get(arm, []) if arm else sorted({n for ns in suite.arm_secret_env.values() for n in ns})
+    missing = [n for n in names if not os.environ.get(n)]
+    if missing:
+        raise RuntimeError(f"secret_env {missing} is not set on the host (the arm needs it; the suite holds only the name)")
+    vals = {n: os.environ[n] for n in names}
+    for v in vals.values():
+        register_secret(v)
+    return vals
 
 
 def leak_guard(skill_copy: Path, suite) -> None:
@@ -288,7 +324,7 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
     tdir = out / "trials" / tid
     tdir.mkdir(parents=True, exist_ok=True)
     arm_skill = suite.skill if suite.arms[arm] else None
-    settings = trial_settings(arm_skill, deny)
+    settings = trial_settings(arm_skill, deny, network=suite.arm_network.get(arm))
     lim = case.limits
     cmd = claude_cmd(case.prompt, model=suite.model, settings=settings, tools=suite.tools,
                      max_turns=lim["max_turns"], max_usd=lim["max_usd"], effort=suite.effort)
@@ -296,7 +332,7 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
     for attempt in range(3):                      # infra errors: retry up to 2 times
         ws = make_workspace(templates[arm], ws_root)
         start, timed_out = time.time(), False
-        te = TrialEnv(extra=skill_env(suite, ws) if arm_skill else None)
+        te = TrialEnv(extra={**skill_env(suite, ws, arm), **secret_env(suite, arm)} or None)
         with open(tdir / "trajectory.jsonl", "w") as so, open(tdir / "stderr.txt", "w") as se, te as env:
             p = subprocess.Popen(cmd, cwd=ws, env=env, stdin=subprocess.DEVNULL, stdout=so, stderr=se)
             try:
@@ -353,6 +389,8 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
 def _grade(rec, suite, case, traj, arm, deny, use_judge, infra, timed_out) -> None:
     hard = checks.run_hard_checks(case, traj, arm, suite.repo, suite.commit, deny)
     rec["hard"] = hard
+    if case.canary:                               # safety case: exposure / attempts / violation, reported apart
+        rec["safety"] = checks.safety_accounting(case, traj)
     sl = [h for h in hard if h["check"] == "skill_loaded"]
     rec["skill_loaded"] = (bool(traj["skills_loaded"]) if arm == "none" else
                            (sl[0]["loaded"] if sl else (suite.skill in traj["skills_loaded"])))
@@ -479,7 +517,8 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
     if index:
         log(f"index: built once in {index['seconds']:.0f}s, " + ", ".join(
             f"{v['bytes'] / 1e6:.0f} MB, sha256 {v['sha256'][:12]}" + (f", vault {v['meta'].get('vault') or 'none'}" if "vault" in v.get("meta", {}) else "")
-            for v in index["files"].values()) + f", read-only in {', '.join(index['arms'])}")
+            for v in index["files"].values()) + ", read-only in " + ", ".join(
+            f"{a} ({len(index['arm_files'].get(a, {}))} file(s))" for a in index["arms"]))
     os.chmod(ws_root, 0o300)                      # same user can enter its own workspace but cannot list siblings
     skill_hashes = {a: hashlib.sha256((t / ".claude" / "skills" / suite.skill / "SKILL.md").read_bytes()).hexdigest()[:12]
                     for a, t in templates.items() if suite.arms[a]}
@@ -551,7 +590,7 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
             shutil.rmtree(ws_root, ignore_errors=True)
     results.sort(key=lambda r: (r["case"], list(suite.arms).index(r["arm"]), r["rep"]))
     case_ids = list(dict.fromkeys(s["case"].id for s in specs))
-    agg = stats.aggregate(results, arms, case_ids, suite.compare, suite.sensitivity)
+    agg = stats.aggregate(results, arms, case_ids, suite.compare, suite.sensitivity, safety_case_ids(suite))
     meta = {
         "suite": suite.name, "suite_file": short(suite.path), "skill": suite.skill,
         "arms": {a: (short(p) if p else None) for a, p in suite.arms.items() if a in arms},
@@ -593,6 +632,11 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
     data = {"meta": meta, "aggregate": agg, "trials": results}
     (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
     return data
+
+
+def safety_case_ids(suite) -> list[str]:
+    """Cases with a canary: graded as usual, but reported apart and left out of the task pass-rate averages."""
+    return [c.id for c in suite.cases if c.canary]
 
 
 def run_counts(results: list[dict], expected: int) -> dict:

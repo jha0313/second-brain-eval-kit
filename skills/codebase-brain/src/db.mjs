@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdirSync, existsSync, rmSync } from 'node:fs';
+import { mkdirSync, existsSync, rmSync, chmodSync } from 'node:fs';
 
 const SCHEMA = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -53,7 +53,8 @@ CREATE TABLE chunks (
   body TEXT,
   sha TEXT,
   date TEXT,
-  prs TEXT                     -- "#12 #34"
+  prs TEXT,                    -- "#12 #34"
+  body_line INTEGER            -- file line of the first line of body (Phase 1: source line numbers; null = start_line)
 );
 CREATE VIRTUAL TABLE chunks_fts USING fts5(title, body, content='chunks', content_rowid='id',
   tokenize = "porter unicode61 tokenchars '_'");
@@ -75,7 +76,9 @@ export function createDb(path) {
   mkdirSync(join(path, '..'), { recursive: true });
   for (const p of [path, `${path}-wal`, `${path}-shm`]) if (existsSync(p)) rmSync(p);
   const db = new DatabaseSync(path);
-  db.exec('PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;');
+  chmodSync(path, 0o600);                                            // masked, but still the team's memory
+  // secure_delete: bytes a later write replaces (sweepSecrets) are zeroed, not left in free pages
+  db.exec('PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA secure_delete = ON;');
   db.exec(SCHEMA);
   return db;
 }

@@ -9,13 +9,15 @@ import json
 import re
 from pathlib import Path
 
-from .checks import _git, line_count, lines_ok, tracked_files
-from .suite import load_key, load_sources
+from .checks import _git, github_index, line_count, lines_ok, tracked_files
+from .suite import GH_PTR_RE, load_key, load_sources
 
 # Template placeholders as suites/example writes them: <path/to/file.ts>, <40자 커밋 SHA>, <module or behavior>, and the
 # one-word slots <function> and <condition>. Code in a prompt such as Promise<void>, Map<string, number>, <Meter />,
 # </div>, <a href="/x"> or <!-- … --> is not one.
 SLOT = re.compile(r"<[^<>\n]{1,160}>")
+# find-all items (unit site) that name memory items instead of files: GitHub pointers, commit:<sha>, doc:/change:<path>
+ITEM_PTR_RE = re.compile(r"(?P<kind>pr|issue|review|rc|ic|commit|doc|change):(?P<rest>(?<=commit:)[0-9a-f]{7,40}|(?<=doc:|nge:).+|\d+)")
 SIGNAL = re.compile(r"/|[가-힣]|…|\s(?:or|to)\s")
 TEMPLATE_WORDS = {"<function>", "<condition>"}          # one word, nothing else to tell them from code by
 TAG = re.compile(r"<[A-Za-z][\w.:-]*(?:\s+[\w:@.-]+\s*=|\s*/>$)")      # <a href=…>, <Meter />
@@ -54,7 +56,8 @@ def check_keys(suite) -> list[dict]:
         if f.suffix in (".yaml", ".yml"):
             text = re.sub(r"(?m)(^|\s)#.*$", "", text)       # comments may explain the placeholders
         for slot in find_placeholders(text):
-            bad(f.name, f"unfilled placeholder {slot}")
+            if slot not in suite.format_slots:      # the suite's declared output-format slots are not placeholders
+                bad(f.name, f"unfilled placeholder {slot}")
     if _git(suite.repo, "cat-file", "-e", f"{suite.commit}^{{commit}}").returncode != 0:
         bad("suite", f"repo.commit {suite.commit[:12]} is not a commit in {suite.label}")
         return problems
@@ -66,18 +69,34 @@ def check_keys(suite) -> list[dict]:
         elif lines and not lines_ok(tuple(lines), line_count(suite.repo, suite.commit, path)):
             bad(where, f"{path}:{lines[0]}-{lines[1]} is outside the file ({line_count(suite.repo, suite.commit, path)} lines)")
 
+    gh_items = github_index(str(suite.github_evidence))["items"] if suite.github_evidence else None
     for c in suite.cases:
         for chk in c.hard:
             name, args = next(iter(chk.items()))
             if name == "set_match":
                 for item in sorted(load_key(args["key"])):
-                    path, lines = _site(item) if args.get("unit") == "site" else (item, None)
-                    path_at(c.id, path, lines)
+                    ptr = ITEM_PTR_RE.fullmatch(item) if args.get("unit") == "site" else None
+                    if ptr and ptr["kind"] in ("doc", "change"):     # a markdown file named as a memory pointer
+                        path_at(c.id, ptr["rest"])
+                    elif ptr and ptr["kind"] == "commit":
+                        if _git(suite.repo, "cat-file", "-e", f"{ptr['rest']}^{{commit}}").returncode != 0:
+                            bad(c.id, f"{item}: {ptr['rest']} is not a commit")
+                    elif ptr:                                         # pr:N, issue:N, review:ID, rc:ID, ic:ID
+                        if gh_items is not None and item not in gh_items:
+                            bad(c.id, f"{item} is not in github_evidence")
+                    else:
+                        path, lines = _site(item) if args.get("unit") == "site" else (item, None)
+                        path_at(c.id, path, lines)
             elif name == "sources_hit":
                 for src in load_sources(args["key"]):
                     if "commit" in src:
                         if _git(suite.repo, "cat-file", "-e", f"{src['commit']}^{{commit}}").returncode != 0:
                             bad(c.id, f"commit {src['commit']} is not a commit")
+                    elif "ptr" in src:                  # checked against the frozen corpus when the suite names one
+                        if not GH_PTR_RE.fullmatch(str(src["ptr"])):
+                            bad(c.id, f"{src['ptr']!r} is not a GitHub pointer (pr:N, issue:N, review:ID, rc:ID, ic:ID)")
+                        elif gh_items is not None and src["ptr"] not in gh_items:
+                            bad(c.id, f"{src['ptr']} is not in github_evidence")
                     else:
                         path_at(c.id, src["path"], src.get("lines"))
             elif name == "answer_regex" and args.get("source_key"):

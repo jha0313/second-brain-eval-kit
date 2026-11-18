@@ -19,7 +19,9 @@ from .isolation import BUNDLED_SKILLS
 from .judge import JUDGE_VERSION
 
 CODE = ("checks.py", "judge.py", "suite.py", "stats.py", "runner.py", "isolation.py", "extract.py")
-WHY_PASS = ("why: hard gates = cites_exist (at least 1 citation, every cited path/line/commit exists at the commit) and "
+WHY_PASS = ("why: hard gates = cites_exist (at least 1 citation, every cited path/line/commit exists at the commit; a path or "
+            "commit that is not in the repo but that the frozen GitHub corpus names is GitHub-backed: neither valid nor missing; "
+            "prepared files are not citations) and "
             "sources_hit (at least 1 answer-key source cited anywhere; a source with a line range needs an overlapping "
             "cited range); then the judge (3 votes, majority per item; it sees the key's facts and forbidden inferences, "
             "the agent never does) scores answers_question and citations_support; "
@@ -63,6 +65,7 @@ def manifest(suite) -> dict:
         "case_ids": [c.id for c in suite.cases],
         "families": {c.id: c.family for c in suite.cases},
         "keys": {Path(k).name: _sha(Path(k)) for k in keys},
+        "github_evidence": _sha(suite.github_evidence) if suite.github_evidence else None,   # absent = null: old freezes match
         "patches": {a: _sha(p) for a, p in suite.patches.items()},
         "v2_plan": _sha(plan) if plan.exists() else None,
         "extracts_plan": _sha(suite.dir / "preregistered-extracts.md") if (suite.dir / "preregistered-extracts.md").exists() else None,
@@ -73,6 +76,8 @@ def manifest(suite) -> dict:
         "rules": {"model": suite.model, "effort": suite.effort, "tools": suite.tools, "limits": suite.limits,
                   "judge_model": suite.judge_model, "votes": suite.votes, "k": suite.k,
                   "pass_threshold": suite.pass_threshold, "compare": suite.compare, "strip": suite.strip,
+                  "arm_network": suite.arm_network, "arm_secret_env": suite.arm_secret_env,   # names only, never values
+                  "format_slots": suite.format_slots,
                   "prepare": suite.prepare, "prepare_outputs": suite.prepare_outputs,
                   "find_all_pass": {**suite.find_all_pass, "rule": "pass = recall >= min_recall and precision >= "
                                     "min_precision; exact set recorded as a secondary metric"},

@@ -1,0 +1,42 @@
+<style>
+.timeline { position: relative; height: 150px; margin: 8px 6px 34px; border-bottom: 1px solid var(--line); }
+.tl-window { position: absolute; top: 0; bottom: 0; background: var(--accent-soft); border-left: 2px dashed var(--accent); }
+.tl-overlap { position: absolute; top: 0; bottom: 0; background: repeating-linear-gradient(135deg, transparent 0 6px, color-mix(in srgb, var(--amber) 22%, transparent) 6px 12px); }
+.tl-mark { position: absolute; top: -4px; bottom: -22px; width: 0; border-left: 2px solid var(--fg); }
+.tl-mark span { position: absolute; bottom: -2px; left: 4px; font: 11px var(--font-mono); white-space: nowrap; color: var(--fg); }
+.tl-mark.cursor { border-color: var(--amber); } .tl-mark.cursor span { color: var(--amber); }
+.tl-row-label { position: absolute; left: -2px; font-size: 11px; color: var(--muted); }
+.dot { position: absolute; transform: translate(-50%, -50%); font: 10.5px var(--font-mono); padding: 1px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--sunk); color: var(--muted); white-space: nowrap; transition: background .2s, color .2s, border-color .2s; }
+.dot.in { background: var(--accent); color: var(--surface); border-color: var(--accent); }
+.dot.stop { background: var(--bad-soft); color: var(--bad); border-color: var(--bad); }
+.dot.dedup { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
+.tl-axis { position: absolute; bottom: -20px; font: 10.5px var(--font-mono); color: var(--muted); transform: translateX(-50%); }@media (max-width: 720px) { .timeline { height: 170px; } }
+</style>
+<div class="widget" id="w-sync">
+  <div class="w-head"><b>직접 돌려 보기 · sync 한 번</b><small>데모 데이터 · 쪽당 3개 · 시간은 "지금으로부터 몇 시간 전"</small></div>
+  <div class="controls">
+    <label><input type="checkbox" id="simFirst" checked> 첫 실행 (cursor 없음)</label>
+    <label for="simCursor">이전 cursor <input type="range" id="simCursor" min="0" max="30" step="1" value="8"> <output id="simCursorOut">없음 (첫 실행)</output></label>
+    <label for="simFail">실패 주입
+      <select id="simFail">
+        <option value="none">없음</option>
+        <option value="pr2">PR 목록 2쪽에서 500</option>
+        <option value="ic">이슈 댓글에서 rate limit</option>
+        <option value="rev">첫 리뷰 목록에서 502</option>
+      </select>
+    </label>
+    <button type="button" class="btn primary" id="simRun">sync 실행</button>
+    <button type="button" class="btn" id="simReset">DB 비우기</button>
+  </div>
+  <div class="timeline" aria-label="updated_at 타임라인"></div>
+  <div class="legend">
+    <span><i style="border-color:var(--accent);background:var(--accent)"></i>이번 run에 upsert</span>
+    <span><i style="border-color:var(--amber);background:var(--amber-soft)"></i>겹친 창에서 다시 옴 → 중복 제거, 행 그대로</span>
+    <span><i style="border-color:var(--bad);background:var(--bad-soft)"></i>W보다 오래된 첫 PR → 멈춤</span>
+    <span><i style="border-color:var(--accent);background:var(--accent-soft)"></i>수집 창 [W, T]</span>
+  </div>
+  <div class="sim-out">
+    <div class="reqlog" aria-live="polite"><div class="dim"># "sync 실행"을 누르면 요청 기록이 여기에 쌓입니다</div></div>
+    <div class="result">실행 결과가 여기에 나옵니다. 처음에는 "첫 실행"으로 한 번, 그다음 다시 한 번 실행해 보세요. 두 번째 run은 1시간 겹친 창을 다시 보고, 같은 항목은 중복으로 처리합니다. 실패를 넣으면 cursor가 그대로 남습니다.</div>
+  </div>
+</div>

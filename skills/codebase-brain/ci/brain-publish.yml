@@ -1,0 +1,104 @@
+# brain-publish: the only writer of the shared brain (Phase 3 design §6.1, "ops repo" mode). Runs daily and on dispatch.
+# Copy to .github/workflows/brain-publish.yml in the OPS repo: a private repo that holds this kit at skills/codebase-brain/
+# and nothing else. The source repo (the service) gets no file and no secret from this.
+#
+# Set up in the ops repo (README "Shared brain: publishing"):
+#   - env BRAIN_SOURCE_REPO below: the source repo, owner/name. It is written here, never taken as an input (R1).
+#   - secret BRAIN_WRITER_URL: the brain_writer URL (direct endpoint). It exists only here.
+#   - secret BRAIN_SOURCE_TOKEN: a fine-grained token that can read the source repo (contents, pull requests, issues).
+#   - only admins can push; Actions secrets are not sent to workflows from fork pull requests.
+# The first run, a force-push of the source main, and a sanitize_version bump (R15) go through brain-bootstrap.yml.
+# Dispatch has no inputs: an agent's dispatch token can start a run but cannot change what it publishes (§6.7).
+name: brain-publish
+
+on:
+  schedule:
+    - cron: '17 19 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  # A5: read this run's created_at (GET /repos/{ops repo}/actions/runs/{run_id})
+  actions: read
+
+# brain-bootstrap.yml uses the same group: at most one writer runs at a time
+concurrency:
+  group: brain-publish
+  cancel-in-progress: false
+
+env:
+  BRAIN_SOURCE_REPO: your-org/your-service
+  BRAIN_DIR: skills/codebase-brain
+
+jobs:
+  publish:
+    # workflow_dispatch can name any ref; only the reviewed main of the ops repo may write
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: check out the ops repo (the kit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+
+      # The whole history of main and no other ref: the commit memory and the ancestry check (R9) need that history.
+      # fetch-depth 0 would fetch every branch and tag of the source repo and print their names in this job's log.
+      # 2147483647 is git's infinite depth (a complete, not shallow, history of the one ref). refs/heads/main, not
+      # main: checkout fetches an unqualified name as the patterns main* (branches and tags)
+      - name: check out the source repo main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 2
+        with:
+          repository: ${{ env.BRAIN_SOURCE_REPO }}
+          ref: refs/heads/main
+          path: src-repo
+          fetch-depth: 2147483647
+          token: ${{ secrets.BRAIN_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        timeout-minutes: 1
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ${{ env.BRAIN_DIR }}/package-lock.json
+
+      - name: install the kit
+        working-directory: ${{ env.BRAIN_DIR }}
+        timeout-minutes: 2
+        run: npm ci --ignore-scripts
+
+      # the mirror of the last published run (R3); ci-publish checks it against the run's checksum.
+      # run_attempt is in the key: a cache entry never changes, and a re-run keeps the run_id.
+      - name: restore the mirror
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        timeout-minutes: 1
+        with:
+          path: .brain-mirror
+          key: brain-mirror-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: brain-mirror-
+
+      # Only this step sees the writer URL. ci-publish runs build and sync as child processes without it (and without the
+      # source token, which sync gets as GH_TOKEN), with BRAIN_TYPESCRIPT=kit: the source repo's own code never runs.
+      # Exit codes (CI_EXIT): 0 ok or skipped (A5), 1 failed, 2 usage, 3 verify failed (data committed), 4 outcome unknown.
+      - name: publish
+        timeout-minutes: 12
+        env:
+          BRAIN_TYPESCRIPT: kit
+          BRAIN_WRITER_URL: ${{ secrets.BRAIN_WRITER_URL }}
+          BRAIN_SOURCE_TOKEN: ${{ secrets.BRAIN_SOURCE_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GHA_RUN_ID: ${{ github.run_id }}
+          GHA_RUN_ATTEMPT: ${{ github.run_attempt }}
+        # exec: GitHub sends the cancel signals to the step's own process; ci-publish must be that process (bin/brain execs node)
+        run: 'exec "$BRAIN_DIR/bin/brain" ci-publish --source src-repo --mirror .brain-mirror'
+
+      - name: save the mirror
+        if: success()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        timeout-minutes: 1
+        with:
+          path: .brain-mirror
+          key: brain-mirror-${{ github.run_id }}-${{ github.run_attempt }}

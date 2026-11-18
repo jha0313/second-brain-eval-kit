@@ -11,9 +11,15 @@
     "node": ">=22.13"
   },
   "dependencies": {
+    "pg": "^8.23.1",
     "typescript": "5.9.3"
   },
   "scripts": {
-    "test": "node test/run.mjs"
+    "test": "node test/run.mjs && node --test \"test/phase1/*.test.mjs\"",
+    "test:phase0": "node test/run.mjs",
+    "test:phase1": "node --test \"test/phase1/*.test.mjs\"",
+    "test:security": "node --test \"test/security/*.test.mjs\"",
+    "test:pg": "node --test \"test/pg/*.test.mjs\"",
+    "test:phase3": "node --test \"test/phase3/*.test.mjs\""
   }
 }

@@ -1,0 +1,29 @@
+<style>
+.asof-grid { display: grid; grid-template-columns: minmax(150px, 1.3fr) repeat(6, minmax(34px, 1fr)); gap: 4px 2px; font-size: 12px; align-items: center; overflow-x: auto; }
+.asof-grid .h { font: 500 11px var(--font-mono); color: var(--muted); text-align: center; padding: 2px 0; border-radius: 6px; }
+.asof-grid .h.on { background: var(--accent); color: var(--surface); }
+.asof-grid .lab { font: 12px var(--font-mono); overflow-wrap: anywhere; padding-right: 6px; }
+.asof-grid .seg { height: 22px; border-radius: 5px; font: 10.5px/22px var(--font-mono); text-align: center; color: var(--fg); background: var(--sunk); border: 1px solid var(--line); white-space: nowrap; overflow: hidden; }
+.asof-grid .seg.v0 { background: var(--accent-soft); border-color: var(--accent); }
+.asof-grid .seg.v1 { background: var(--ok-soft); border-color: var(--ok); }
+.asof-grid .seg.v2 { background: var(--amber-soft); border-color: var(--amber); }
+.asof-grid .seg.hit { outline: 2px solid var(--fg); outline-offset: -2px; font-weight: 600; }
+.asof-grid .gap { height: 22px; }
+#asofSql { white-space: pre-wrap; }
+.asof-out { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 14px; margin-top: 12px; }
+@media (max-width: 720px) { .asof-out { grid-template-columns: minmax(0, 1fr); } }
+</style>
+<div class="widget" id="w-asof">
+  <div class="w-head"><b>직접 움직여 보기 · 유효 구간과 as-of</b><small>데모 데이터 · run 6개 · 칸 하나 = run 하나</small></div>
+  <div class="controls">
+    <label><input type="checkbox" id="asofLatest" checked> 최신만 (기본)</label>
+    <label for="asofRun">--as-of run <input type="range" id="asofRun" min="1" max="6" step="1" value="6"> <output id="asofRunOut">6</output></label>
+    <label for="asofMirror">내 mirror run
+      <select id="asofMirror"><option value="0">없음 (처음)</option><option value="2">2</option><option value="4">4</option><option value="5" selected>5</option><option value="6">6</option></select></label>
+  </div>
+  <div class="asof-grid" aria-label="행마다 유효 구간"></div>
+  <div class="asof-out">
+    <div class="result" id="asofRes"></div>
+    <div class="term-wrap"><pre class="term" id="asofSql"></pre></div>
+  </div>
+</div>

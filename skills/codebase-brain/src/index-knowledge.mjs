@@ -4,12 +4,13 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { git } from './files.mjs';
+import { sanitize, sanitizeLine } from './sanitize.mjs';
 
-const MD_EXT = /\.(md|mdx)$/i;
-const PR_RE = /(?<![\w/#])#(\d{2,6})\b/g;
-const PATH_RE = /(?<![\w/.-])(?:@\/)?((?:[\w.-]+\/)+(?:[\w.-]*\w)?)(?!\w)/g;   // a/b/c.ts, services/billing/, @/lib/x
-const PATH_TRIES = ['', '.ts', '.tsx', '/index.ts', '/index.tsx', '.mjs', '.js'];
-const IDENT_RE = /\b([A-Za-z_][A-Za-z0-9_]*[a-z0-9][A-Z][A-Za-z0-9_]*|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|[A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g;
+export const MD_EXT = /\.(md|mdx)$/i;
+export const PR_RE = /(?<![\w/#])#(\d{2,6})\b/g;
+export const PATH_RE = /(?<![\w/.-])(?:@\/)?((?:[\w.-]+\/)+(?:[\w.-]*\w)?)(?!\w)/g;   // a/b/c.ts, services/billing/, @/lib/x
+export const PATH_TRIES = ['', '.ts', '.tsx', '/index.ts', '/index.tsx', '.mjs', '.js'];
+export const IDENT_RE = /\b([A-Za-z_][A-Za-z0-9_]*[a-z0-9][A-Z][A-Za-z0-9_]*|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|[A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g;
 // A name in a doc links to its exported symbols only if 1–3 of them have it. With more (a `displayName` in every
 // component, a `handler` in every route) the name says nothing about which one the text means, and linking all
 // of them would point `why` at unrelated code. Skipped names are counted (brain status) so the cut is visible.
@@ -18,16 +19,13 @@ const MAX_LINES = 40;
 const BULK_FILES = 300;
 
 export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommits = 5000, log }) {
-  const insChunk = db.prepare(`INSERT INTO chunks(source, path, start_line, end_line, title, body, sha, date, prs)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const insChunk = db.prepare(`INSERT INTO chunks(source, path, start_line, end_line, title, body, sha, date, prs, body_line)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const insLink = db.prepare('INSERT INTO links(chunk, node, kind, evidence) VALUES (?, ?, ?, ?)');
   const nodeByKey = db.prepare('SELECT id FROM nodes WHERE key = ?');
   const symbolsByName = db.prepare(`SELECT id FROM nodes WHERE name = ? AND kind != 'file' AND exported = 1 LIMIT ${MAX_NAME_OWNERS + 1}`);
   const insDir = db.prepare(`INSERT OR IGNORE INTO nodes(key, kind, name, path, lang) VALUES (?, 'dir', ?, ?, 'dir')`);
-  const known = new Set(tracked);
-  const dirs = new Set(tracked.flatMap((p) => p.split('/').slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join('/'))));
-  const byBase = new Map();
-  for (const p of tracked) { const b = p.split('/').pop(); byBase.set(b, byBase.has(b) ? null : p); }   // null = ambiguous
+  const { known, dirs, byBase } = pathIndex(tracked);
   const tooCommon = new Set();
   const stats = { docs: 0, changes: 0, changelog: 0, commits: 0, bulkCommits: 0, vault: 0, vaultSkippedNewer: 0, chunks: 0,
     links: { 'mentions-path': 0, 'mentions-symbol': 0, 'area-doc': 0, touches: 0 } };
@@ -62,16 +60,20 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
     }
   };
 
+  // texts arrive sanitized whole (sanitize.mjs); a title can also come from a file name, so it is cleaned here too
   const addChunk = (c) => {
-    const r = insChunk.run(c.source, c.path ?? null, c.start ?? null, c.end ?? null, c.title, c.body, c.sha ?? null, c.date ?? null,
-      prsOf(`${c.title}\n${c.body}`));
+    const title = sanitizeLine(c.title);
+    const r = insChunk.run(c.source, c.path ?? null, c.start ?? null, c.end ?? null, title, c.body, c.sha ?? null, c.date ?? null,
+      prsOf(`${title}\n${c.body}`), c.bodyLine ?? null);
     stats.chunks++;
     return Number(r.lastInsertRowid);
   };
 
-  // 1. Markdown in the repo: one chunk per heading section (long sections split), CHANGELOG per entry
+  // 1. Markdown in the repo: one chunk per heading section (long sections split), CHANGELOG per entry.
+  //    Each file is sanitized whole before it is split, so a secret across a chunk boundary is still caught;
+  //    sanitizing keeps the line count, so chunk line numbers stay file line numbers
   for (const rel of tracked.filter((p) => MD_EXT.test(p))) {
-    const text = readFileSync(join(repo, rel), 'utf8');
+    const text = sanitize(readFileSync(join(repo, rel), 'utf8')).text;
     const source = rel === 'CHANGELOG.md' ? 'changelog' : rel.startsWith('changes/') ? 'change' : 'doc';
     const pieces = source === 'changelog' ? changelogEntries(text) : sections(text, rel);
     for (const s of pieces) {
@@ -88,14 +90,19 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
 
   // 2. Commit history reachable from the indexed commit: message + PR numbers + touched files
   const SEP = '\x1e';
-  const out = git(repo, ['log', `-n${maxCommits}`, '--no-merges', '--name-only', `--format=${SEP}%H%x1f%cI%x1f%s%x1f%b%x1f`, 'HEAD']);
+  // core.quotePath=false: a non-ASCII path (Korean too) comes raw; by default git quotes it ("src/\352\262\260.ts") and it
+  // matched no file node. Control characters, '"' and '\' stay quoted, so a path can never break the record framing.
+  const out = git(repo, ['-c', 'core.quotePath=false', 'log', `-n${maxCommits}`, '--no-merges', '--name-only', `--format=${SEP}%H%x1f%cI%x1f%s%x1f%b%x1f`, 'HEAD']);
   for (const rec of out.split(SEP).slice(1)) {
-    const [sha, date, subject, body, files = ''] = rec.split('\x1f');
+    const [sha, date, rawSubject, rawBody, files = ''] = rec.split('\x1f');
+    const msg = sanitize(`${rawSubject}\n${rawBody}`).text;          // the whole message; git's subject is one line
+    const cut = msg.indexOf('\n');
+    const subject = msg.slice(0, cut), body = msg.slice(cut + 1);
     const cleanBody = body.split('\n').filter((l) => !/^(Co-authored-by|Signed-off-by|Claude-Session|Reviewed-by):/i.test(l.trim()) && !/^https?:\/\/claude\.ai\//.test(l.trim())).join('\n').trim();
-    const touched = files.split('\n').map((f) => f.trim()).filter(Boolean);
+    const touched = files.split('\n').filter(Boolean);   // no trim: ' a.ts' is a different file from 'a.ts'
     // a bulk commit (initial import, mass rename, the root of a shallow clone) says nothing about one file
     const bulk = touched.length > BULK_FILES;
-    const id = addChunk({ source: 'commit', title: subject, body: bulk ? cleanBody : `${cleanBody}\n\nfiles: ${touched.join(' ')}`, sha, date: date.slice(0, 10) });
+    const id = addChunk({ source: 'commit', title: subject, body: bulk ? cleanBody : `${cleanBody}\n\nfiles: ${sanitize(touched.join(' ')).text}`, sha, date: date.slice(0, 10) });
     if (bulk) stats.bulkCommits++;
     else for (const f of touched) { const n = nodeByKey.get(f); if (n) link(id, n.id, 'touches', sha.slice(0, 8)); }
     linkText(id, `${subject}\n${cleanBody}`);
@@ -108,7 +115,7 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
     for (const abs of walk(vault)) {
       if (!MD_EXT.test(abs)) continue;
       const rel = relative(vault, abs).split(sep).join('/');
-      const text = readFileSync(abs, 'utf8');
+      const text = sanitize(readFileSync(abs, 'utf8')).text;
       const born = text.match(/^born:\s*(\d{4}-\d{2}-\d{2})/m)?.[1];
       if (born && commitDate && born > commitDate) { stats.vaultSkippedNewer++; continue; }
       const sha = rel.match(/^Changes\/([0-9a-f]{7,40})\b/)?.[1];       // commit notes are named "<sha> <subject>.md"
@@ -127,6 +134,27 @@ export function indexKnowledge({ repo, tracked, db, vault, commitDate, maxCommit
   return stats;
 }
 
+// Path rules shared with the Phase 1 linker (link.mjs): which tracked file or directory a path-like string names.
+export function pathIndex(tracked) {
+  const known = new Set(tracked);
+  const dirs = new Set(tracked.flatMap((p) => p.split('/').slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join('/'))));
+  const byBase = new Map();
+  for (const p of tracked) { const b = p.split('/').pop(); byBase.set(b, byBase.has(b) ? null : p); }   // null = ambiguous
+  return {
+    known, dirs, byBase,
+    /** a PATH_RE match -> { kind: 'file' | 'dir', path } | null (same rules as linkText) */
+    resolvePath(raw) {
+      const p = raw.replace(/^\.\//, '').replace(/\/$/, '');
+      const file = PATH_TRIES.map((x) => p + x).find((c) => known.has(c));
+      if (file) return { kind: 'file', path: file };
+      if (dirs.has(p) && p.includes('/')) return { kind: 'dir', path: p };
+      return null;
+    },
+    /** a bare file name -> its path when exactly one tracked file has it */
+    resolveBase(base) { const p = byBase.get(base); return p ? { kind: 'file', path: p } : null; },
+  };
+}
+
 const prsOf = (text) => [...new Set([...text.matchAll(PR_RE)].map((m) => `#${m[1]}`))].join(' ');
 
 function* walk(dir) {
@@ -140,6 +168,7 @@ function* walk(dir) {
 // Heading sections with their line ranges, so a citation can say path:12-31.
 export function sections(text, rel) {
   const lines = text.split('\n');
+  if (lines.length > 1 && lines.at(-1) === '') lines.pop();       // the final newline ends the last line; it is not a line
   const out = [];
   // title: frontmatter title (changes/ fragments), else the first H1, else the file name
   const fm = /^---\n([\s\S]*?)\n---/.exec(text);
@@ -152,7 +181,8 @@ export function sections(text, rel) {
   const flush = () => {
     for (let i = 0; i < cur.lines.length; i += MAX_LINES) {
       const part = cur.lines.slice(i, i + MAX_LINES);
-      out.push({ title: cur.title, body: part.join('\n').trim(), start: cur.start + i, end: cur.start + i + part.length - 1 });
+      const [a, b] = bodyRange(part);
+      out.push({ title: cur.title, body: part.slice(a, b).join('\n'), start: cur.start + i, end: cur.start + i + part.length - 1, bodyLine: cur.start + i + a });
     }
   };
   let inFence = false;
@@ -170,17 +200,26 @@ export function sections(text, rel) {
     }
   });
   flush();
-  return out.filter((s) => s.body.length >= 20);
+  return out.filter((s) => s.body.trim().length >= 20);
+}
+
+// [first, last + 1) of the non-blank lines. Blank lines at the ends are dropped; kept lines keep their indentation,
+// so a stored body line is byte-for-byte its file line (body_line = the file line of the first one)
+function bodyRange(lines) {
+  const a = lines.findIndex((l) => /\S/.test(l));
+  if (a < 0) return [0, 0];
+  return [a, lines.findLastIndex((l) => /\S/.test(l)) + 1];
 }
 
 // CHANGELOG.md: the preamble (how the file is kept), then one chunk per top-level "- " entry, titled with its version.
 function changelogEntries(text) {
   const lines = text.split('\n');
   const first = lines.findIndex((l) => /^##\s/.test(l));
-  const out = first > 0 ? [{ title: 'CHANGELOG', start: 1, end: first, body: lines.slice(0, first).join('\n').trim() }] : [];
+  const pre = bodyRange(lines.slice(0, first));
+  const out = first > 0 ? [{ title: 'CHANGELOG', start: 1, end: first, body: lines.slice(pre[0], pre[1]).join('\n'), bodyLine: 1 + pre[0] }] : [];
   let version = '';
   let cur = null;
-  const flush = () => { if (cur) out.push({ ...cur, body: cur.lines.join('\n'), end: cur.start + cur.lines.length - 1 }); cur = null; };
+  const flush = () => { if (cur) out.push({ ...cur, body: cur.lines.join('\n'), end: cur.start + cur.lines.length - 1, bodyLine: cur.start }); cur = null; };
   lines.forEach((line, i) => {
     const v = /^##\s+\[([^\]]+)\]/.exec(line);
     if (v) { flush(); version = v[1]; return; }

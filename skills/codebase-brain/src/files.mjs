@@ -8,8 +8,12 @@ export const CPP_EXT = /\.(h|hh|hpp|hxx|c|cc|cpp|cxx|ipp|tcc)$/;
 export const PY_EXT = /\.py$/;
 const SKIP_DIR = /(^|\/)(node_modules|\.next|dist|build|out|coverage|\.git|vendor|third[-_]party)\//;
 
+// git never needs a GitHub token or brain's own settings, so it does not get them (PATH, HOME and GIT_* stay)
+export const gitEnv = (env = process.env) => Object.fromEntries(Object.entries(env).filter(([k]) => !/^(GH|GITHUB|BRAIN)_/.test(k)));
+
+// stderr is captured, never inherited: git's own messages reach the user only through the CLI's masked error path
 export function git(repo, args, opts = {}) {
-  return execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', maxBuffer: 1 << 30, ...opts });
+  return execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', maxBuffer: 1 << 30, stdio: ['pipe', 'pipe', 'pipe'], env: gitEnv(), ...opts });
 }
 
 // Tracked files only: the index describes a commit, not the working tree.

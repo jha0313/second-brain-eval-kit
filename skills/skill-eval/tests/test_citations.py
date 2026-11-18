@@ -90,8 +90,8 @@ def test_cites_exist_failure_labels(repo):
 
 
 def test_grading_version_is_recorded():
-    assert checks.GRADING_VERSION == "grading-v2"
-    assert judge.JUDGE_VERSION == "judge-v4"
+    assert checks.GRADING_VERSION == "grading-v3"
+    assert judge.JUDGE_VERSION == "judge-v5"
 
 
 def test_old_grading_version_is_not_silently_regraded(tmp_path, capsys):
@@ -112,7 +112,7 @@ def test_old_freeze_refuses_new_grading_rules(monkeypatch, tmp_path, repo, capsy
     frozen.write_text(json.dumps(m))
     monkeypatch.setattr(runner, "run", lambda *a, **k: pytest.fail("must not run"))
     assert cli.main(["run", str(suite)]) == 1
-    assert "frozen with grading-v1, this harness is grading-v2" in capsys.readouterr().err
+    assert "frozen with grading-v1, this harness is grading-v3" in capsys.readouterr().err
 
 
 def test_sources_hit_ignores_citations_with_bad_line_ranges(repo, tmp_path):
