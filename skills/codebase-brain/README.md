@@ -43,6 +43,16 @@ cd /path/to/repo && brain build . --if-stale                             # 대�
 
 모든 명령에 `--json`이 있습니다. 라우팅 규칙(언제 무엇을 부르고, 언제 부르지 않나)은 [SKILL.md](SKILL.md)에 있습니다.
 
+## 작업 전에 brain을 보게 하기
+
+실제 서비스 repo에서 백로그 과제 4개(구현·제거·버그·비밀값 분리)를 brain 없이 한 번, 있을 때 한 번 시켜 봤습니다. 에이전트는 "구현해", "지워"를 받으면 grep과 테스트로 바로 갔고, 스킬은 4번 중 1번만 열었습니다. 그래서 SKILL.md의 설명을 "공유 코드를 바꾸기 전에 먼저 본다"로 바꾸고 "Before you change shared code" 절을 넣었습니다(호출자 → 그 파일의 열린 PR·이슈 → 전의 결정).
+
+더 확실하게 하려면 대상 repo의 `CLAUDE.md`(또는 `AGENTS.md`)에 한 줄을 넣습니다.
+
+```markdown
+- 여러 파일이 쓰는 코드를 고치기 전에 codebase-brain 스킬로 먼저 확인한다: 호출자(`brain callers` / `brain impact --list`), 그 파일의 열린 PR·이슈(`brain search --path <파일> --state open`), 전의 결정(`brain why "<바꿀 내용>"`). 작업 지시에 "진행 중"이라고 적힌 PR·이슈도 `brain get`으로 상태를 확인한다.
+```
+
 ## 세미나(2026-10-31) 뒤 바뀐 동작
 
 - **freshness:** 모든 JSON 답에 `freshness`(`state: fresh | stale`, commit·HEAD·바뀐 파일)가 `coverage` 옆에 붙습니다. `complete`(다 찾았다)와 `fresh`(지금 코드와 맞다)는 다른 사실입니다. 일반 출력의 why·find에도 `stale:` 줄이 나오고, 바뀐 파일을 앞 5개까지 이름으로 보여 줍니다. 빌드할 때 커밋 안 한 파일의 내용 해시를 적어 두므로, 인덱스가 이미 읽은 수정은 "바뀜"으로 세지 않습니다.
@@ -88,6 +98,8 @@ brain why "how is IOBuf meant to be used?"     # 문서 1건뿐: 지식 공백
 ## 공유 brain: publish (Phase 2)
 
 팀이 함께 읽는 brain은 Neon Postgres 하나에 있습니다. 쓰는 곳은 `brain-publish` workflow 하나뿐입니다. workflow가 소스 repo의 `main`을 받아 지도와 기억을 만들고, 바뀐 행만 한 트랜잭션으로 씁니다. 에이전트와 노트북은 읽기 전용 `brain_reader`로만 붙습니다. 설계: [docs/phase2-design.md](../../docs/phase2-design.md) §6.2–6.3.
+
+> **검색 순위 주의 (Phase 2 평가):** 서버 모드는 로컬 모드와 같은 후보를 찾지만 순서를 다르게 매깁니다(Postgres `ts_rank`에는 IDF와 길이 정규화가 없습니다). 그래서 사전 등록한 agent 평가에서 서버 모드의 통과율이 로컬 모드보다 0.10 낮았습니다(95% CI −0.17 … −0.04). 순위를 맞추는 BM25(통계를 publish 때 미리 계산)가 들어가기 전까지는, 혼자 쓰거나 답의 정확도가 중요하면 로컬 모드(`brain sync` + 로컬 SQLite)를 권장합니다. 서버 모드는 여러 사람이 같은 brain을 읽어야 할 때 씁니다.
 
 ### 운영 repo 방식 (권장)
 
