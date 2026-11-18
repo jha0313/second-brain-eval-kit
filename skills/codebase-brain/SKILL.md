@@ -1,6 +1,6 @@
 ---
 name: codebase-brain
-description: Find every file that imports a module (or N hops out), every reference or call site of a symbol, and every file, test, page or route that may be affected by a change, across a whole TypeScript/JavaScript repo, from a compiler-built index instead of grep. Also answers "why is X built this way / what went wrong before / which PR changed it" with doc and commit citations, and, after `brain sync`, from GitHub PRs, reviews, review comments and issues ("what did reviewers say about X", "was this tried and rejected", "is anyone already working on these files"), even if `gh` is offline. Use it for "which files import X", "what is affected if I change X", "list every caller/use of X", "which tests cover X", "what do A and B share", and the same in Korean: "X를 import하는 파일 전부", "X를 바꾸면 어디가 영향받아?", "X를 부르는 곳 다 찾아줘", "X는 왜 이렇게 만들었어?", "전에 뭐가 깨졌어?", "이거 리뷰에서 뭐라고 했어?". Do not use it for a small task inside one file you already know ("이 파일 오타 고쳐줘"), or to find who uses a URL, SQL table or env var (grep the string).
+description: Check this before you change shared code in a TypeScript/JavaScript repo. When a task says implement, fix, remove, rename, refactor or ship something other files use, first ask brain who depends on it (every importer, caller, test, page or route, from a compiler-built index instead of grep) and, after `brain sync`, what GitHub says about it even with `gh` offline: open PRs or issues on those files, ideas tried and rejected, review objections, why it was built this way. Also for direct questions: "which files import X", "what is affected if I change X", "list every caller of X", "why is X built this way", "what did reviewers say about X". Korean: 공유 코드에 "X 지워줘", "X 고쳐줘", "X 구현해줘", "X를 import하는 파일 전부", "X를 바꾸면 어디가 영향받아?", "X는 왜 이렇게 만들었어?", "이거 리뷰에서 뭐라고 했어?", "누가 이미 작업 중이야?". Not for a small edit inside one file you already know ("이 파일 오타 고쳐줘"), or for who uses a URL, SQL table or env var (grep the string).
 ---
 
 # codebase-brain (prototype)
@@ -10,6 +10,20 @@ Call it before grep when the answer is a list of files or locations: grep misses
 
 `brain` below means `bin/brain` in this skill's directory: `.claude/skills/codebase-brain/` in a project, `~/.claude/skills/codebase-brain/` for a user install.
 Needs Node 22.13+. Queries need no packages; `brain build` needs `npm install` once in this directory. `BRAIN_DB` or `--db` names the index file.
+
+## Before you change shared code
+
+A task such as "remove X", "add a step to X", "fix X" or "should we ship X" starts here, before the first edit.
+Two or three calls, then work as usual:
+
+| Before you … | Call |
+|---|---|
+| remove, rename or change the signature of X | `brain callers <ID>` or `brain impact <ID> --list` (every user, tests counted) |
+| edit files that someone else may be working on | `brain search --path <file or dir> --state open` (open PRs and issues on them) |
+| change a behavior or decide a release | `brain why "<what you plan to change>"` and `brain search "<topic>"` (earlier decisions, reverts, review objections) |
+
+The task text can be out of date. If it calls a PR or issue "claimed", "in progress" or "blocked", check its state
+with `brain get <ptr>` before you plan around it. If brain has no index or errors, say so and go on with grep (rule 5).
 
 ## 0. Index
 
