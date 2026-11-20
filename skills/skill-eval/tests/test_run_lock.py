@@ -75,6 +75,7 @@ def test_a_killed_holder_leaves_no_stale_lock(tmp_path):
     os.kill(p.pid, signal.SIGKILL)                    # no finally runs: the OS drops the flock with the process
     p.wait()
     assert f"pid {p.pid}" in lock.read_text()         # the file still names the dead holder
+    assert lock.read_text().endswith(f"process group {os.getpgrp()}")   # and the group its orphaned children are in
     with runner.run_lock(lock):
         assert f"pid {os.getpid()}" in lock.read_text()
 
@@ -238,3 +239,13 @@ def test_a_token_in_stderr_of_a_failed_attempt_is_not_retried_away(monkeypatch, 
     r = run()
     assert len(calls) == 1 and r["trials"][0]["outcome"] == "isolation_error" and r["meta"]["stopped"]
     assert not any("test-token-value-123" in p.read_text(errors="replace") for p in out.rglob("*") if p.is_file())
+
+
+def test_trial_children_stay_in_the_runner_process_group(monkeypatch, tmp_path, repo):
+    """No new session or group: Ctrl-C / SIGTERM to the group stops them; after `kill -9` of run, `pkill -g` does."""
+    out, run = tiny_run(monkeypatch, tmp_path, repo)
+    stream = tmp_path / "stream.jsonl"               # tiny_run's canned result, after the child's own group on stderr
+    monkeypatch.setattr(runner, "claude_cmd", lambda prompt, **kw: ["sh", "-c", 'ps -o pgid= -p $$ >&2; cat "$0"', str(stream)])
+    run()
+    seen = {f.read_text().strip() for f in out.rglob("stderr.txt")}
+    assert seen == {str(os.getpgrp())}

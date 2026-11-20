@@ -497,7 +497,8 @@ def lock_path() -> Path:
 def run_lock(path: Path | None = None):
     """One `run` at a time for this user: two at once on a 16 GB Mac got the shell killed and lost the paid trials.
     flock is atomic (no count-then-start race) and the OS drops it when the holder exits or is killed, so a lock file
-    left behind never blocks. The file holds the holder's pid and start time, only for the refusal message."""
+    left behind never blocks. The file holds the holder's pid, start time and process group: for the refusal message,
+    and after a `kill -9` of `run` the group its claude children are still in (they share it: Ctrl-C stops them too)."""
     import fcntl                                  # POSIX only: here, so `report` and `--help` load anywhere
     path = path or lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -511,7 +512,8 @@ def run_lock(path: Path | None = None):
                         f"and lose paid trials: wait for it to end (lock {short(path)})") from None
     try:
         os.ftruncate(fd, 0)
-        os.pwrite(fd, f"pid {os.getpid()}, started {datetime.now().isoformat(timespec='seconds')}".encode(), 0)
+        os.pwrite(fd, f"pid {os.getpid()}, started {datetime.now().isoformat(timespec='seconds')}, "
+                      f"process group {os.getpgrp()}".encode(), 0)
         yield
     finally:
         os.ftruncate(fd, 0)
