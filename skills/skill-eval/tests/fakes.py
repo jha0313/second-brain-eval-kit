@@ -66,9 +66,11 @@ def tiny_suite(tmp_path, repo) -> Path:
 
 
 def probe_items():
-    """The probe's attack table for made-up paths: ws /w/ws/a1b2c3none, scan-only key /w/scan-only, outside /w/outside."""
+    """The probe's attack table for made-up paths: ws /w/ws/a1b2c3none, scan-only key /w/scan-only, outside /w/outside,
+    SKILL_EVAL_DENY_EXTRA /w/extra-deny/canary.txt."""
     from skill_eval import probe
-    return probe.attack_items(Path("/w/ws/a1b2c3none"), Path("/w/ws"), Path("/w/scan-only"), Path("/w/outside"))
+    return probe.attack_items(Path("/w/ws/a1b2c3none"), Path("/w/ws"), Path("/w/scan-only"), Path("/w/outside"),
+                              (Path("/w/extra-deny/canary.txt"),))
 
 
 def tool_call(name, out, err=False, **inp):
@@ -104,6 +106,8 @@ def clean_calls() -> dict:
         "git-cred": tool_call("Bash", "0", command=cred["git"]),
         "gh-env": tool_call("Bash", "GH_CONFIG_DIR", command=cred["env"]),
         "cred-files": tool_call("Bash", "       0", command=cred["files"]),
+        "extra-deny": tool_call("Bash", "head: /w/extra-deny/canary.txt: Operation not permitted\n       0",
+                                command="head -c 1 /w/extra-deny/canary.txt | wc -c"),
         "key-read": tool_call("Read", in_denied_dir, True, file_path=f"/w/ws/a1b2c3none/{key}"),
         "scan-read": tool_call("Read", '1\t{"paths": ["SCAN-ONLY-CANARY-2b9e"]}', file_path="/w/scan-only/key.json"),
         "md-read": tool_call("Read", in_denied_dir, True, file_path=md),
@@ -151,3 +155,30 @@ def stored_run(tmp_path, repo, outcome, **extra) -> Path:
             "grading_version": GRADING_VERSION, "spent_usd": 0.01, "judge_version": "judge-v3", "judge_models_seen": []}
     (run / "results.json").write_text(json.dumps({"meta": meta, "trials": [rec]}))
     return run
+
+
+def tiny_run(monkeypatch, tmp_path, repo, on_start=lambda n: None, result="x is 42"):
+    """A 4-trial run of the tiny suite whose trials `cat` a canned stream (its result text: `result`); on_start(n) runs
+    as trial n starts. Returns (run folder, a function that runs it)."""
+    import json
+
+    from skill_eval import isolation
+    repo.write({"a.ts": "x\n"})
+    from skill_eval.suite import load_suite
+    suite = load_suite(str(tiny_suite(tmp_path, repo)))
+    stream = tmp_path / "stream.jsonl"
+    stream.write_text(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": result,
+                                  "total_cost_usd": 0.01}) + "\n")
+    started = []
+
+    def fake_cmd(prompt, **kw):
+        started.append(prompt)
+        on_start(len(started))
+        return ["cat", str(stream)]
+    monkeypatch.setattr(runner, "claude_cmd", fake_cmd)
+    monkeypatch.setattr(runner, "auth_mode", lambda: "token")
+    monkeypatch.setattr(isolation, "token", lambda: None)
+    monkeypatch.setattr(runner, "ancestor_instructions", lambda p: [])
+    out = tmp_path / "run"
+    return out, lambda: runner.run(suite, runner.plan(suite, ["none"], None, 4), out, 1, None, {"total_usd": 0.0, "trials": 4},
+                                   use_judge=False, log=lambda s: None, canary=False)

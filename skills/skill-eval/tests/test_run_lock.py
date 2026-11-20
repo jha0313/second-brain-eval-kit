@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fakes import tiny_suite
+from fakes import tiny_run, tiny_suite
 
 from skill_eval import cli, isolation, runner
 
@@ -119,36 +119,13 @@ class Killed(BaseException):
     """Stands in for the process dying mid-run (not an Exception: the runner's per-trial handler does not catch it)."""
 
 
-def _tiny_run(monkeypatch, tmp_path, repo, on_start):
-    """A 4-trial run of the tiny suite whose trials `cat` a canned stream; on_start(n) runs as trial n starts."""
-    repo.write({"a.ts": "x\n"})
-    from skill_eval.suite import load_suite
-    suite = load_suite(str(tiny_suite(tmp_path, repo)))
-    stream = tmp_path / "stream.jsonl"
-    stream.write_text(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "x is 42",
-                                  "total_cost_usd": 0.01}) + "\n")
-    started = []
-
-    def fake_cmd(prompt, **kw):
-        started.append(prompt)
-        on_start(len(started))
-        return ["cat", str(stream)]
-    monkeypatch.setattr(runner, "claude_cmd", fake_cmd)
-    monkeypatch.setattr(runner, "auth_mode", lambda: "token")
-    monkeypatch.setattr(isolation, "token", lambda: None)
-    monkeypatch.setattr(runner, "ancestor_instructions", lambda p: [])
-    out = tmp_path / "run"
-    return out, lambda: runner.run(suite, runner.plan(suite, ["none"], None, 4), out, 1, None, {"total_usd": 0.0, "trials": 4},
-                                   use_judge=False, log=lambda s: None, canary=False)
-
-
 def _die_at_3(n):                                     # trial 3 and later: the process "dies" as the trial starts
     if n >= 3:
         raise Killed
 
 
 def test_an_interrupted_run_keeps_its_finished_trials_and_report_counts_them(monkeypatch, tmp_path, repo, capsys):
-    out, run = _tiny_run(monkeypatch, tmp_path, repo, _die_at_3)
+    out, run = tiny_run(monkeypatch, tmp_path, repo, _die_at_3)
     stale = out / "trials" / "C1__none__9"            # a trial left by an earlier run into the same folder
     stale.mkdir(parents=True)
     (stale / "grade.json").write_text(json.dumps({"trial_id": "C1__none__9", "case": "C1", "arm": "none", "outcome": "fail"}))
@@ -173,7 +150,7 @@ def test_a_runner_exception_is_kept_on_disk_for_recover(monkeypatch, tmp_path, r
     def bug_at_2(n):
         if n == 2:
             raise RuntimeError("harness bug")         # caught per trial: an infra_error, and the run stops
-    out, run = _tiny_run(monkeypatch, tmp_path, repo, bug_at_2)
+    out, run = tiny_run(monkeypatch, tmp_path, repo, bug_at_2)
     run()
     (out / "results.json").unlink()                   # as if the process died before results.json
     rec = runner.recover(out)
@@ -181,7 +158,7 @@ def test_a_runner_exception_is_kept_on_disk_for_recover(monkeypatch, tmp_path, r
 
 
 def test_report_reads_a_finished_run_when_plan_json_is_cut_off(monkeypatch, tmp_path, repo, capsys):
-    out, run = _tiny_run(monkeypatch, tmp_path, repo, lambda n: None)
+    out, run = tiny_run(monkeypatch, tmp_path, repo, lambda n: None)
     run()
     (out / "plan.json").write_text('{"run_id": ')     # (run() replaces it whole; a cut file must not stop the report)
     assert cli.main(["report", str(out)]) == 0 and "unfinished run" not in capsys.readouterr().out
@@ -191,7 +168,7 @@ def test_an_unwritable_record_still_stops_the_run(monkeypatch, tmp_path, repo):
     def bug_at_2(n):
         if n == 2:
             raise RuntimeError("harness bug")
-    out, run = _tiny_run(monkeypatch, tmp_path, repo, bug_at_2)
+    out, run = tiny_run(monkeypatch, tmp_path, repo, bug_at_2)
     (out / "trials" / "C1__none__2" / "grade.json").mkdir(parents=True)   # grade.json cannot be written
     r = run()
     assert [t["outcome"] for t in r["trials"]][:2] == ["pass", "infra_error"] and r["meta"]["stopped"]
@@ -207,3 +184,57 @@ def test_recover_finds_a_case_id_with_a_slash(tmp_path):
     rec = runner.recover(tmp_path)
     assert rec["counts"]["attempted"] == 1 and rec["arms"]["none"] == {"scored": 1, "passed": 1}
     assert not hasattr(runner, "fcntl")               # imported in run_lock() only: `report` loads without it
+
+
+def test_the_first_write_of_a_trial_stream_is_already_redacted(monkeypatch, tmp_path, repo):
+    out, run = tiny_run(monkeypatch, tmp_path, repo, result="the token is test-token-value-123")
+    monkeypatch.setattr(isolation, "token", lambda: "test-token-value-123")
+    real, first = Path.write_text, []
+
+    def write_then_die(self, data, *a, **k):
+        n = real(self, data, *a, **k)
+        if self.name == "trajectory.jsonl":
+            first.append(self.read_text())
+            raise Killed                              # the process dies right after its first write
+        return n
+    monkeypatch.setattr(Path, "write_text", write_then_die)
+    with pytest.raises(Killed):
+        run()
+    assert first and all("test-token-value-123" not in t and "[REDACTED-TOKEN]" in t for t in first)
+    left = [p for p in out.rglob("*") if p.is_file() and "test-token-value-123" in p.read_text(errors="replace")]
+    assert left == []
+
+
+def test_a_run_killed_before_redaction_leaves_no_raw_stream(monkeypatch, tmp_path, repo):
+    out, run = tiny_run(monkeypatch, tmp_path, repo, result="the token is test-token-value-123")
+    monkeypatch.setattr(isolation, "token", lambda: "test-token-value-123")
+
+    def die(text, **kw):                                    # killed after the trial process ended, before its stream is redacted
+        raise Killed
+    monkeypatch.setattr(runner, "redact", die)
+    with pytest.raises(Killed):
+        run()
+    assert [p for p in out.rglob("*") if p.is_file() and "test-token-value-123" in p.read_text(errors="replace")] == []
+
+
+def test_the_claude_token_in_a_trial_stream_is_an_isolation_failure(monkeypatch, tmp_path, repo):
+    out, run = tiny_run(monkeypatch, tmp_path, repo, result="the token is test-token-value-123")
+    monkeypatch.setattr(isolation, "token", lambda: "test-token-value-123")
+    r = run()
+    first = r["trials"][0]
+    assert first["outcome"] == "isolation_error" and "Claude token" in first["reason"] and r["meta"]["stopped"]
+    assert not any("test-token-value-123" in p.read_text(errors="replace") for p in out.rglob("*") if p.is_file())
+
+
+def test_a_token_in_stderr_of_a_failed_attempt_is_not_retried_away(monkeypatch, tmp_path, repo):
+    out, run = tiny_run(monkeypatch, tmp_path, repo)
+    monkeypatch.setattr(isolation, "token", lambda: "test-token-value-123")
+    calls = []
+
+    def fake_cmd(prompt, **kw):                       # no result event (an infra error), the token on stderr
+        calls.append(prompt)
+        return ["sh", "-c", "echo test-token-value-123 >&2"]
+    monkeypatch.setattr(runner, "claude_cmd", fake_cmd)
+    r = run()
+    assert len(calls) == 1 and r["trials"][0]["outcome"] == "isolation_error" and r["meta"]["stopped"]
+    assert not any("test-token-value-123" in p.read_text(errors="replace") for p in out.rglob("*") if p.is_file())

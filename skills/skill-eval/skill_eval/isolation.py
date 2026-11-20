@@ -51,17 +51,28 @@ def gh_config_dirs(env=os.environ) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(dirs))
 
 
+def extra_deny(env=os.environ) -> tuple[Path, ...]:
+    """SKILL_EVAL_DENY_EXTRA: this machine's other credential files or folders (os.pathsep-separated absolute paths,
+    ~ expanded), e.g. a folder of test tokens. Denied like the default credential stores, and the probe reads them."""
+    paths = [Path(os.path.expanduser(p)) for p in env.get("SKILL_EVAL_DENY_EXTRA", "").split(os.pathsep) if p]   # kept exactly
+    rel = [str(p) for p in paths if not p.is_absolute()]
+    if rel:
+        raise ValueError(f"SKILL_EVAL_DENY_EXTRA takes absolute paths (or ~/...): {', '.join(rel)}")
+    return tuple(dict.fromkeys(paths))
+
+
 def credential_paths(env=os.environ) -> tuple[Path, ...]:
     git = [Path.home() / ".config/git/credentials", *([Path(env["XDG_CONFIG_HOME"]) / "git/credentials"] if env.get("XDG_CONFIG_HOME") else [])]
     # macOS login keychain: gh falls back to its keyring entry even with an empty GH_CONFIG_DIR (`gh auth token`
     # prints the host's token); the sandbox's read deny on the keychain files stops that lookup
     keychain = [Path.home() / "Library/Keychains"] if sys.platform == "darwin" else []
     return tuple(dict.fromkeys([*gh_config_dirs(env), Path.home() / ".git-credentials", *git, Path.home() / ".netrc", Path.home() / ".ssh",
-                                *keychain]))
+                                *keychain, *(q for p in extra_deny(env) for q in (p, p.resolve()))]))   # also /private/var for /var
 
 
-# GitHub token shapes. A trial or probe that printed one anyway must not leave it in a saved file.
-GH_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})")
+# GitHub token shapes. A trial or probe that printed one anyway must not leave it in a saved file. No \b before it:
+# in a JSON line a token after a newline follows the "n" of "\n".
+GH_TOKEN_RE = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})")
 # Keys that would change what a trial can see or do if an auto-synced file in the empty config dir carried them
 # (remote-settings.json / policy-limits.json come from the account). Only key NAMES are ever recorded.
 RISKY_KEYS = {"hooks", "permissions", "env", "plugins", "enabledPlugins", "extraKnownMarketplaces", "skills",
@@ -77,9 +88,10 @@ def token() -> str | None:
     return TOKEN_FILE.read_text().strip() if auth_mode() == "token" else None
 
 
-def trial_settings(arm_skill: str | None, deny_dirs: list[Path], extra_off: list[str] = (), network: list[str] | None = None) -> dict:
+def trial_settings(arm_skill: str | None, deny_dirs: list[Path], extra_off: list[str] = (), network: list[str] | None = None,
+                   env=os.environ) -> dict:
     off = {s: "off" for s in [*BUNDLED_SKILLS, *extra_off] if s != arm_skill}
-    paths = [*map(str, deny_dirs), str(Path.home() / ".claude"), str(TOKEN_FILE.parent), *map(str, credential_paths())]
+    paths = [*map(str, deny_dirs), str(Path.home() / ".claude"), str(TOKEN_FILE.parent), *map(str, credential_paths(env))]
     # "//abs/path" is an absolute path rule; "/**" covers a folder's contents, the bare form a single file
     deny = [f"{tool}(/{p}{tail})" for p in paths for tool in ("Read", "Edit") for tail in ("", "/**")]
     sandbox = {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False}
@@ -205,14 +217,19 @@ def register_secret(value: str) -> None:
     _SECRETS.update(p for p in parts if p and len(p) >= 8)
 
 
-def redact(text: str) -> str:
+def redact(text: str, also=()) -> str:
     """Remove the token, registered secrets, any GitHub-token-shaped string and the token file's folder (in any
-    spelling) from text that will be saved or shown."""
-    tok = token()
-    if tok:
-        text = text.replace(tok, "[REDACTED-TOKEN]")
-    for sec in sorted(_SECRETS, key=len, reverse=True):     # the whole URL first, then a password left anywhere else
-        text = text.replace(sec, "[REDACTED-SECRET]")
+    spelling) from text that will be saved or shown. also: the token a child process was given (the file may have
+    changed since). Each value also as a JSON string holds it (\\ and \" escaped, \\u or UTF-8), once or twice (a tool
+    result that is itself JSON): the streams are JSON lines."""
+    values = [(v, "[REDACTED-TOKEN]") for v in dict.fromkeys([*also, token()]) if v]
+    values += [(sec, "[REDACTED-SECRET]") for sec in sorted(_SECRETS, key=len, reverse=True)]   # whole URL first
+    for value, mark in values:                    # the longest spelling first: "a\\" before "a\" (valid JSON stays)
+        forms = {value}
+        for _ in range(2):
+            forms |= {json.dumps(f, ensure_ascii=a)[1:-1] for f in forms for a in (True, False)}
+        for form in sorted(forms, key=len, reverse=True):
+            text = text.replace(form, mark)
     text = GH_TOKEN_RE.sub("[REDACTED-GITHUB-TOKEN]", text)
     folder = str(TOKEN_FILE.parent)
     home = str(Path.home())

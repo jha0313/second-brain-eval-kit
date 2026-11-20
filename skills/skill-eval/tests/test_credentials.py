@@ -1,12 +1,13 @@
 """Credential isolation (lane X): the trial env holds no GitHub or git credential, and the probe's credential checks
 judge what the agent printed. Offline: no `claude`, no `gh`, no git credential helper is run."""
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
 
 import pytest
-from fakes import probe_items, tool_call
+from fakes import probe_items, tiny_run, tool_call
 
 from skill_eval import isolation, probe
 from skill_eval.isolation import NO_GIT_CREDENTIALS, TrialEnv
@@ -116,7 +117,7 @@ def test_probe_saved_files_drop_a_github_token(tmp_path, monkeypatch):
     monkeypatch.setattr(isolation, "token", lambda: None)
     stream = tmp_path / "s.jsonl"
     monkeypatch.setattr(probe.subprocess, "run", lambda *a, stdout, **k: stdout.write(
-        json.dumps({"type": "result", "subtype": "success", "result": f"token {FAKE_TOKEN}"}) + "\n"))
+        (json.dumps({"type": "result", "subtype": "success", "result": f"token {FAKE_TOKEN}"}) + "\n").encode()))
     t = probe._call(["true"], tmp_path, {}, stream)
     assert FAKE_TOKEN not in stream.read_text() and "[REDACTED-GITHUB-TOKEN]" in t["final"]
 
@@ -143,10 +144,67 @@ def test_credential_stores_follow_the_hosts_gh_config_dir_and_xdg_config_home(tm
     assert str(work / "hosts.yml") in files and str(xdg / "gh" / "hosts.yml") in files and "~/.config/gh/hosts.yml" in files
 
 
-def test_saved_trial_files_drop_a_github_token(tmp_path, monkeypatch):
-    from skill_eval import runner
+def test_saved_trial_files_drop_a_github_token(tmp_path, monkeypatch, repo):
+    out, run = tiny_run(monkeypatch, tmp_path, repo, result=f"cat hosts.yml -> oauth_token: {FAKE_TOKEN}")
+    run()
+    saved = [p.read_text() for p in (out / "trials").rglob("trajectory.jsonl")]
+    assert saved and all(FAKE_TOKEN not in t and "[REDACTED-GITHUB-TOKEN]" in t for t in saved)
+
+
+def test_skill_eval_deny_extra_adds_denied_credential_paths(tmp_path, monkeypatch):
+    box = tmp_path / "box"                            # an ordinary folder this user can read
+    box.mkdir(mode=0o700)
+    deny = isolation.trial_settings(None, [])["permissions"]["deny"]
+    assert not any(str(box) in d for d in deny)       # control: not denied until it is listed
+    monkeypatch.setenv("SKILL_EVAL_DENY_EXTRA", os.pathsep.join([str(box), "~/elsewhere/tokens"]))
+    assert isolation.extra_deny() == (box, Path.home() / "elsewhere/tokens")
+    paths = isolation.credential_paths()
+    assert box in paths and box.resolve() in paths
+    deny = isolation.trial_settings(None, [])["permissions"]["deny"]
+    for p in (box, box.resolve(), Path.home() / "elsewhere/tokens"):
+        assert f"Read(/{p})" in deny and f"Read(/{p}/**)" in deny and f"Edit(/{p}/**)" in deny
+    files = dict((n, c) for n, c, _ in probe.credential_cmds())["files"]
+    assert str(box) not in files                      # item extra-deny reads them, with find
+    monkeypatch.setenv("SKILL_EVAL_DENY_EXTRA", "tokens/relative")
+    with pytest.raises(ValueError, match="absolute"):
+        isolation.extra_deny()
+    from skill_eval import cli
+    assert cli.main(["probe", "--out", str(tmp_path / "p")]) == 1      # stops before any call
+
+
+def test_redact_also_removes_a_secret_as_a_json_string_holds_it(monkeypatch):
     monkeypatch.setattr(isolation, "token", lambda: None)
-    f = tmp_path / "trajectory.jsonl"
-    f.write_text(json.dumps({"type": "user", "content": f"cat hosts.yml -> oauth_token: {FAKE_TOKEN}"}) + "\n")
-    runner._redact_files(f)
-    assert FAKE_TOKEN not in f.read_text() and "[REDACTED-GITHUB-TOKEN]" in f.read_text()
+    monkeypatch.setattr(isolation, "_SECRETS", {'pa\\ss"word-123456'})
+    line = json.dumps({"type": "user", "content": 'the url has pa\\ss"word-123456 in it'})
+    assert "word-123456" not in isolation.redact(line) and "[REDACTED-SECRET]" in json.loads(isolation.redact(line))["content"]
+
+
+def test_skill_eval_deny_extra_keeps_paths_exactly_and_cred_files_keep_their_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKILL_EVAL_DENY_EXTRA", f"/keys/token {os.pathsep}{os.pathsep}/keys/b")
+    assert isolation.extra_deny() == (Path("/keys/token "), Path("/keys/b"))
+    work = tmp_path / "gh-work"                       # named both as the host's gh config and as an extra path
+    monkeypatch.setenv("GH_CONFIG_DIR", str(work))
+    monkeypatch.setenv("SKILL_EVAL_DENY_EXTRA", str(work))
+    files = dict((n, c) for n, c, _ in probe.credential_cmds())["files"]
+    assert str(work / "hosts.yml") in files
+
+
+@pytest.mark.parametrize("secret", ['café"sample123', "ends-with-backslash\\", 'pa\\ss"word-123456'])
+def test_redact_keeps_no_secret_and_valid_json_for_any_spelling(monkeypatch, secret):
+    monkeypatch.setattr(isolation, "token", lambda: None)
+    monkeypatch.setattr(isolation, "_SECRETS", {secret})
+    for line in (json.dumps({"r": f"x {secret} y"}), json.dumps({"r": f"x {secret} y"}, ensure_ascii=False)):
+        clean = isolation.redact(line)
+        assert json.loads(clean)["r"] == "x [REDACTED-SECRET] y", (line, clean)
+
+
+def test_redact_finds_a_token_after_an_escape_and_a_secret_in_json_inside_json(monkeypatch):
+    monkeypatch.setattr(isolation, "token", lambda: None)
+    gh = "ghp_" + "A1b2" * 9
+    clean = isolation.redact(json.dumps({"content": "output:\n" + gh + "\tx"}))    # "\\n" + "ghp_": no word boundary
+    assert gh not in clean and json.loads(clean)["content"] == "output:\n[REDACTED-GITHUB-TOKEN]\tx"
+    for secret in ('café"sample123', "ends-with-backslash\\", 'pa\\ss"word-123456'):
+        monkeypatch.setattr(isolation, "_SECRETS", {secret})
+        for a in (True, False):                   # `cat config.json`: the tool result is JSON itself
+            clean = isolation.redact(json.dumps({"content": json.dumps({"pw": secret}, ensure_ascii=a)}, ensure_ascii=a))
+            assert json.loads(json.loads(clean)["content"])["pw"] == "[REDACTED-SECRET]", clean

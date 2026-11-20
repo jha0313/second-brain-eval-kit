@@ -310,14 +310,6 @@ def _sum_tokens(per_model: Iterable[dict]) -> dict:
     return total
 
 
-def _redact_files(*paths: Path) -> None:
-    for p in paths:
-        text = p.read_text(errors="replace")
-        clean = redact(text)
-        if clean != text:
-            p.write_text(clean)
-
-
 def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny: list[Path], use_judge: bool,
               keep_ws: bool) -> dict:
     case, arm, rep = spec["case"], spec["arm"], spec["rep"]
@@ -330,11 +322,14 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
     cmd = claude_cmd(case.prompt, model=suite.model, settings=settings, tools=suite.tools,
                      max_turns=lim["max_turns"], max_usd=lim["max_usd"], effort=suite.effort)
     attempts = []                                 # every attempt is paid for: keep each one's cost, time and tokens
+    token_seen = False                            # the Claude token in any attempt's output: an isolation failure
     for attempt in range(3):                      # infra errors: retry up to 2 times
         ws = make_workspace(templates[arm], ws_root)
         start, timed_out = time.time(), False
         te = TrialEnv(extra={**skill_env(suite, ws, arm), **secret_env(suite, arm)} or None)
-        with open(tdir / "trajectory.jsonl", "w") as so, open(tdir / "stderr.txt", "w") as se, te as env:
+        # the raw stream goes to files with no name on disk (the OS drops them if this process is killed); only the
+        # redacted text is ever written under trials/
+        with tempfile.TemporaryFile() as so, tempfile.TemporaryFile() as se, te as env:
             p = subprocess.Popen(cmd, cwd=ws, env=env, stdin=subprocess.DEVNULL, stdout=so, stderr=se)
             try:
                 p.wait(timeout=lim["timeout_s"])
@@ -342,14 +337,19 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
                 p.kill()
                 p.wait()
                 timed_out = True
+            for f, name in ((so, "trajectory.jsonl"), (se, "stderr.txt")):
+                f.seek(0)
+                raw = f.read().decode(errors="replace")
+                clean = redact(raw, also=[env.get("CLAUDE_CODE_OAUTH_TOKEN")])
+                token_seen |= clean.count("[REDACTED-TOKEN]") > raw.count("[REDACTED-TOKEN]")
+                (tdir / name).write_text(clean)
         seconds = time.time() - start
         state = ws_state(ws, suite.commit)
         if not keep_ws:
             shutil.rmtree(ws, ignore_errors=True)
-        _redact_files(tdir / "trajectory.jsonl", tdir / "stderr.txt")
         traj = parse_stream(tdir / "trajectory.jsonl")
-        traj["ws_state"] = state
-        infra = not timed_out and (not traj["has_result"] or (traj["is_error"] and (
+        traj["ws_state"], traj["token_in_stream"] = state, token_seen
+        infra = not timed_out and not token_seen and (not traj["has_result"] or (traj["is_error"] and (
             traj["terminal_reason"] == "api_error" or any(m in traj["error_text"] for m in INFRA_MARKERS))))
         attempts.append({"seconds": round(seconds, 1), "usd": traj["cost_usd"], "usd_known": traj["has_result"],
                          "tokens_total": sum(traj["tokens"].values()), "infra": infra})
@@ -439,6 +439,8 @@ def isolation_ok(traj: dict, arm_skill: str | None) -> tuple[bool, str]:
         problems.append("auto-memory enabled")
     if traj["hook_events"]:
         problems.append(f"{traj['hook_events']} hook events")
+    if traj.get("token_in_stream"):
+        problems.append("the Claude token appeared in the trial's output (redacted before it was saved)")
     if any(s != arm_skill for s in traj["skills_loaded"]):
         problems.append(f"loaded a skill outside the arm: {traj['skills_loaded']}")
     return (not problems, "; ".join(problems) or "ok")

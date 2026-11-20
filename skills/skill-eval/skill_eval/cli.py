@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import checks, extract, judge, report, runner, stats
 from .freeze import freeze, verify
-from .isolation import scan_saved
+from .isolation import extra_deny, scan_saved
 from .keycheck import check_keys
 from .probe import format_probe, run_probe
 from .selftest import run_selftest
@@ -33,7 +33,16 @@ def _csv(s):
     return [x.strip() for x in s.split(",") if x.strip()] if s else None
 
 
+def check_deny_extra() -> None:
+    """A bad SKILL_EVAL_DENY_EXTRA stops `run` and `probe` before anything starts (not later, inside a trial)."""
+    try:
+        extra_deny()
+    except ValueError as e:
+        raise SuiteError(str(e)) from None
+
+
 def cmd_probe(a):
+    check_deny_extra()
     r = run_probe(Path(a.out), model=a.model, control=not a.no_control)
     print(format_probe(r))
     print(f"\nwrote {runner.short(Path(a.out).resolve() / 'probe.json')}")
@@ -82,6 +91,7 @@ def cmd_freeze(a):
 
 
 def cmd_run(a):
+    check_deny_extra()
     suite = load_suite(a.suite, a.repo)
     if a.model:
         suite.model = a.model
