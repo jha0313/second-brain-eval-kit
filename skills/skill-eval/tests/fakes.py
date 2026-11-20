@@ -71,7 +71,7 @@ def probe_items():
     /w/shared/other/notes.md."""
     from skill_eval import probe
     return probe.attack_items(Path("/w/ws/a1b2c3none"), Path("/w/ws"), Path("/w/scan-only"), Path("/w/outside"),
-                              (Path("/w/extra-deny/canary.txt"),), Path("/w/shared/other/notes.md"))
+                              (Path("/w/extra-deny/canary.txt"),), Path("/w/shared/other/notes.md"), Path("/w/extra-deny/canary.txt"))
 
 
 def tool_call(name, out, err=False, **inp):
