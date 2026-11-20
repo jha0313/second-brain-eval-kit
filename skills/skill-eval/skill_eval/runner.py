@@ -388,9 +388,16 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
     return rec
 
 
-def _redacted(rec: dict) -> dict:
-    """The record with redact() applied to all of its text (redact keeps JSON valid)."""
-    return json.loads(redact(json.dumps(rec, ensure_ascii=False)))
+def _redacted(v):
+    """redact() on every string value of a record, never on a key: the keys are the harness's own names, and a secret
+    equal to one (agent_usd) must not rename the metric the budget reads."""
+    if isinstance(v, str):
+        return redact(v)
+    if isinstance(v, dict):
+        return {k: _redacted(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_redacted(x) for x in v]
+    return v
 
 
 def _grade(rec, suite, case, traj, arm, deny, use_judge, infra, timed_out) -> None:

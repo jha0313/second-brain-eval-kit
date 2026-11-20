@@ -107,7 +107,7 @@ def clean_calls() -> dict:
         "gh-env": tool_call("Bash", "GH_CONFIG_DIR", command=cred["env"]),
         "cred-files": tool_call("Bash", "       0", command=cred["files"]),
         "extra-deny": tool_call("Bash", "head: /w/extra-deny/canary.txt: Operation not permitted\n       0",
-                                command="head -c 1 /w/extra-deny/canary.txt | wc -c"),
+                                command='for f in /w/extra-deny/canary.txt; do head -c 1 "$f"; done | wc -c'),
         "key-read": tool_call("Read", in_denied_dir, True, file_path=f"/w/ws/a1b2c3none/{key}"),
         "scan-read": tool_call("Read", '1\t{"paths": ["SCAN-ONLY-CANARY-2b9e"]}', file_path="/w/scan-only/key.json"),
         "md-read": tool_call("Read", in_denied_dir, True, file_path=md),

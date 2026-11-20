@@ -280,3 +280,11 @@ def test_run_writes_its_plan_before_the_probe(monkeypatch, tmp_path, repo, capsy
     assert cli.main(["run", str(suite), "--dev", "--out", str(out)]) == 2
     assert during and during[0] != "old" and "unfinished run" in capsys.readouterr().out
 
+
+def test_a_secret_equal_to_a_record_key_does_not_break_the_budget(monkeypatch, tmp_path, repo):
+    out, run = tiny_run(monkeypatch, tmp_path, repo)
+    monkeypatch.setattr(isolation, "_SECRETS", {"agent_usd"})          # a database password could be any word
+    data = run()
+    assert all("agent_usd" in t["metrics"] for t in data["trials"]) and len(data["trials"]) == 4
+    assert all("agent_usd" in json.loads(p.read_text())["metrics"] for p in out.rglob("grade.json"))
+
