@@ -1,11 +1,13 @@
 """Credential isolation (lane X): the trial env holds no GitHub or git credential, and the probe's credential checks
 judge what the agent printed. Offline: no `claude`, no `gh`, no git credential helper is run."""
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
 
 import pytest
+from fakes import probe_items, tiny_run, tool_call
 
 from skill_eval import isolation, probe
 from skill_eval.isolation import NO_GIT_CREDENTIALS, TrialEnv
@@ -57,53 +59,65 @@ def test_each_trial_gets_its_own_gh_config_dir_also_with_the_claude_token(host_e
         assert _gh_names(a) == _gh_names(b) == ["GH_CONFIG_DIR"]
 
 
-def _pairs(gh="       0\n", git="0\n", env="GH_CONFIG_DIR\n", files="       0\n", drop=()):
-    """The attack call's (input JSON, output) pairs as probe.run_probe builds them, plus unrelated calls."""
-    rows = [(json.dumps({"command": "ls"}), "a.ts")]
-    rows += [(json.dumps({"command": cmd}), {"gh": gh, "git": git, "env": env, "files": files}[name])
-             for name, cmd, _ in probe.CREDENTIAL_CMDS if name not in drop]
-    return rows
+CRED_ITEMS = {"gh": "gh-token", "git": "git-cred", "env": "gh-env", "files": "cred-files"}
+
+
+def _verdicts(gh="       0\n", git="0\n", env="GH_CONFIG_DIR\n", files="       0\n", drop=()):
+    """The four credential items' verdicts from an attack call that ran them (minus `drop`), plus an unrelated call."""
+    items = probe_items()
+    calls = [tool_call("Bash", "a.ts", command="ls")]
+    calls += [tool_call("Bash", {"gh": gh, "git": git, "env": env, "files": files}[name], command=cmd)
+              for name, cmd, _ in probe.credential_cmds() if name not in drop]
+    ctx = {"detect": "/w/scan-only", "wrote_outside": False, "leaks": probe.leak_finder([])}
+    return {name: probe.judge_item(next(it for it in items if it.id == iid), calls, items, ctx)
+            for name, iid in CRED_ITEMS.items()}
 
 
 def test_probe_credential_checks_pass_on_a_clean_trial():
-    r = probe.credential_checks(_pairs())
-    assert len(r) == 4 and all(ok for ok, _ in r.values()), r
-    r = probe.credential_checks(_pairs(git="Exit code 1\n0\n", env=""))      # a tool's exit line; no GH variable at all
-    assert all(ok for ok, _ in r.values()), r
+    r = _verdicts()
+    assert all(v == "pass" for v, _ in r.values()), r
+    r = _verdicts(git="Exit code 1\n0\n")                       # a tool's exit line
+    assert all(v == "pass" for v, _ in r.values()), r
 
 
-@pytest.mark.parametrize("kw, failing", [
-    ({"gh": "      41\n"}, "gh auth token"),                                  # gh found a token (41 bytes)
-    ({"gh": FAKE_TOKEN + "\n"}, "gh auth token"),                             # the agent dropped `| wc -c`
-    ({"git": "1\n"}, "git credential fill"),
-    ({"env": "GH_CONFIG_DIR\nGITHUB_TOKEN\n"}, "GH_* / GITHUB_*"),
-    ({"env": "GITHUB_TOKEN=" + FAKE_TOKEN + "\n"}, "GH_* / GITHUB_*"),        # the agent dropped `cut`
-    ({"drop": ("gh",)}, "gh auth token"),                                     # not run: nothing proven
-    ({"drop": ("git",)}, "git credential fill"),
-    ({"drop": ("env",)}, "GH_* / GITHUB_*"),
-    ({"files": "     812\n"}, "hosts.yml"),                                    # a credential file was readable
-    ({"drop": ("files",)}, "hosts.yml"),
+@pytest.mark.parametrize("kw, failing, verdict", [
+    ({"gh": "      41\n"}, "gh", "fail"),                                    # gh found a token (41 bytes)
+    ({"gh": FAKE_TOKEN + "\n"}, "gh", "fail"),                               # the agent dropped `| wc -c`: a leak
+    ({"git": "1\n"}, "git", "fail"),
+    ({"env": "GH_CONFIG_DIR\nGITHUB_TOKEN\n"}, "env", "fail"),
+    ({"env": "GITHUB_TOKEN=" + FAKE_TOKEN + "\n"}, "env", "fail"),          # the agent dropped `cut`
+    ({"drop": ("gh",)}, "gh", "missing"),                                    # not run: nothing proven, asked again
+    ({"drop": ("git",)}, "git", "missing"),
+    ({"drop": ("env",)}, "env", "missing"),
+    ({"env": "Permission to use Bash has been denied."}, "env", "missing"),  # not a list of names: proves nothing
+    ({"env": ""}, "env", "missing"),                                         # GH_CONFIG_DIR is in every trial env
+    ({"env": "Exit code 2"}, "env", "missing"),                              # grep failed: no listing
+    ({"files": "     812\n"}, "files", "fail"),                              # a credential file was readable
+    ({"drop": ("files",)}, "files", "missing"),
 ])
-def test_probe_credential_checks_fail_and_keep_no_value(kw, failing):
-    r = probe.credential_checks(_pairs(**kw))
-    bad = [k for k, (ok, _) in r.items() if not ok]
-    assert len(bad) == 1 and failing in bad[0], r
+def test_probe_credential_checks_fail_and_keep_no_value(kw, failing, verdict):
+    r = _verdicts(**kw)
+    assert {k for k, (v, _) in r.items() if v != "pass"} == {failing} and r[failing][0] == verdict, r
     assert FAKE_TOKEN not in json.dumps({k: v[1] for k, v in r.items()})      # evidence: counts and names only
 
 
-def test_probe_commands_print_counts_and_names_and_are_found_in_the_saved_input():
+def test_probe_commands_print_counts_and_names_and_are_found_in_the_command():
     for name, cmd, mark in probe.CREDENTIAL_CMDS:
-        assert mark in json.dumps({"command": cmd}), name        # the marker survives JSON escaping of the tool input
-        assert sum(mark in json.dumps({"command": c}) for _, c, _ in probe.CREDENTIAL_CMDS) == 1, name
+        assert mark in cmd and sum(mark in c for _, c, _ in probe.CREDENTIAL_CMDS) == 1, name
     cmds = {name: cmd for name, cmd, _ in probe.CREDENTIAL_CMDS}
     assert cmds["gh"].endswith("| wc -c") and "grep -c '^password='" in cmds["git"] and cmds["env"].endswith("cut -d= -f1")
+    files = next(it for it in probe_items() if it.id == "cred-files")       # found also when the agent expands ~
+    cmd = files.text.removeprefix("Bash: ")
+    assert probe._found(files, tool_call("Bash", "0", command=cmd.replace("~", str(Path.home()))))
+    assert probe._found(files, tool_call("Bash", "0", command=cmd.replace(str(Path.home()), "~")))
+    assert not probe._found(files, tool_call("Bash", "0", command="cat ~/.netrc 2>/dev/null | wc -c"))   # one file only
 
 
 def test_probe_saved_files_drop_a_github_token(tmp_path, monkeypatch):
     monkeypatch.setattr(isolation, "token", lambda: None)
     stream = tmp_path / "s.jsonl"
     monkeypatch.setattr(probe.subprocess, "run", lambda *a, stdout, **k: stdout.write(
-        json.dumps({"type": "result", "subtype": "success", "result": f"token {FAKE_TOKEN}"}) + "\n"))
+        (json.dumps({"type": "result", "subtype": "success", "result": f"token {FAKE_TOKEN}"}) + "\n").encode()))
     t = probe._call(["true"], tmp_path, {}, stream)
     assert FAKE_TOKEN not in stream.read_text() and "[REDACTED-GITHUB-TOKEN]" in t["final"]
 
@@ -130,10 +144,75 @@ def test_credential_stores_follow_the_hosts_gh_config_dir_and_xdg_config_home(tm
     assert str(work / "hosts.yml") in files and str(xdg / "gh" / "hosts.yml") in files and "~/.config/gh/hosts.yml" in files
 
 
-def test_saved_trial_files_drop_a_github_token(tmp_path, monkeypatch):
-    from skill_eval import runner
+def test_saved_trial_files_drop_a_github_token(tmp_path, monkeypatch, repo):
+    out, run = tiny_run(monkeypatch, tmp_path, repo, result=f"cat hosts.yml -> oauth_token: {FAKE_TOKEN}")
+    run()
+    saved = [p.read_text() for p in (out / "trials").rglob("trajectory.jsonl")]
+    assert saved and all(FAKE_TOKEN not in t and "[REDACTED-GITHUB-TOKEN]" in t for t in saved)
+
+
+def test_skill_eval_deny_extra_adds_denied_credential_paths(tmp_path, monkeypatch):
+    box = tmp_path / "box"                            # an ordinary folder this user can read
+    box.mkdir(mode=0o700)
+    deny = isolation.trial_settings(None, [])["permissions"]["deny"]
+    assert not any(str(box) in d for d in deny)       # control: not denied until it is listed
+    monkeypatch.setenv("SKILL_EVAL_DENY_EXTRA", os.pathsep.join([str(box), "~/elsewhere/tokens"]))
+    assert isolation.extra_deny() == (box, Path.home() / "elsewhere/tokens")
+    paths = isolation.credential_paths()
+    assert box in paths and box.resolve() in paths
+    deny = isolation.trial_settings(None, [])["permissions"]["deny"]
+    for p in (box, box.resolve(), Path.home() / "elsewhere/tokens"):
+        assert f"Read(/{p})" in deny and f"Read(/{p}/**)" in deny and f"Edit(/{p}/**)" in deny
+    files = dict((n, c) for n, c, _ in probe.credential_cmds())["files"]
+    assert str(box) not in files                      # item extra-deny reads them, with find
+    monkeypatch.setenv("SKILL_EVAL_DENY_EXTRA", "tokens/relative")
+    with pytest.raises(ValueError, match="absolute"):
+        isolation.extra_deny()
+    from skill_eval import cli
+    assert cli.main(["probe", "--out", str(tmp_path / "p")]) == 1      # stops before any call
+
+
+def test_redact_also_removes_a_secret_as_a_json_string_holds_it(monkeypatch):
     monkeypatch.setattr(isolation, "token", lambda: None)
-    f = tmp_path / "trajectory.jsonl"
-    f.write_text(json.dumps({"type": "user", "content": f"cat hosts.yml -> oauth_token: {FAKE_TOKEN}"}) + "\n")
-    runner._redact_files(f)
-    assert FAKE_TOKEN not in f.read_text() and "[REDACTED-GITHUB-TOKEN]" in f.read_text()
+    monkeypatch.setattr(isolation, "_SECRETS", {'pa\\ss"word-123456'})
+    line = json.dumps({"type": "user", "content": 'the url has pa\\ss"word-123456 in it'})
+    assert "word-123456" not in isolation.redact(line) and "[REDACTED-SECRET]" in json.loads(isolation.redact(line))["content"]
+
+
+def test_skill_eval_deny_extra_keeps_paths_exactly_and_cred_files_keep_their_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKILL_EVAL_DENY_EXTRA", f"/keys/token {os.pathsep}{os.pathsep}/keys/b")
+    assert isolation.extra_deny() == (Path("/keys/token "), Path("/keys/b"))
+    work = tmp_path / "gh-work"                       # named both as the host's gh config and as an extra path
+    monkeypatch.setenv("GH_CONFIG_DIR", str(work))
+    monkeypatch.setenv("SKILL_EVAL_DENY_EXTRA", str(work))
+    files = dict((n, c) for n, c, _ in probe.credential_cmds())["files"]
+    assert str(work / "hosts.yml") in files
+
+
+@pytest.mark.parametrize("secret", ['café"sample123', "ends-with-backslash\\", 'pa\\ss"word-123456'])
+def test_redact_keeps_no_secret_and_valid_json_for_any_spelling(monkeypatch, secret):
+    monkeypatch.setattr(isolation, "token", lambda: None)
+    monkeypatch.setattr(isolation, "_SECRETS", {secret})
+    for line in (json.dumps({"r": f"x {secret} y"}), json.dumps({"r": f"x {secret} y"}, ensure_ascii=False)):
+        clean = isolation.redact(line)
+        assert json.loads(clean)["r"] == "x [REDACTED-SECRET] y", (line, clean)
+
+
+def test_redact_finds_a_token_after_an_escape_and_a_secret_in_json_inside_json(monkeypatch):
+    monkeypatch.setattr(isolation, "token", lambda: None)
+    gh = "ghp_" + "A1b2" * 9
+    clean = isolation.redact(json.dumps({"content": "output:\n" + gh + "\tx"}))    # "\\n" + "ghp_": no word boundary
+    assert gh not in clean and json.loads(clean)["content"] == "output:\n[REDACTED-GITHUB-TOKEN]\tx"
+    for secret in ('café"sample123', "ends-with-backslash\\", 'pa\\ss"word-123456'):
+        monkeypatch.setattr(isolation, "_SECRETS", {secret})
+        for a in (True, False):                   # `cat config.json`: the tool result is JSON itself
+            clean = isolation.redact(json.dumps({"content": json.dumps({"pw": secret}, ensure_ascii=a)}, ensure_ascii=a))
+            assert json.loads(json.loads(clean)["content"])["pw"] == "[REDACTED-SECRET]", clean
+
+
+def test_redact_removes_github_app_installation_tokens(monkeypatch):
+    monkeypatch.setattr(isolation, "token", lambda: None)
+    for tok in ("ghs_12345_header.payload.signature", "ghs_123456_eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOjF9.c2lnbmF0dXJl-_x"):
+        clean = isolation.redact(json.dumps({"r": f"token: {tok}\n"}))
+        assert tok not in clean and json.loads(clean)["r"] == "token: [REDACTED-GITHUB-TOKEN]\n", clean
+

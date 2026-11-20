@@ -5,7 +5,8 @@
   skill-eval freeze SUITE [--reason TEXT]            write FROZEN.json (hashes of cases, keys, code, rules)
   skill-eval run SUITE --dry-run                     print the plan and the estimated cost; no model calls
   skill-eval run SUITE [-k 3] [-j 4] [--max-usd 20]  run, grade, write results.json + scorecard.html
-  skill-eval report RUN_DIR                          rebuild the terminal table and scorecard.html
+  skill-eval report RUN_DIR                          rebuild the terminal table and scorecard.html (an interrupted
+                                                     run: count its finished trials)
   skill-eval grade RUN_DIR [--new-grading]           re-grade stored trajectories (hard checks + judge; no agent runs)
   skill-eval keycheck SUITE                          do the answer keys point at real commits, files and lines? ($0)
 """
@@ -20,7 +21,7 @@ from pathlib import Path
 
 from . import checks, extract, judge, report, runner, stats
 from .freeze import freeze, verify
-from .isolation import scan_saved
+from .isolation import extra_deny, scan_saved
 from .keycheck import check_keys
 from .probe import format_probe, run_probe
 from .selftest import run_selftest
@@ -32,7 +33,16 @@ def _csv(s):
     return [x.strip() for x in s.split(",") if x.strip()] if s else None
 
 
+def check_deny_extra() -> None:
+    """A bad SKILL_EVAL_DENY_EXTRA stops `run` and `probe` before anything starts (not later, inside a trial)."""
+    try:
+        extra_deny()
+    except ValueError as e:
+        raise SuiteError(str(e)) from None
+
+
 def cmd_probe(a):
+    check_deny_extra()
     r = run_probe(Path(a.out), model=a.model, control=not a.no_control)
     print(format_probe(r))
     print(f"\nwrote {runner.short(Path(a.out).resolve() / 'probe.json')}")
@@ -81,6 +91,7 @@ def cmd_freeze(a):
 
 
 def cmd_run(a):
+    check_deny_extra()
     suite = load_suite(a.suite, a.repo)
     if a.model:
         suite.model = a.model
@@ -117,22 +128,27 @@ def cmd_run(a):
     # paths unreadable); a failing probe runs no trial. --skip-probe exists for dev runs only.
     if a.skip_probe and not a.unfrozen:
         raise SuiteError("--skip-probe is for dev runs only (--dev): a frozen run starts with the isolation probe")
-    probe_rec = {"skipped": True}
-    if not a.skip_probe:
-        pr = run_probe(out / "probe", model=a.probe_model, control=False)
-        probe_rec = {"all_ok": bool(pr["all_ok"]), "file": runner.short(out / "probe" / "probe.json")}
-        if not pr["all_ok"]:
-            print(format_probe(pr))
-            print(f"\nisolation probe failed: no trial was run ({probe_rec['file']})")
-            return 2
-    data = runner.run(suite, specs, out, a.jobs, a.max_usd, est, use_judge=not a.no_judge, keep_ws=a.keep_workspaces,
-                      seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None,
-                      stop_after_denials=a.stop_after_denials, canary=not a.no_canary)
-    data["meta"]["probe"] = probe_rec
-    html_path, text = report.write_reports(data, out)
-    scan = scan_saved(out)                        # grep every saved file for the token (redacts any hit)
-    data["meta"]["token_scan"] = scan
-    (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
+    with runner.run_lock():                       # before the probe: a second `run` stops here, before it pays for anything
+        run_id = runner.write_plan(suite, specs, out)   # this run is the current one in `out` from here on
+        warn = runner.memory_warning()
+        if warn:
+            print(f"\nwarning: {warn}")
+        probe_rec = {"skipped": True}
+        if not a.skip_probe:
+            pr = run_probe(out / "probe", model=a.probe_model, control=False)
+            probe_rec = {"all_ok": bool(pr["all_ok"]), "file": runner.short(out / "probe" / "probe.json")}
+            if not pr["all_ok"]:
+                print(format_probe(pr))
+                print(f"\nisolation probe failed: no trial was run ({probe_rec['file']})")
+                return 2
+        data = runner.run(suite, specs, out, a.jobs, a.max_usd, est, use_judge=not a.no_judge, keep_ws=a.keep_workspaces,
+                          seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None,
+                          stop_after_denials=a.stop_after_denials, canary=not a.no_canary, run_id=run_id)
+        data["meta"]["probe"] = probe_rec
+        html_path, text = report.write_reports(data, out)
+        scan = scan_saved(out)                    # grep every saved file for the token (redacts any hit)
+        data["meta"]["token_scan"] = scan
+        (out / "results.json").write_text(json.dumps(data, indent=1, ensure_ascii=False, default=str))
     print("\n" + text)
     print(f"saved records: token {scan['token']} · {runner.short(out)}/scorecard.html")
     if data["meta"]["stopped"]:
@@ -174,7 +190,30 @@ def plan_table(suite, specs, arms, k, est, a, frozen=None, diffs=()) -> str:
 
 def cmd_report(a):
     out = Path(a.run_dir).resolve()
-    data = json.loads((out / "results.json").read_text())
+    try:
+        data = json.loads((out / "results.json").read_text())
+    except (OSError, ValueError):                 # no results.json, one cut off mid-write, or not readable
+        data = None
+    try:
+        plan = json.loads((out / "plan.json").read_text())
+    except (OSError, ValueError):                 # a run from before plan.json, or none at all
+        plan = None
+    if plan and (data is None or data["meta"].get("run_id") != plan["run_id"]):   # the latest run here did not finish
+        rec = runner.recover(out)
+        c = rec["counts"]
+        excluded = ", ".join(f"{o} {n}" for o, n in c["excluded"].items() if n)
+        print(f"unfinished run (no results.json for it yet: still running, or stopped): {c['attempted']} of "
+              f"{c['expected']} planned trials finished, {c['scored']} scored{' (excluded: ' + excluded + ')' if excluded else ''}")
+        for arm, s in rec["arms"].items():
+            print(f"  {arm:<5} passed {s['passed']}/{s['scored']} scored trial(s)")
+        print(f"recorded cost of the finished trials: ${rec['recorded_usd']:.2f} (not in it: the probe, and trials "
+              "that were still running)")
+        if rec["unreadable"]:
+            print(f"unreadable grade.json (cut off mid-write?): {', '.join(rec['unreadable'])}")
+        print("trial records: trials/*/grade.json (scorecard.html needs a finished run)")
+        return 0
+    if data is None:
+        raise SuiteError(f"no readable results.json in {runner.short(out)}")
     html_path, text = report.write_reports(data, out)
     print(text)
     print(f"\nscorecard {html_path}")
@@ -342,7 +381,7 @@ def main(argv=None):
     a = p.parse_args(argv)
     try:
         return a.fn(a)
-    except SuiteError as e:
+    except (SuiteError, runner.RunLocked) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
