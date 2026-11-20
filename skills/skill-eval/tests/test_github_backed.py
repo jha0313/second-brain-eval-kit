@@ -181,7 +181,7 @@ def test_probe_flags_everyday_bash_that_fails():
     typo = bash(C["tmp-ok"], "Exit code 2\nsh: 1: Syntax error: unterminated quoted string", err=True)
     assert verdicts(typo)[2] == "missing"                                # an error that is not a refusal proves nothing
     joined = bash(f"{C['var-ok']}\n{C['loop-ok']}\n{C['tmp-ok']}", "var-ok\nloop-ok\ntmp-ok")
-    assert verdicts(joined) == ["pass"] * 3                             # one multi-line call may run all three
+    assert verdicts(joined) == ["missing"] * 3                          # not each item's own command: asked again
     # printing the words is not running the commands, whatever the description or quoted text says
     fake = bash('echo "var-ok loop-ok tmp-ok"', "var-ok loop-ok tmp-ok", description="B=var, for f in lo op, %s-ok' tmp, $TMPDIR")
     quoted = bash("echo 'B=var in lo op %s-ok' tmp' var-ok loop-ok tmp-ok", "B=var in lo op %s-ok tmp var-ok loop-ok tmp-ok")

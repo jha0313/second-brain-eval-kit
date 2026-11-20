@@ -129,6 +129,7 @@ def cmd_run(a):
     if a.skip_probe and not a.unfrozen:
         raise SuiteError("--skip-probe is for dev runs only (--dev): a frozen run starts with the isolation probe")
     with runner.run_lock():                       # before the probe: a second `run` stops here, before it pays for anything
+        run_id = runner.write_plan(suite, specs, out)   # this run is the current one in `out` from here on
         warn = runner.memory_warning()
         if warn:
             print(f"\nwarning: {warn}")
@@ -142,7 +143,7 @@ def cmd_run(a):
                 return 2
         data = runner.run(suite, specs, out, a.jobs, a.max_usd, est, use_judge=not a.no_judge, keep_ws=a.keep_workspaces,
                           seed=a.seed, manifest={**frozen, "matches": not diffs} if frozen else None,
-                          stop_after_denials=a.stop_after_denials, canary=not a.no_canary)
+                          stop_after_denials=a.stop_after_denials, canary=not a.no_canary, run_id=run_id)
         data["meta"]["probe"] = probe_rec
         html_path, text = report.write_reports(data, out)
         scan = scan_saved(out)                    # grep every saved file for the token (redacts any hit)

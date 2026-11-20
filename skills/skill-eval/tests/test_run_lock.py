@@ -249,3 +249,34 @@ def test_trial_children_stay_in_the_runner_process_group(monkeypatch, tmp_path, 
     run()
     seen = {f.read_text().strip() for f in out.rglob("stderr.txt")}
     assert seen == {str(os.getpgrp())}
+
+
+def test_a_token_shaped_file_name_is_redacted_in_the_records(monkeypatch, tmp_path, repo):
+    out, run = tiny_run(monkeypatch, tmp_path, repo)
+    stream = tmp_path / "stream.jsonl"
+    name = "ghp_" + "A1b2C3d4" * 5                    # a file the agent made: git status lists it in ws_state
+    monkeypatch.setattr(runner, "claude_cmd", lambda prompt, **kw: ["sh", "-c", f'touch {name}; cat "$0"', str(stream)])
+    data = run()
+    assert name not in json.dumps(data) and not any(name in p.read_text() for p in out.rglob("grade.json"))
+    assert all(t["ws_state"]["untracked"] == ["[REDACTED-GITHUB-TOKEN]"] for t in data["trials"])
+
+
+def test_run_writes_its_plan_before_the_probe(monkeypatch, tmp_path, repo, capsys):
+    """A stop during the probe shows this run as unfinished, not the earlier finished run in the same folder."""
+    repo.write({"a.ts": "x\n"})
+    suite = tiny_suite(tmp_path, repo)
+    out = tmp_path / "r"
+    out.mkdir()
+    (out / "plan.json").write_text(json.dumps({"run_id": "old", "arms": ["base"], "expected": 1}))
+    (out / "results.json").write_text(json.dumps({"meta": {"run_id": "old"}}))
+    during = []
+
+    def stopped_probe(o, **k):                    # what `report` sees while the probe runs, or after a stop in it
+        during.append(json.loads((out / "plan.json").read_text())["run_id"])
+        assert cli.main(["report", str(out)]) == 0
+        return {"all_ok": False, "checks": {}}
+    monkeypatch.setattr(cli, "run_probe", stopped_probe)
+    monkeypatch.setattr(cli, "format_probe", lambda r: "probe: FAILED")
+    assert cli.main(["run", str(suite), "--dev", "--out", str(out)]) == 2
+    assert during and during[0] != "old" and "unfinished run" in capsys.readouterr().out
+

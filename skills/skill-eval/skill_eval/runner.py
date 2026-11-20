@@ -383,8 +383,14 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
         rec.update(hard=rec.get("hard", []), outcome="infra_error", score=None, passed=None,
                    reason=f"grader exception: {type(e).__name__}: {e}"[:200], grader_exception=True)
         rec.setdefault("skill_loaded", None)
+    rec = _redacted(rec)                          # file names in ws_state, the final answer, tool inputs: the agent's
     (tdir / "grade.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False))
     return rec
+
+
+def _redacted(rec: dict) -> dict:
+    """The record with redact() applied to all of its text (redact keeps JSON valid)."""
+    return json.loads(redact(json.dumps(rec, ensure_ascii=False)))
 
 
 def _grade(rec, suite, case, traj, arm, deny, use_judge, infra, timed_out) -> None:
@@ -549,9 +555,20 @@ def progress_line(n: int, total: int, rec: dict, elapsed: float, tty: bool) -> s
             f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}   ({extra})")
 
 
+def write_plan(suite, specs: list[dict], out: Path, run_id: str | None = None) -> str:
+    """plan.json: this run's id, arms and planned trial count, what recover() counts against. `run` writes it as soon
+    as it holds the lock, before the probe: a stop from then on shows this run as unfinished, not an earlier one."""
+    run_id = run_id or secrets.token_hex(6)
+    arms = sorted({s["arm"] for s in specs}, key=list(suite.arms).index)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "plan.json.tmp").write_text(json.dumps({"run_id": run_id, "arms": arms, "expected": len(specs)}, indent=1))
+    os.replace(out / "plan.json.tmp", out / "plan.json")          # whole or not there: a kill cannot leave half of it
+    return run_id
+
+
 def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, est: dict,
         use_judge: bool = True, keep_ws: bool = False, log=print, seed: int = 0, manifest: dict | None = None,
-        stop_after_denials: int = 3, canary: bool = True) -> dict:
+        stop_after_denials: int = 3, canary: bool = True, run_id: str | None = None) -> dict:
     if auth_mode() != "token" and os.environ.get("SKILL_EVAL_ALLOW_KEYCHAIN") != "1":
         raise RuntimeError("no token file: trials would use your own Claude Code config. Run `claude setup-token` "
                            "and save the token (see SKILL.md), or set SKILL_EVAL_ALLOW_KEYCHAIN=1 for a dev run.")
@@ -568,10 +585,8 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
     arms = sorted({s["arm"] for s in specs}, key=list(suite.arms).index)
     # what recover() needs if the run dies before results.json: each finished trial already has its grade.json. The id
     # tells this run's records from an earlier run's in the same folder
-    run_id = secrets.token_hex(6)
+    run_id = write_plan(suite, specs, out, run_id)
     specs = [{**s, "run_id": run_id} for s in specs]
-    (out / "plan.json.tmp").write_text(json.dumps({"run_id": run_id, "arms": arms, "expected": len(specs)}, indent=1))
-    os.replace(out / "plan.json.tmp", out / "plan.json")          # whole or not there: a kill cannot leave half of it
     log(f"preparing {len(arms)} arm workspace(s): {suite.label} @{suite.commit[:8]}, without {', '.join(suite.strip)} ...")
     templates = {a: build_template(suite, a, ws_root) for a in arms}
     index = build_index(suite, ws_root, templates)
@@ -610,8 +625,8 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
                     try:
                         rec = run_trial(suite, spec, out, ws_root, templates, deny, use_judge, keep_ws)
                     except Exception as e:        # a harness bug in one trial must not hang the budget or lose the run
-                        rec = skipped(spec, "infra_error", f"runner exception: {type(e).__name__}: {e}"[:200])
-                        rec.update(runner_exception=True, run_id=run_id)
+                        rec = _redacted(skipped(spec, "infra_error", f"runner exception: {type(e).__name__}: {e}"[:200])
+                                        | {"runner_exception": True, "run_id": run_id})
                         try:                      # on disk too: recover() counts it if the run dies
                             (out / "trials" / rec["trial_id"]).mkdir(parents=True, exist_ok=True)
                             (out / "trials" / rec["trial_id"] / "grade.json").write_text(json.dumps(rec, indent=1))

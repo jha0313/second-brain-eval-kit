@@ -71,8 +71,9 @@ def credential_paths(env=os.environ) -> tuple[Path, ...]:
 
 
 # GitHub token shapes. A trial or probe that printed one anyway must not leave it in a saved file. No \b before it:
-# in a JSON line a token after a newline follows the "n" of "\n".
-GH_TOKEN_RE = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})")
+# in a JSON line a token after a newline follows the "n" of "\n". After the prefix also "_", "." and "-": an app
+# installation token can be ghs_<app id>_<JWT>.
+GH_TOKEN_RE = re.compile(r"(?:gh[pousr]_[A-Za-z0-9_.-]{30,}|github_pat_[A-Za-z0-9_]{30,})")
 # Keys that would change what a trial can see or do if an auto-synced file in the empty config dir carried them
 # (remote-settings.json / policy-limits.json come from the account). Only key NAMES are ever recorded.
 RISKY_KEYS = {"hooks", "permissions", "env", "plugins", "enabledPlugins", "extraKnownMarketplaces", "skills",

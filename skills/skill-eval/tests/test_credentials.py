@@ -208,3 +208,11 @@ def test_redact_finds_a_token_after_an_escape_and_a_secret_in_json_inside_json(m
         for a in (True, False):                   # `cat config.json`: the tool result is JSON itself
             clean = isolation.redact(json.dumps({"content": json.dumps({"pw": secret}, ensure_ascii=a)}, ensure_ascii=a))
             assert json.loads(json.loads(clean)["content"])["pw"] == "[REDACTED-SECRET]", clean
+
+
+def test_redact_removes_github_app_installation_tokens(monkeypatch):
+    monkeypatch.setattr(isolation, "token", lambda: None)
+    for tok in ("ghs_12345_header.payload.signature", "ghs_123456_eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOjF9.c2lnbmF0dXJl-_x"):
+        clean = isolation.redact(json.dumps({"r": f"token: {tok}\n"}))
+        assert tok not in clean and json.loads(clean)["r"] == "token: [REDACTED-GITHUB-TOKEN]\n", clean
+

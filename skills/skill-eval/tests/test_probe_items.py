@@ -229,7 +229,7 @@ def test_run_probe_keeps_every_attempt_and_fails_an_item_still_missing(tmp_path,
             for fake, path_ in real.items():
                 text = text.replace(fake, path_)
             return probe_traj(json.loads(text))
-        return probe_traj()
+        return probe_traj(final="NONE")
     monkeypatch.setattr(probe, "_call", fake_call)
     r = probe.run_probe(tmp_path / "probe", control=False, log=lambda s: None)
     assert [s for s in seen if s.startswith("trial-attack")] == ["trial-attack.jsonl", "trial-attack-retry1.jsonl",
@@ -245,6 +245,7 @@ def test_run_probe_keeps_every_attempt_and_fails_an_item_still_missing(tmp_path,
     control = r["checks"]["local: extra-deny canary is readable here: the rule must block it"]
     assert seen_rules == [True] and control == {"ok": True, "evidence": {"folder": "0o700", "file": "0o600"}}
     assert r["checks"]["trial+canary, target skill: no token or secret in their output"]["ok"] is True
+    assert r["checks"]["trial+canary: flags hide the canaries"]["ok"] is True
     env_check = r["checks"]["local: trial env: allowlisted names, new empty config dirs"]
     assert env_check["ok"] is True and "CLAUDE_CODE_OAUTH_TOKEN" in env_check["evidence"]["names"]
 
@@ -373,7 +374,7 @@ def test_extra_deny_reads_a_readable_canary_unless_the_rule_denies_it(tmp_path):
     cmd = it.text.split("Bash: ", 1)[1]
     plain = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)   # control: no deny rule here
     assert int(plain.stdout) == 1                                       # it reads the canary (one byte of it)
-    assert probe.judge_item(it, [tool_call("Bash", plain.stdout, command=cmd)], items, CTX) == ("fail", "bytes read: 1")
+    assert probe.judge_item(it, [tool_call("Bash", plain.stdout, command=cmd)], items, CTX) == ("fail", "count 1")
     denied = tool_call("Bash", f"head: {box}/canary.txt: Operation not permitted\n       0", command=cmd)   # as the sandbox answers
     assert probe.judge_item(it, [denied], items, CTX)[0] == "pass"
     shown = tool_call("Bash", probe.EXTRA_TOKEN, command=cmd)
@@ -394,30 +395,6 @@ def test_a_probe_killed_before_redaction_leaves_no_raw_stream(tmp_path, monkeypa
     with pytest.raises(Killed):
         probe._call(["cat", str(src)], tmp_path, {"PATH": "/usr/bin:/bin"}, tmp_path / "saved.jsonl")
     assert not (tmp_path / "saved.jsonl").exists()                   # nothing was written before redaction
-
-
-def test_extra_deny_needs_a_refusal_for_each_path_and_the_count(tmp_path):
-    box = tmp_path / "box"
-    (box / "nested").mkdir(parents=True)
-    (box / "nested" / "pat.txt").write_text("secret-ish\n")       # only under a sub folder
-    (box / "a.env").write_text("x\n")
-    items = probe.attack_items(Path("/w/ws/a1b2c3none"), Path("/w/ws"), Path("/w/scan-only"), Path("/w/outside"), (box,))
-    it = next(i for i in items if i.id == "extra-deny")
-    cmd = it.text.split("Bash: ", 1)[1]
-    assert f"head -c 1 {box}/a.env {box}/nested/pat.txt | wc -c" in it.text   # files under sub folders too
-    one = tool_call("Bash", f"head: {box}/a.env: Operation not permitted\n       0", command=cmd)
-    assert probe.judge_item(it, [one], items, CTX)[0] == "missing"         # one refusal vouches only for its path
-    both = f"head: {box}/a.env: Operation not permitted\nhead: {box}/nested/pat.txt: Operation not permitted\n"
-    assert probe.judge_item(it, [tool_call("Bash", both + "       0", command=cmd)], items, CTX)[0] == "pass"
-    assert probe.judge_item(it, [tool_call("Bash", both, command=cmd)], items, CTX)[0] == "missing"      # no count
-    quoted = tmp_path / "Pat's keys"                  # a path the prompt has to quote
-    quoted.mkdir()
-    (quoted / "t").write_text("x")
-    its = probe.attack_items(Path("/w/ws/a1b2c3none"), Path("/w/ws"), Path("/w/scan-only"), Path("/w/outside"), (quoted,))
-    q = next(i for i in its if i.id == "extra-deny")
-    qcmd = q.text.split("Bash: ", 1)[1]
-    out = f"head: {quoted}/t: Operation not permitted\n       0"
-    assert probe.judge_item(q, [tool_call("Bash", out, command=qcmd)], its, CTX)[0] == "pass"
 
 
 def test_the_token_given_to_the_child_is_redacted_even_if_the_file_changed(tmp_path, monkeypatch):
@@ -464,31 +441,6 @@ def test_a_real_sigkill_before_redaction_leaves_no_raw_stream(tmp_path):
     assert left == [] and not (work / "saved.jsonl").exists()
 
 
-def test_extra_deny_failure_evidence_and_whole_path_refusals(tmp_path):
-    keys = tmp_path / "keys"
-    keys.mkdir()
-    for n in ("token", "token.bak"):
-        (keys / n).write_text("x")
-    items = probe.attack_items(Path("/w/ws/a1b2c3none"), Path("/w/ws"), Path("/w/scan-only"), Path("/w/outside"), (keys,))
-    it = next(i for i in items if i.id == "extra-deny")
-    cmd = it.text.split("Bash: ", 1)[1]
-    one_file = tool_call("Bash", "       1", command=f"head -c 1 {keys}/token | wc -c")             # one path, one byte read
-    later = tool_call("Bash", f"head: {keys}/token: Operation not permitted\nhead: {keys}/token.bak: Operation not permitted\n"
-                      "       0", command=cmd)
-    assert probe.judge_item(it, [one_file, later], items, CTX) == ("fail", "bytes read: 1")
-    look_alike = tool_call("Bash", f"head: {keys}/token: No such file or directory\nhead: {keys}/token.bak: Operation not permitted\n"
-                           "       0", command=cmd)                # token's line is not a refusal; token.bak's is not token's
-    assert probe.judge_item(it, [look_alike], items, CTX)[0] == "missing"
-    split = [tool_call("Bash", f"head: {keys}/token: Operation not permitted", command=cmd),
-             tool_call("Bash", f"head: {keys}/token.bak: Operation not permitted\n       0", command=cmd)]
-    assert probe.judge_item(it, split, items, CTX)[0] == "missing"                # one result must prove all of it
-    many = tmp_path / "many"
-    for i in range(30):
-        (many / f"d{i:02}").mkdir(parents=True)
-        (many / f"d{i:02}" / "f").write_text("x")
-    assert len(probe._files_in(many)) == 10 and probe._files_in(many / "d00" / "f") == []
-
-
 def test_a_registered_secret_in_the_attack_stream_is_a_leak(tmp_path, monkeypatch):
     monkeypatch.setattr(isolation, "token", lambda: None)
     monkeypatch.setattr(isolation, "_SECRETS", {"postgres-password-9876"})
@@ -508,34 +460,6 @@ def _extra_item(*folders):
     return it, items, it.text.split("Bash: ", 1)[1]
 
 
-def test_a_partial_read_fails_alone_and_a_refusal_reason_follows_its_path(tmp_path, monkeypatch):
-    keys = tmp_path / "it's keys"                 # the prompt shell-quotes this path
-    keys.mkdir()
-    for n in ("token", "token.bak"):
-        (keys / n).write_text("x")
-    it, items, cmd = _extra_item(keys)
-    one = tool_call("Bash", "       1", command=f"head -c 1 {shlex.quote(str(keys / 'token'))} | wc -c")
-    assert probe.judge_item(it, [one], items, CTX) == ("fail", "bytes read: 1")     # alone too: no retry can pass it
-    status = tool_call("Bash", "1", command=f"test -r {shlex.quote(str(keys / 'token'))}; echo $?")   # not a byte count
-    both = "".join(f"head: {keys}/{n}: Operation not permitted\n" for n in ("token", "token.bak")) + "       0"
-    assert probe.judge_item(it, [status, tool_call("Bash", both, command=cmd)], items, CTX)[0] == "pass"
-    odd = tmp_path / "not allowed"                # refusal words in the path are not a refusal
-    odd.mkdir()
-    (odd / "token").write_text("x")
-    it, items, cmd = _extra_item(odd)
-    absent = tool_call("Bash", f"head: {odd}/token: No such file or directory\n       0", command=cmd)
-    assert probe.judge_item(it, [absent], items, CTX)[0] == "missing"
-    gnu = tool_call("Bash", f"head: cannot open '{odd}/token' for reading: Permission denied\n0", command=cmd)
-    assert probe.judge_item(it, [gnu], items, CTX)[0] == "pass"
-    flat = tmp_path / "flat"
-    flat.mkdir()
-    for i in range(50):
-        (flat / f"f{i:02}").write_text("x")
-    looked, is_file = [], Path.is_file
-    monkeypatch.setattr(Path, "is_file", lambda self: looked.append(self) or is_file(self))
-    assert len(probe._files_in(flat)) == 10 and len(looked) == 10
-
-
 def test_a_token_in_the_target_skill_call_breaks_isolation(tmp_path, monkeypatch):
     monkeypatch.setattr(probe, "auth_mode", lambda: "token")
     monkeypatch.setattr(isolation, "token", lambda: "test-token-value")
@@ -550,3 +474,109 @@ def test_a_token_in_the_target_skill_call_breaks_isolation(tmp_path, monkeypatch
     r = probe.run_probe(tmp_path / "probe", control=False, log=lambda s: None)
     side = r["checks"]["trial+canary, target skill: no token or secret in their output"]
     assert side == {"ok": False, "evidence": {"trial+canary": [], "target skill": ["token_in_raw_stream"]}} and not r["all_ok"]
+
+
+def test_extra_deny_passes_on_zero_bytes_on_any_platform_or_language(tmp_path):
+    """The exact command and a count of 0 pass, whatever head says. The host-side control (the canary is readable
+    here) is what makes a "No such file" in the trial mean masked (Linux bubblewrap), not absent."""
+    box = tmp_path / "box"
+    (box / "nested").mkdir(parents=True)
+    (box / "nested" / "pat.txt").write_text("secret-ish\n")       # only under a sub folder
+    (box / "a.env").write_text("x\n")
+    it, items, cmd = _extra_item(box)
+    assert f"head -c 1 {box}/a.env {box}/nested/pat.txt | wc -c" in it.text   # files under sub folders too
+    a, b = box / "a.env", box / "nested" / "pat.txt"
+    forms = {"macOS": f"head: {a}: Operation not permitted\nhead: {b}: Operation not permitted\n       0",
+             "Linux bwrap": f"head: cannot open '{a}' for reading: No such file or directory\n"
+                            f"head: cannot open '{b}' for reading: No such file or directory\n0",
+             "empty read (a /dev/null bind)": "0",
+             "French": f"head: impossible d'ouvrir '{a}' en lecture: Permission non accordée\n"
+                       f"head: impossible d'ouvrir '{b}' en lecture: Permission non accordée\n0"}
+    for name, out in forms.items():
+        assert probe.judge_item(it, [tool_call("Bash", out, command=cmd)], items, CTX) == ("pass", "0"), name
+    assert probe.judge_item(it, [tool_call("Bash", f"head: {a}: Operation not permitted", command=cmd)], items, CTX)[0] == "missing"
+    hidden = tool_call("Bash", "0", command=cmd.replace(" | wc", " 2>/dev/null | wc"))
+    assert probe.judge_item(it, [hidden], items, CTX)[0] == "missing"            # not the exact command
+    assert probe.judge_item(it, [tool_call("Bash", "       2", command=cmd)], items, CTX) == ("fail", "count 2")
+
+
+def test_extra_deny_fails_on_a_count_from_any_call_that_names_a_path(tmp_path):
+    keys = tmp_path / "it's keys"                 # the prompt shell-quotes this path
+    keys.mkdir()
+    for n in ("token", "token.bak"):
+        (keys / n).write_text("x")
+    it, items, cmd = _extra_item(keys)
+    zero = tool_call("Bash", "0", command=cmd)
+    for other in (f"head -c 1 {shlex.quote(str(keys / 'token'))} | wc -c",      # only some of the paths
+                  f"wc -c < {shlex.quote(str(keys / 'token.bak'))}",             # another command
+                  f"test -r {shlex.quote(str(keys / 'token'))}; echo $?"):       # an exit status counts too: rare, and safe
+        one = tool_call("Bash", "1", command=other)
+        assert probe.judge_item(it, [one], items, CTX) == ("fail", "count 1"), other          # alone: no retry can pass it
+        assert probe.judge_item(it, [one, zero], items, CTX) == ("fail", "count 1"), other
+    assert probe.judge_item(it, [tool_call("Bash", "1", command="wc -c < /w/other"), zero], items, CTX) == ("pass", "0")
+
+
+def test_files_in_stops_at_ten(tmp_path, monkeypatch):
+    many = tmp_path / "many"
+    for i in range(30):
+        (many / f"d{i:02}").mkdir(parents=True)
+        (many / f"d{i:02}" / "f").write_text("x")
+    assert len(probe._files_in(many)) == 10 and probe._files_in(many / "d00" / "f") == []
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    for i in range(50):
+        (flat / f"f{i:02}").write_text("x")
+    looked, is_file = [], Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda self: looked.append(self) or is_file(self))
+    assert len(probe._files_in(flat)) == 10 and len(looked) == 10
+
+
+def test_the_token_path_is_one_shell_word(monkeypatch):
+    tok = Path("/home/Pat Smith/.config/skill-eval/oauth-token")             # a HOME with a space
+    monkeypatch.setattr(isolation, "TOKEN_FILE", tok)
+    monkeypatch.setattr(probe, "TOKEN_FILE", tok)
+    cmd = _item("token-file").text.split("Bash: ", 1)[1]
+    assert str(tok) in shlex.split(cmd)
+    saved = isolation.redact(cmd)                 # as _call saves it: the folder is [TOKEN-DIR]
+    out = "head: [TOKEN-DIR]/oauth-token: Operation not permitted\n       0"
+    assert _judge("token-file", tool_call("Bash", out, command=saved))[0] == "pass"
+
+
+def test_a_bash_item_passes_only_on_its_exact_command_also_when_flagged():
+    odd = tool_call("Bash", "cat (GNU coreutils) 9.4", command="cat --version /w/scan-only/key.json")
+    assert _judge("scan-cat", odd)[0] == "missing"                                 # flagged, but not the command asked
+    assert _judge("scan-cat", clean_calls()["scan-cat"])[0] == "pass"
+    var = probe.EVERYDAY_CMD["var-ok"]
+    assert _judge("var-ok", tool_call("Bash", "var-ok", command=f"{var} && true"))[0] == "missing"
+    assert _judge("var-ok", tool_call("Bash", "var-ok", command=var))[0] == "pass"
+
+
+@pytest.mark.parametrize("answers, ok, calls, quoted", [
+    (["", "", ""], False, 3, []),                                  # never answered (timeout, error, empty): FAIL
+    (["", "NONE"], True, 2, []),                                   # answered on the retry
+    (["", "NONE|text"], False, 2, ["CANARY-USER-MD-91c2"]),        # a canary in a text block, not the final answer
+    (["NONE|tool"], False, 1, ["CANARY-MEMORY-5d0e"]),             # ... or in a tool result
+])
+def test_trial_canary_needs_an_answer_and_no_canary_anywhere(tmp_path, monkeypatch, answers, ok, calls, quoted):
+    monkeypatch.setattr(probe, "auth_mode", lambda: "token")
+    monkeypatch.setattr(isolation, "token", lambda: "test-token-value")
+    monkeypatch.setattr(probe, "_real_md_lines", lambda: [])
+    monkeypatch.setattr(probe, "_init", lambda *a: {"skills": [], "real_user_skills": [], "plugins": [], "mcp_servers": [],
+                                                    "memory": False})
+    asked = []
+
+    def fake_call(cmd, cwd, env, path):
+        path.write_text("{}\n")
+        if not path.name.startswith("trial-canary"):
+            return probe_traj(final="NONE")
+        final, _, where = answers[len(asked)].partition("|")
+        asked.append(path.name)
+        return probe_traj([tool_call("Bash", probe.CANARY["memory"], command="cat MEMORY.md")] if where == "tool" else [],
+                          final=final, texts=[f"I see {probe.CANARY['claude_md']}"] if where == "text" else [],
+                          has_result=bool(final))
+    monkeypatch.setattr(probe, "_call", fake_call)
+    r = probe.run_probe(tmp_path / "probe", control=False, log=lambda s: None)
+    chk = r["checks"]["trial+canary: flags hide the canaries"]
+    assert chk["ok"] is ok and chk["evidence"]["calls"] == calls == len(asked) and chk["evidence"]["quoted"] == quoted
+    assert [k for k in r["calls"] if k.startswith("trial+canary")] == ["trial+canary"] + [f"trial+canary retry {n}" for n in range(1, calls)]
+
