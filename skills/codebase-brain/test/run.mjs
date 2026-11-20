@@ -122,6 +122,10 @@ check('SKILL.md: description fits 1,024 chars, routes Korean questions, and name
   assert.ok(desc.length <= 1024 && /[가-힣]/.test(desc));
   const help = sh(brain, ['--help']);
   for (const flag of new Set(skill.match(/--[a-z][a-z-]+/g))) assert.ok(help.includes(flag), flag);
+  // every brain call it shows is a command of its own: allow rules and sandbox exceptions match only that shape
+  assert.match(skill, /^brain build \. --if-stale +# in the repo root\./m);   // nothing between the command and its comment
+  assert.ok(!/&&\s*brain\b|\$\{?[A-Za-z_]+\}?\s+(?:build|why|search|get|source|status|refresh)\b/.test(skill), 'no `cd … && brain` and no brain path in a shell variable');
+  assert.ok(!/`brain[^`\n]*(?:\||;|&&)[^`\n]*`/.test(skill), 'no inline brain example piped or chained');
 });
 check('viz writes one HTML file', () => assert.ok(existsSync(sh(brain, ['viz', 'src/lib/credits.ts', '--out', join(repo, '..', 'v.html')], { BRAIN_DB: db }).trim().replace(/^~(?=\/)/, homedir()))));
 
