@@ -31,5 +31,11 @@ def repo(tmp_path):
     return Repo(tmp_path / "repo")
 
 
+@pytest.fixture(autouse=True)
+def own_run_lock(tmp_path, monkeypatch):
+    """`run` takes a lock under the user's cache dir: in tests it is a temp one, never the real ~/.cache."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+
 def lines(n, word="line"):
     return "".join(f"{word} {i}\n" for i in range(1, n + 1))

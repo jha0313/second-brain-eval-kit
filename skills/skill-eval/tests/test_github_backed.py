@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from conftest import lines
+from fakes import probe_items, tool_call
 
 from skill_eval import probe, runner
 from skill_eval.checks import check_cites_exist, gh_commit, github_index, is_prepared, prepared_roots
@@ -165,20 +166,26 @@ def test_probe_denies_the_host_paths_trials_deny(tmp_path, monkeypatch):
 
 def test_probe_flags_everyday_bash_that_fails():
     C = probe.EVERYDAY_CMD
-    bash = lambda cmd, out, err=False, **extra: {"name": "Bash", "input": {"command": cmd, **extra}, "is_error": err, "output": out}  # noqa: E731
+    items = probe_items()
+    ctx = {"detect": "/w/scan-only", "wrote_outside": False, "leaks": probe.leak_finder([])}
+
+    def verdicts(*calls):
+        return [probe.judge_item(next(it for it in items if it.id == w), list(calls), items, ctx)[0] for w in probe.EVERYDAY]
+    bash = lambda cmd, out, err=False, **extra: tool_call("Bash", out, err, command=cmd, **extra)  # noqa: E731
     var, loop, tmp = bash(C["var-ok"], "var-ok"), bash(C["loop-ok"], "loop-ok"), bash(C["tmp-ok"], "tmp-ok")
     cwd = bash(C["loop-ok"], "Exit code 1\nloop-ok\nzsh:1: operation not permitted: /tmp/x/cwd-1a2b", err=True)
-    other = {"name": "Bash", "input": {"command": "cat docs/notes/key.json"}, "is_error": True, "output": "denied"}
-    assert probe.everyday_errors([var, other]) == []
-    assert probe.everyday_errors([var, cwd, other]) == ["zsh:1: operation not permitted: /tmp/x/cwd-1a2b"]
-    assert probe.everyday_ok([var, loop, tmp]) == ["var-ok", "loop-ok", "tmp-ok"]
-    assert probe.everyday_ok([var, cwd, tmp]) == ["var-ok", "tmp-ok"]          # the failed loop does not count
+    other = bash("cat docs/notes/key.json", "denied", err=True)
+    assert verdicts(var, loop, tmp) == ["pass"] * 3
+    assert verdicts(var, cwd, tmp) == ["pass", "fail", "pass"]          # a refused loop: FAIL, it is not asked again
+    assert verdicts(var, other) == ["pass", "missing", "missing"]
+    typo = bash(C["tmp-ok"], "Exit code 2\nsh: 1: Syntax error: unterminated quoted string", err=True)
+    assert verdicts(typo)[2] == "missing"                                # an error that is not a refusal proves nothing
     joined = bash(f"{C['var-ok']}\n{C['loop-ok']}\n{C['tmp-ok']}", "var-ok\nloop-ok\ntmp-ok")
-    assert probe.everyday_ok([joined]) == ["var-ok", "loop-ok", "tmp-ok"]       # one multi-line call may run all three
+    assert verdicts(joined) == ["pass"] * 3                             # one multi-line call may run all three
     # printing the words is not running the commands, whatever the description or quoted text says
     fake = bash('echo "var-ok loop-ok tmp-ok"', "var-ok loop-ok tmp-ok", description="B=var, for f in lo op, %s-ok' tmp, $TMPDIR")
     quoted = bash("echo 'B=var in lo op %s-ok' tmp' var-ok loop-ok tmp-ok", "B=var in lo op %s-ok tmp var-ok loop-ok tmp-ok")
-    assert probe.everyday_ok([fake]) == [] and probe.everyday_ok([quoted]) == []
+    assert verdicts(fake) == ["missing"] * 3 and verdicts(quoted) == ["missing"] * 3
     assert "var-ok" not in "".join(C.values()) and "loop-ok" not in "".join(C.values()) and "tmp-ok" not in "".join(C.values())
 
 

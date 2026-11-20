@@ -65,6 +65,7 @@ def parse_stream(path: Path) -> dict:
         "tool_calls": tool_calls,
         "skills_loaded": [skill_name(c["input"]) for c in tool_calls if c["name"] == "Skill"],
         "final": (result or {}).get("result") if result and not result.get("is_error") else (texts[-1] if texts else ""),
+        "texts": texts,                          # every text block of the agent, not only the last (probe leak scan)
         "result_subtype": (result or {}).get("subtype"),
         "terminal_reason": (result or {}).get("terminal_reason"),
         "is_error": bool((result or {}).get("is_error")) if result else True,

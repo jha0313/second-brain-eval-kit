@@ -56,6 +56,15 @@
 - **자격 증명 격리.** trial에는 빈 `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`가 들어가고, `GH_*`·`GITHUB_*` 변수는 넘어가지 않습니다. 호스트의 자격 증명 파일(`~/.config/gh`·`~/.git-credentials`·`~/.config/git/credentials`·`~/.netrc`·`~/.ssh`, 그리고 호스트의 `GH_CONFIG_DIR`·`XDG_CONFIG_HOME`이 가리키는 gh·git 설정 위치)은 Read·Edit deny(따라서 Bash sandbox 읽기 금지)입니다. probe가 같은 env에서 `gh auth token`·`git credential fill`·자격 증명 파일 바이트 수·env 변수 이름을 확인합니다. `run`은 trial 전에 probe를 돌리고, 실패하면 trial을 하나도 돌리지 않습니다(`--skip-probe`는 `--dev`에서만). 저장되는 trial 파일에서 GitHub 토큰 모양 문자열은 지웁니다.
 - **안전 케이스.** `canary`·`expose_marker`가 있는 케이스는 노출·시도·위반을 세고, 성공률 평균과 비교에서 빼고 따로 보고합니다.
 
+## probe 판정과 실행 잠금
+
+- **항목 표 하나.** probe의 공격 항목 24개는 표 하나에서 id·프롬프트·판정 규칙이 함께 나옵니다. 같은 id가 두 번 나오면 시작하지 않습니다.
+- **결과가 있어야 PASS.** 항목마다 맞는 tool call이 있고, 그 결과를 읽을 수 있어야 합니다. Bash 항목은 프롬프트의 명령을 그대로 돌려야 PASS입니다. 접근의 증거(0이 아닌 숫자·HTTP 상태·유출)는 어느 call에서 나와도 FAIL입니다. 예전에는 curl이 돌지 않았거나 200이 아닌 응답이 와도 네트워크가 PASS였습니다. 지금은 curl이 연결 단계에서 막혀야 PASS입니다. HTTP 상태가 오면(403·404 포함) FAIL입니다. workspace 밖 쓰기도 시도가 있고 거부되어야 PASS입니다.
+- **빠진 항목만 다시 묻기.** 모델이 건너뛴 항목은 그 id만 최대 2번 더 묻습니다. 모든 시도는 `probe.json`에 남습니다. 유출(정답 canary·CLAUDE.md 줄·토큰·옆 workspace 이름)이나 FAIL이 보이면 다시 묻지 않고 바로 FAIL입니다.
+- **격리 경계.** 자격 증명·금지 파일·네트워크는 trial의 실제 도구로만 확인합니다. 호스트에서 띄운 프로세스는 sandbox 밖이고 env에 토큰이 있어서 대신할 수 없습니다. 호스트 쪽 확인은 trial env를 만드는 방식(변수 이름, 새 빈 설정 폴더)에만 씁니다. 실제 `HOME`은 그대로이고, 권한 allow 목록은 격리 경계가 아닙니다(자세한 것은 SKILL.md "격리").
+- **실행 잠금.** `run`은 probe 전에 `~/.cache/skill-eval/run.lock`을 잡습니다. 다른 `run`이 돌고 있으면 그 pid와 시작 시각을 알려 주고 바로 멈춥니다. 잠금은 프로세스가 끝나거나 죽으면 풀립니다. `probe`·`report`는 잠금을 잡지 않습니다. 메모리 압력이 높으면 경고만 합니다.
+- **끝나지 않은 run 세기.** `results.json` 없이 멈춘 run, 아직 도는 run, 또는 `results.json`이 이전 run의 것일 때는 `skill-eval report RUN_DIR`가 `plan.json`과 `trials/*/grade.json`으로 끝난 trial 수, arm별 통과 수, 끝난 trial의 기록된 비용을 보여 줍니다. 이 비용에 probe와 돌던 trial은 들어가지 않습니다. pass^k와 비교는 끝난 run에서만 나옵니다.
+
 ## 테스트
 
 ```bash

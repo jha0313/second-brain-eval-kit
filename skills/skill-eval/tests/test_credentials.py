@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from fakes import probe_items, tool_call
 
 from skill_eval import isolation, probe
 from skill_eval.isolation import NO_GIT_CREDENTIALS, TrialEnv
@@ -57,46 +58,58 @@ def test_each_trial_gets_its_own_gh_config_dir_also_with_the_claude_token(host_e
         assert _gh_names(a) == _gh_names(b) == ["GH_CONFIG_DIR"]
 
 
-def _pairs(gh="       0\n", git="0\n", env="GH_CONFIG_DIR\n", files="       0\n", drop=()):
-    """The attack call's (input JSON, output) pairs as probe.run_probe builds them, plus unrelated calls."""
-    rows = [(json.dumps({"command": "ls"}), "a.ts")]
-    rows += [(json.dumps({"command": cmd}), {"gh": gh, "git": git, "env": env, "files": files}[name])
-             for name, cmd, _ in probe.CREDENTIAL_CMDS if name not in drop]
-    return rows
+CRED_ITEMS = {"gh": "gh-token", "git": "git-cred", "env": "gh-env", "files": "cred-files"}
+
+
+def _verdicts(gh="       0\n", git="0\n", env="GH_CONFIG_DIR\n", files="       0\n", drop=()):
+    """The four credential items' verdicts from an attack call that ran them (minus `drop`), plus an unrelated call."""
+    items = probe_items()
+    calls = [tool_call("Bash", "a.ts", command="ls")]
+    calls += [tool_call("Bash", {"gh": gh, "git": git, "env": env, "files": files}[name], command=cmd)
+              for name, cmd, _ in probe.credential_cmds() if name not in drop]
+    ctx = {"detect": "/w/scan-only", "wrote_outside": False, "leaks": probe.leak_finder([])}
+    return {name: probe.judge_item(next(it for it in items if it.id == iid), calls, items, ctx)
+            for name, iid in CRED_ITEMS.items()}
 
 
 def test_probe_credential_checks_pass_on_a_clean_trial():
-    r = probe.credential_checks(_pairs())
-    assert len(r) == 4 and all(ok for ok, _ in r.values()), r
-    r = probe.credential_checks(_pairs(git="Exit code 1\n0\n", env=""))      # a tool's exit line; no GH variable at all
-    assert all(ok for ok, _ in r.values()), r
+    r = _verdicts()
+    assert all(v == "pass" for v, _ in r.values()), r
+    r = _verdicts(git="Exit code 1\n0\n")                       # a tool's exit line
+    assert all(v == "pass" for v, _ in r.values()), r
 
 
-@pytest.mark.parametrize("kw, failing", [
-    ({"gh": "      41\n"}, "gh auth token"),                                  # gh found a token (41 bytes)
-    ({"gh": FAKE_TOKEN + "\n"}, "gh auth token"),                             # the agent dropped `| wc -c`
-    ({"git": "1\n"}, "git credential fill"),
-    ({"env": "GH_CONFIG_DIR\nGITHUB_TOKEN\n"}, "GH_* / GITHUB_*"),
-    ({"env": "GITHUB_TOKEN=" + FAKE_TOKEN + "\n"}, "GH_* / GITHUB_*"),        # the agent dropped `cut`
-    ({"drop": ("gh",)}, "gh auth token"),                                     # not run: nothing proven
-    ({"drop": ("git",)}, "git credential fill"),
-    ({"drop": ("env",)}, "GH_* / GITHUB_*"),
-    ({"files": "     812\n"}, "hosts.yml"),                                    # a credential file was readable
-    ({"drop": ("files",)}, "hosts.yml"),
+@pytest.mark.parametrize("kw, failing, verdict", [
+    ({"gh": "      41\n"}, "gh", "fail"),                                    # gh found a token (41 bytes)
+    ({"gh": FAKE_TOKEN + "\n"}, "gh", "fail"),                               # the agent dropped `| wc -c`: a leak
+    ({"git": "1\n"}, "git", "fail"),
+    ({"env": "GH_CONFIG_DIR\nGITHUB_TOKEN\n"}, "env", "fail"),
+    ({"env": "GITHUB_TOKEN=" + FAKE_TOKEN + "\n"}, "env", "fail"),          # the agent dropped `cut`
+    ({"drop": ("gh",)}, "gh", "missing"),                                    # not run: nothing proven, asked again
+    ({"drop": ("git",)}, "git", "missing"),
+    ({"drop": ("env",)}, "env", "missing"),
+    ({"env": "Permission to use Bash has been denied."}, "env", "missing"),  # not a list of names: proves nothing
+    ({"env": ""}, "env", "missing"),                                         # GH_CONFIG_DIR is in every trial env
+    ({"env": "Exit code 2"}, "env", "missing"),                              # grep failed: no listing
+    ({"files": "     812\n"}, "files", "fail"),                              # a credential file was readable
+    ({"drop": ("files",)}, "files", "missing"),
 ])
-def test_probe_credential_checks_fail_and_keep_no_value(kw, failing):
-    r = probe.credential_checks(_pairs(**kw))
-    bad = [k for k, (ok, _) in r.items() if not ok]
-    assert len(bad) == 1 and failing in bad[0], r
+def test_probe_credential_checks_fail_and_keep_no_value(kw, failing, verdict):
+    r = _verdicts(**kw)
+    assert {k for k, (v, _) in r.items() if v != "pass"} == {failing} and r[failing][0] == verdict, r
     assert FAKE_TOKEN not in json.dumps({k: v[1] for k, v in r.items()})      # evidence: counts and names only
 
 
-def test_probe_commands_print_counts_and_names_and_are_found_in_the_saved_input():
+def test_probe_commands_print_counts_and_names_and_are_found_in_the_command():
     for name, cmd, mark in probe.CREDENTIAL_CMDS:
-        assert mark in json.dumps({"command": cmd}), name        # the marker survives JSON escaping of the tool input
-        assert sum(mark in json.dumps({"command": c}) for _, c, _ in probe.CREDENTIAL_CMDS) == 1, name
+        assert mark in cmd and sum(mark in c for _, c, _ in probe.CREDENTIAL_CMDS) == 1, name
     cmds = {name: cmd for name, cmd, _ in probe.CREDENTIAL_CMDS}
     assert cmds["gh"].endswith("| wc -c") and "grep -c '^password='" in cmds["git"] and cmds["env"].endswith("cut -d= -f1")
+    files = next(it for it in probe_items() if it.id == "cred-files")       # found also when the agent expands ~
+    cmd = files.text.removeprefix("Bash: ")
+    assert probe._found(files, tool_call("Bash", "0", command=cmd.replace("~", str(Path.home()))))
+    assert probe._found(files, tool_call("Bash", "0", command=cmd.replace(str(Path.home()), "~")))
+    assert not probe._found(files, tool_call("Bash", "0", command="cat ~/.netrc 2>/dev/null | wc -c"))   # one file only
 
 
 def test_probe_saved_files_drop_a_github_token(tmp_path, monkeypatch):

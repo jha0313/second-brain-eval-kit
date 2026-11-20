@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -356,7 +357,7 @@ def run_trial(suite, spec: dict, out: Path, ws_root: Path, templates: dict, deny
             break
         time.sleep(5 * (attempt + 1))
     rec = {"trial_id": tid, "case": case.id, "kind": case.kind, "family": case.family, "arm": arm, "rep": rep,
-           "slot": spec.get("slot"), "attempts": attempt + 1, "model": traj["model"],
+           "slot": spec.get("slot"), "run_id": spec.get("run_id"), "attempts": attempt + 1, "model": traj["model"],
            "claude_code_version": traj["claude_code_version"], "visible": traj["visible"],
            "hook_events": traj["hook_events"], "skills_loaded": traj["skills_loaded"], "ws_state": state,
            "models_used": traj["models_used"], "config_files": te.config_keys,
@@ -480,6 +481,56 @@ def deny_list(suite, out: Path) -> list[Path]:
     return sorted({p.resolve() for p in paths})
 
 
+# ---- one heavy run at a time -------------------------------------------------------
+
+class RunLocked(RuntimeError):
+    pass
+
+
+def lock_path() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "skill-eval" / "run.lock"
+
+
+@contextmanager
+def run_lock(path: Path | None = None):
+    """One `run` at a time for this user: two at once on a 16 GB Mac got the shell killed and lost the paid trials.
+    flock is atomic (no count-then-start race) and the OS drops it when the holder exits or is killed, so a lock file
+    left behind never blocks. The file holds the holder's pid and start time, only for the refusal message."""
+    import fcntl                                  # POSIX only: here, so `report` and `--help` load anywhere
+    path = path or lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        holder = os.pread(fd, 200, 0).decode(errors="replace").strip() or "pid not written yet"
+        os.close(fd)
+        raise RunLocked(f"another skill-eval run is running ({holder}). Two heavy runs at once can run out of memory "
+                        f"and lose paid trials: wait for it to end (lock {short(path)})") from None
+    try:
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"pid {os.getpid()}, started {datetime.now().isoformat(timespec='seconds')}".encode(), 0)
+        yield
+    finally:
+        os.ftruncate(fd, 0)
+        os.close(fd)                              # closing the file releases the lock
+
+
+def memory_warning() -> str | None:
+    """Advisory only (a run never stops for it): macOS's memory pressure level when it is above normal."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        r = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"], capture_output=True, text=True)
+    except OSError:                               # no reading: no warning, and the run goes on
+        return None
+    level = r.stdout.strip()
+    if r.returncode != 0 or level in ("", "1"):
+        return None
+    return (f"memory pressure is {'critical' if level == '4' else 'raised'} (level {level}). A heavy run may be killed; "
+            "close other large apps or lower -j")
+
+
 COLOR = {"pass": "32", "fail": "31", "limit": "31", "safety_violation": "35"}
 
 
@@ -511,6 +562,12 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
     if any(ws_root.is_relative_to(d) for d in deny):
         raise RuntimeError(f"workspace root {ws_root} is inside a denied folder")
     arms = sorted({s["arm"] for s in specs}, key=list(suite.arms).index)
+    # what recover() needs if the run dies before results.json: each finished trial already has its grade.json. The id
+    # tells this run's records from an earlier run's in the same folder
+    run_id = secrets.token_hex(6)
+    specs = [{**s, "run_id": run_id} for s in specs]
+    (out / "plan.json.tmp").write_text(json.dumps({"run_id": run_id, "arms": arms, "expected": len(specs)}, indent=1))
+    os.replace(out / "plan.json.tmp", out / "plan.json")          # whole or not there: a kill cannot leave half of it
     log(f"preparing {len(arms)} arm workspace(s): {suite.label} @{suite.commit[:8]}, without {', '.join(suite.strip)} ...")
     templates = {a: build_template(suite, a, ws_root) for a in arms}
     index = build_index(suite, ws_root, templates)
@@ -550,7 +607,12 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
                         rec = run_trial(suite, spec, out, ws_root, templates, deny, use_judge, keep_ws)
                     except Exception as e:        # a harness bug in one trial must not hang the budget or lose the run
                         rec = skipped(spec, "infra_error", f"runner exception: {type(e).__name__}: {e}"[:200])
-                        rec["runner_exception"] = True
+                        rec.update(runner_exception=True, run_id=run_id)
+                        try:                      # on disk too: recover() counts it if the run dies
+                            (out / "trials" / rec["trial_id"]).mkdir(parents=True, exist_ok=True)
+                            (out / "trials" / rec["trial_id"] / "grade.json").write_text(json.dumps(rec, indent=1))
+                        except OSError:           # the record in memory still stops the run below
+                            pass
                     with lock:                    # before the budget is settled: a worker it wakes sees the stop
                         was = breaker.reason
                         breaker.see(rec, canary=is_canary)
@@ -607,7 +669,7 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
         "truncated_output": sum(bool(r.get("truncated_output")) for r in results),
         "claude_code_versions_seen": sorted({r["claude_code_version"] for r in results if r.get("claude_code_version")}),
         "compare": suite.compare, "judge_model": suite.judge_model, "judge_version": judge.JUDGE_VERSION, "votes": suite.votes,
-        "grading_version": checks.GRADING_VERSION, "stopped": breaker.reason, "canary": bool(canaries),
+        "grading_version": checks.GRADING_VERSION, "run_id": run_id, "stopped": breaker.reason, "canary": bool(canaries),
         "stop_after_denials": stop_after_denials, "stopped_in_flight": breaker.in_flight_at_stop,
         "auth_mode": auth_mode(), "seed": seed, "manifest": manifest,
         "index": {k: v for k, v in index.items() if k != "checkout"},
@@ -643,6 +705,29 @@ def run_counts(results: list[dict], expected: int) -> dict:
     return {"expected": expected, "attempted": sum(not r["outcome"].startswith("skipped") for r in results),
             "scored": sum(r["outcome"] in SCORED for r in results),
             "excluded": {o: sum(r["outcome"] == o for r in results) for o in EXCLUDED}}
+
+
+def recover(out: Path) -> dict:
+    """A run that stopped before its results.json (killed, Ctrl-C): the trials that finished, from the grade.json
+    run_trial writes as each one ends, counted against plan.json. A trial still running had no grade.json yet; one
+    from an earlier run into the same folder has another run_id; a file cut off mid-write is listed, not read. Only
+    counts: pass^k and the comparisons need every planned repeat, so they wait for a finished run."""
+    plan = json.loads((out / "plan.json").read_text())
+    trials, unreadable = [], []
+    for p in sorted((out / "trials").rglob("grade.json")):        # rglob: a case id may hold a "/"
+        try:
+            rec = json.loads(p.read_text())
+        except (OSError, ValueError):
+            unreadable.append(str(p.parent.relative_to(out / "trials")))
+            continue
+        if rec.get("run_id") == plan["run_id"]:
+            trials.append(rec)
+    scored = [t for t in trials if t["outcome"] in SCORED]
+    arms = {a: {"scored": sum(t["arm"] == a for t in scored), "passed": sum(t["arm"] == a and bool(t["passed"]) for t in scored)}
+            for a in plan["arms"]}
+    usd = sum(t["metrics"]["agent_usd"] + t["metrics"]["judge_usd"] for t in trials)
+    return {"counts": run_counts(trials, plan["expected"]), "arms": arms, "recorded_usd": round(usd, 4),
+            "unreadable": unreadable, "trials": trials}
 
 
 def repo_instructions(suite) -> dict:
