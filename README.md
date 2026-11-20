@@ -53,7 +53,6 @@ uv run --project $SE skill-eval run suites/my-suite/suite.yaml -k 3 -j 6 --max-u
 | 2 팀 서버 | codebase마다 Neon Postgres 하나. 쓰기는 CI 하나, 읽기는 SELECT만. 노트북은 mirror로 읽음 | [phase2-design.md](docs/phase2-design.md) ([HTML](docs/phase2-design.html)) | 일부 미달: 서버 검색 순위가 로컬과 다름 |
 | 3 자동 갱신 | `brain-publish.yml`(매일 + dispatch)과 `brain ci-publish`. 낡은 답은 footer에 표시하고 `brain refresh`로 갱신 | [phase3-design.md](docs/phase3-design.md) ([HTML](docs/phase3-design.html)) | 대부분 충족: dispatch → publish p95 75.9 s |
 
-검증 결과와 근거는 [docs/reports](docs/reports/README.md)에 있습니다(슬라이드 포함).
 설계하고 구현시킬 때 실제로 쓴 프롬프트는 [prompts](prompts/README.md)에 모았습니다.
 
 - **로컬 모드를 기본으로 권장합니다.** 서버 모드는 로컬과 같은 후보를 찾지만 순서를 다르게 매겨서, 사전 등록 agent eval에서 통과율이 0.10 낮았습니다. 서버 모드는 여러 사람이 같은 brain을 읽어야 할 때 씁니다. 설정은 [skills/codebase-brain/README.md](skills/codebase-brain/README.md)에 있습니다.
