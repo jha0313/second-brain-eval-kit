@@ -54,6 +54,7 @@ def parse_stream(path: Path) -> dict:
     }
     return {
         "model": (init or {}).get("model"),
+        "session_id": (init or {}).get("session_id") or (result or {}).get("session_id"),
         "claude_code_version": (init or {}).get("claude_code_version"),
         "visible": {
             "skills": (init or {}).get("skills"),

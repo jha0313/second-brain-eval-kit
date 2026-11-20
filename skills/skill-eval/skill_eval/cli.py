@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import checks, extract, judge, report, runner, stats
 from .freeze import freeze, verify
-from .isolation import extra_deny, scan_saved
+from .isolation import check_shared_tmp, extra_deny, scan_saved
 from .keycheck import check_keys
 from .probe import format_probe, run_probe
 from .selftest import run_selftest
@@ -41,8 +41,18 @@ def check_deny_extra() -> None:
         raise SuiteError(str(e)) from None
 
 
+def check_temp_folder() -> None:
+    """A symlinked, foreign or shared-writable /tmp/claude-<uid> stops `run` and `probe` before any output path is
+    resolved or written (isolation.check_shared_tmp)."""
+    try:
+        check_shared_tmp()
+    except RuntimeError as e:
+        raise SuiteError(str(e)) from None
+
+
 def cmd_probe(a):
     check_deny_extra()
+    check_temp_folder()
     r = run_probe(Path(a.out), model=a.model, control=not a.no_control)
     print(format_probe(r))
     print(f"\nwrote {runner.short(Path(a.out).resolve() / 'probe.json')}")
@@ -92,6 +102,7 @@ def cmd_freeze(a):
 
 def cmd_run(a):
     check_deny_extra()
+    check_temp_folder()                           # before --out is resolved or plan.json is written under it
     suite = load_suite(a.suite, a.repo)
     if a.model:
         suite.model = a.model

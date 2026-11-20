@@ -164,8 +164,8 @@ def one_vote(prompt: str, model: str, ids: list[str], timeout_s: int = 300) -> d
     cmd += ["--json-schema", json.dumps(SCHEMA)]
     cost, unknown, tokens = 0.0, 0, {}           # every attempt is paid for and uses tokens, not only the one that worked
     for attempt in range(2):                     # grader_error: re-run the grader, never the agent
-        with tempfile.TemporaryDirectory(prefix="skill-eval-judge-") as d, TrialEnv() as env:
-            p = _call(cmd, d, env, timeout_s)
+        with TrialEnv() as env:                  # its cwd too is in its own root, never in /tmp/claude-<uid>
+            p = _call(cmd, tempfile.mkdtemp(prefix="judge-", dir=env["CLAUDE_CODE_TMPDIR"]), env, timeout_s)
         out = None
         try:
             out = json.loads(p.stdout)
