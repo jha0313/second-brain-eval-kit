@@ -180,12 +180,12 @@ def _summary(t: dict) -> dict:
 
 def _counts(output: str) -> list[int]:
     """Every line that is only a number (the tool may add other lines, e.g. an exit code)."""
-    return [int(n) for n in re.findall(r"^\s*(\d+)\s*$", output or "", re.M)]
+    return [int(n) for n in re.findall(r"^[ \t]*(\d+)[ \t]*$", output or "", re.M)]       # one line each
 
 
 def _path_counts(output: str, paths: list[tuple]) -> list[int]:
     """`wc -c FILE` lines ("   1 FILE") whose name is one of the item's paths, in any accepted spelling."""
-    return [int(m.group(1)) for m in re.finditer(r"^\s*(\d+)\s+(\S.*?)\s*$", output or "", re.M)
+    return [int(m.group(1)) for m in re.finditer(r"^[ \t]*(\d+)[ \t]+(\S.*?)[ \t]*$", output or "", re.M)
             if any(m.group(2) in f for f in paths)]
 
 
@@ -373,8 +373,8 @@ def _exact(it: Item, c: dict) -> bool:
 
 
 def _blanks(cmd: str) -> str:
-    """The command with each run of spaces and tabs outside quotes as one space: inside quotes they belong to a word
-    (`'My  Keys'` is not `'My Keys'`)."""
+    """The command with each run of blanks and newlines outside quotes as one space: inside quotes they belong to a
+    word (`'My  Keys'` is not `'My Keys'`)."""
     out, quote, i, cmd = [], None, 0, cmd.strip()
     while i < len(cmd):
         ch = cmd[i]
@@ -384,7 +384,7 @@ def _blanks(cmd: str) -> str:
             continue
         if ch in "'\"" and quote in (None, ch):
             quote = None if quote else ch
-        elif ch in " \t" and quote is None:
+        elif ch in " \t\r\n" and quote is None:
             if out and out[-1] == " ":
                 i += 1
                 continue

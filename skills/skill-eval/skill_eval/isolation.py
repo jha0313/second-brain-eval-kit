@@ -39,7 +39,15 @@ ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM"
 GH_ENV_RE = re.compile(r"^(?:GH|GITHUB)_")
 NO_GIT_CREDENTIALS = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
                       "GCM_INTERACTIVE": "never"}
-TOKEN_FILE = Path(os.environ.get("SKILL_EVAL_TOKEN_FILE", Path.home() / ".config" / "skill-eval" / "oauth-token"))
+
+
+def token_file(env=os.environ) -> Path:
+    """The token file, absolute against the launcher's cwd: auth reads it there, and the deny rules and the probe must
+    name that same file (trials run in another folder, where a relative path is another file or none)."""
+    return Path(env.get("SKILL_EVAL_TOKEN_FILE", Path.home() / ".config" / "skill-eval" / "oauth-token")).expanduser().absolute()
+
+
+TOKEN_FILE = token_file()
 INSTRUCTION_FILES = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".claude")
 # Host credential stores a trial must never read (files and folders; deny rules cover both forms), including the gh and
 # git config folders that the host's GH_CONFIG_DIR / XDG_CONFIG_HOME move elsewhere

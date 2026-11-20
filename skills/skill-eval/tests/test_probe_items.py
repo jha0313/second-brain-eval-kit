@@ -638,3 +638,29 @@ def test_the_exact_command_keeps_blanks_inside_quotes(tmp_path):
     assert probe._exact(it, tool_call("Bash", "0", command=loose)) and probe.judge_item(it, [tool_call("Bash", "0", command=cmd)],
                                                                                         items, CTX) == ("pass", "0")
 
+
+def test_every_line_of_a_result_is_read_for_its_count(tmp_path):
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    (keys / "token").write_text("x")
+    it, items, cmd = _extra_item(keys)
+    both = tool_call("Bash", f"0\n1 {keys}/token", command=f"wc -c < {keys}/token; wc -c {keys}/token")   # a bare 0, then "1 FILE"
+    assert probe.judge_item(it, [both, tool_call("Bash", "0", command=cmd)], items, CTX) == ("fail", "count 1")
+    assert probe._counts("0\n\n  7  \nx 3") == [0, 7]
+
+
+def test_a_relative_token_file_is_fixed_against_the_launcher_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    tok = isolation.token_file({"SKILL_EVAL_TOKEN_FILE": "secrets/oauth-token"})
+    assert tok == tmp_path / "secrets" / "oauth-token" and tok.is_absolute()
+    monkeypatch.setattr(isolation, "TOKEN_FILE", tok)
+    monkeypatch.setattr(probe, "TOKEN_FILE", tok)
+    assert f"head -c 3 {tok} | wc -c" in _item("token-file").text      # the probe names the file auth reads
+    assert f"Read(/{tok.parent}/**)" in isolation.trial_settings(None, [])["permissions"]["deny"]   # and so does the deny
+
+
+def test_a_newline_outside_quotes_is_blank_space_for_the_exact_command():
+    cmd = probe.EVERYDAY_CMD["tmp-ok"]
+    assert "&& " in cmd and _judge("tmp-ok", tool_call("Bash", "tmp-ok", command=cmd.replace("&& ", "&&\n  ")))[0] == "pass"
+    assert _judge("tmp-ok", tool_call("Bash", "tmp-ok", command=cmd.replace("'%s-ok'", "'%s\n-ok'")))[0] == "missing"   # in quotes
+
