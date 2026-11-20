@@ -22,7 +22,8 @@ from pathlib import Path
 
 from . import checks, judge, report, stats
 from .stats import EXCLUDED, SCORED
-from .isolation import TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, harness_dir, redact, register_secret, trial_settings
+from .isolation import (TrialEnv, ancestor_instructions, auth_mode, check_shared_tmp, claude_cmd, clean_env, harness_dir, redact,
+                        register_secret, trial_settings)
 from .trajectory import parse_stream
 
 # Rough $ per trial before any calibration. `--calibrate` replaces these with measured means.
@@ -579,6 +580,7 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
     if auth_mode() != "token" and os.environ.get("SKILL_EVAL_ALLOW_KEYCHAIN") != "1":
         raise RuntimeError("no token file: trials would use your own Claude Code config. Run `claude setup-token` "
                            "and save the token (see SKILL.md), or set SKILL_EVAL_ALLOW_KEYCHAIN=1 for a dev run.")
+    check_shared_tmp()                            # before `out` is made: it may be under a symlinked /tmp/claude-<uid>
     out.mkdir(parents=True, exist_ok=True)
     (out / "trials").mkdir(exist_ok=True)
     ws_root = harness_dir("skill-eval-ws-")       # outside the suite, the kit, the run records and /tmp/claude-<uid>

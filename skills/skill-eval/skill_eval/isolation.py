@@ -154,6 +154,28 @@ def shared_tmp() -> tuple[Path, ...]:
     return tuple(dict.fromkeys([p, Path(os.path.realpath("/tmp")) / p.name]))
 
 
+def check_shared_tmp() -> Path:
+    """The shared folder in its /tmp-resolved spelling, made if absent. A symlink, another owner or write access for
+    others stops skill-eval before it resolves, writes or removes any path: an output folder under a symlinked
+    /tmp/claude-<uid> would land in the link's target, and the probe plants a fake session's folder there."""
+    shared = shared_tmp()[-1]
+    try:
+        shared.mkdir(mode=0o700, exist_ok=True)
+        st = shared.lstat()
+    except OSError as e:                          # e.g. a symlink to nowhere
+        raise RuntimeError(f"{shared} (Claude Code's temp folder): {e}") from e
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise RuntimeError(f"{shared} is not a folder of this user (Claude Code's temp folder) or others can write it: "
+                           "fix it and run again")
+    return shared
+
+
+def cwd_slug(p) -> str:
+    """The name Claude Code gives a session's cwd in its temp folder (observed in 2.1.329): the real path with each
+    character that is not a letter or a digit as "-"."""
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(p))
+
+
 def root_layouts(tmp: str, uid: int) -> list[tuple[Path, int]]:
     """Where the private roots can go, each with the length of a root's random name that keeps <root>/claude-<uid>
     within TMPDIR_MAX bytes (as long as there is room for, at least 8 and at most 16 hex): <tmp>/sk-<uid>, or for a

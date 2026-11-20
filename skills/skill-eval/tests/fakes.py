@@ -68,7 +68,7 @@ def tiny_suite(tmp_path, repo) -> Path:
 def probe_items():
     """The probe's attack table for made-up paths: ws /w/ws/a1b2c3none, scan-only key /w/scan-only, outside /w/outside,
     SKILL_EVAL_DENY_EXTRA /w/extra-deny/canary.txt, another session's file in the shared temp folder
-    /w/shared/other/notes.md. A call's own temp root (CLAUDE_CODE_TMPDIR) is /w/root."""
+    /w/shared/other/notes.md."""
     from skill_eval import probe
     return probe.attack_items(Path("/w/ws/a1b2c3none"), Path("/w/ws"), Path("/w/scan-only"), Path("/w/outside"),
                               (Path("/w/extra-deny/canary.txt"),), Path("/w/shared/other/notes.md"))
@@ -126,7 +126,7 @@ def probe_traj(calls=(), final="", **kw) -> dict:
     """A parsed probe call (trajectory.parse_stream fields the probe reads)."""
     t = {"tool_calls": list(calls), "final": final, "token_in_raw_stream": False, "is_error": False, "has_result": True,
          "result_subtype": "success", "hook_events": 0, "skills_loaded": [], "cost_usd": 0.001, "permission_denied_tools": [],
-         "tmp_root": "/w/root"}
+         "tmp_disk": ("pass", {"session_folder": "<root>/claude-501/-w-ws-a1b2c3none/s1"})}
     t.update(kw)
     return t
 

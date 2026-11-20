@@ -325,3 +325,28 @@ def test_each_judge_vote_starts_in_its_own_temp_root(monkeypatch):
     assert len(seen) == 2 and seen[0][1] != seen[1][1]
     assert all(cwd.parent == root and made and denied for cwd, root, made, denied in seen)
     assert not any(root.exists() for _, root, _, _ in seen)
+
+
+def test_run_and_probe_stop_before_their_output_folder_when_the_shared_folder_is_a_symlink(monkeypatch, tmp_path, repo, capsys):
+    from skill_eval import cli
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "claude-shared"
+    link.symlink_to(target)                       # /tmp/claude-<uid> as a link: --out under it would land in target
+    monkeypatch.setattr(isolation, "shared_tmp", lambda: (link,))
+    out, go = tiny_run(monkeypatch, tmp_path, repo)
+    with pytest.raises(RuntimeError, match="is not a folder of this user"):
+        go()                                      # runner.run: before `out` is made
+    assert not out.exists()
+    suite = tmp_path / "suite" / "suite.yaml"     # tiny_run's suite
+    monkeypatch.setattr(cli.runner, "write_plan", lambda *a: pytest.fail("plan.json must not be written"))
+    for argv in (["run", str(suite), "--dev", "--out", str(link / "run")], ["probe", "--out", str(link / "probe")]):
+        assert cli.main(argv) == 1 and "is not a folder of this user" in capsys.readouterr().err
+    assert list(target.iterdir()) == []
+
+
+def test_the_stream_gives_the_session_id(tmp_path):
+    from skill_eval.trajectory import parse_stream
+    s = tmp_path / "s.jsonl"
+    s.write_text(json.dumps({"type": "system", "subtype": "init", "session_id": "e290-1"}) + "\n")
+    assert parse_stream(s)["session_id"] == "e290-1"
