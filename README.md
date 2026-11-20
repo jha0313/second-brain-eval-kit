@@ -35,7 +35,7 @@ brain why "why reserve credits first"    # 문서·changes·커밋 인용 묶음
 # skill-eval: suites/example/를 복사해 <…> 자리를 내 repo에 맞게 채운 뒤
 SE=~/.claude/skills/skill-eval
 cd $SE && export MY_REPO=/path/to/repo
-uv run --project $SE skill-eval probe --out runs/probe              # 격리 점검 21개 전부 PASS여야 함
+uv run --project $SE skill-eval probe --out runs/probe              # 격리 점검이 모두 PASS(ISOLATION OK)여야 함
 uv run --project $SE skill-eval keycheck suites/my-suite/suite.yaml # 정답표·빈 <…> 자리 점검 ($0)
 uv run --project $SE skill-eval selftest suites/my-suite/suite.yaml # 채점기 점검 ($0)
 uv run --project $SE skill-eval freeze suites/my-suite/suite.yaml   # 고정해야 run이 시작함
