@@ -14,8 +14,8 @@ codebase-brain의 Phase 1–3을 만들 때 실제로 쓴 프롬프트입니다.
 | 4 | 구현 | [상세 계획과 구현 시작](#4-상세-계획과-구현-시작) | [phase1-impl-plan.md](../docs/phase1-impl-plan.md), Phase 1 코드 |
 | 5 | 구현 | [자러 가기 전: 자율 진행 규칙](#5-자러-가기-전-자율-진행-규칙) | 밤새 Phase 2 · 3 구현 |
 | 6 | 구현 | [Phase 2 · 3 구현](#6-phase-2--3-구현) | Phase 2 · 3 코드, 테스트 |
-| 7 | 검증 | [실제 개발로 before / after](#7-실제-개발로-before--after) | [보고서의 개발 trial](../docs/reports/README.md#실제-개발-trial-백로그-과제-4개) |
-| 8 | 검증 | [검증 보고 슬라이드](#8-검증-보고-슬라이드) | [verification-deck.html](../docs/reports/verification-deck.html) |
+| 7 | 검증 | [실제 개발로 before / after](#7-실제-개발로-before--after) | 개발 trial 보고서 |
+| 8 | 검증 | [검증 보고 슬라이드](#8-검증-보고-슬라이드) | 검증 보고 덱 |
 | 9 | 검증 | [슬라이드 다시 만들기](#9-슬라이드-다시-만들기) | 같은 덱 (최종본) |
 | 10 | 검증 | [실제 개발에서 스킬이 쓰였나](#10-실제-개발에서-스킬이-쓰였나) | 과제별 표 |
 | 11 | 개선 | [개선하고 공개 repo에 올리기](#11-개선하고-공개-repo에-올리기) | 스킬 routing 수정, PR · merge |
