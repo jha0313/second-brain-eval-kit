@@ -52,6 +52,8 @@ const ROW_DATE = 'coalesce(r.merged_at, r.closed_at, r.updated_at, r.created_at)
 // a chunk by content (why.mjs, the map tie-break): the last ORDER BY terms of a list, so ties do not follow ids, which a
 // local build and the server assign apart
 const CHUNK_ORDER = 'c.source, c.path, c.sha, c.start_line, c.end_line, c.title';
+// a chunk's item as the server names it (contract.repoItemPtr; a vault note's path is vault:<path>): its group sort key
+const CHUNK_ITEM = "CASE c.source WHEN 'commit' THEN 'commit:' || c.sha WHEN 'vault' THEN c.path ELSE c.source || ':' || c.path END";
 
 function itemLists(gh, t, f, build, add, seeds = []) {
   const w = [`i.kind IN (${marks(f.ghKinds)})`], p = [...f.ghKinds];
@@ -67,7 +69,7 @@ function itemLists(gh, t, f, build, add, seeds = []) {
     p.push(json, json, ...underArgs(f.path));
   }
   const run = (name, from, match, args, order = '', orderArgs = []) => add(name, gh.prepare(
-    `SELECT 'g' || i.id AS key, 'g' || r.id AS grp, ${ROW_DATE} AS d, i.ptr AS ptr, i.flags AS flags FROM ${from} ${ROW}
+    `SELECT 'g' || i.id AS key, 'g' || r.id AS grp, ${ROW_DATE} AS d, i.ptr AS ptr, i.flags AS flags, r.ptr AS gk, NULL AS ga, NULL AS gb FROM ${from} ${ROW}
      WHERE ${match} AND ${w.join(' AND ')} ${order} LIMIT ${CAP + 1}`).all(...args, ...p, ...orderArgs));
   if (t.ascii.length) run('items_fts', 'items_fts JOIN items i ON i.id = items_fts.rowid', 'items_fts MATCH ?', [t.ascii.map(quote).join(' OR ')], 'ORDER BY bm25(items_fts, 3.0, 1.0), i.ptr');
   for (const s of t.tri) {
@@ -96,7 +98,7 @@ function chunkLists(code, t, f, add, seeds = []) {
     p.push(...underArgs(f.path), ...underArgs(f.path));
   }
   const run = (name, from, match, args, order = '', orderArgs = []) => add(name, code.prepare(
-    `SELECT 'c' || c.id AS key, 'c' || c.id AS grp, c.date AS d FROM ${from} WHERE ${match} AND ${w.join(' AND ')} ${order} LIMIT ${CAP + 1}`)
+    `SELECT 'c' || c.id AS key, 'c' || c.id AS grp, c.date AS d, ${CHUNK_ITEM} AS gk, c.start_line AS ga, c.end_line AS gb FROM ${from} WHERE ${match} AND ${w.join(' AND ')} ${order} LIMIT ${CAP + 1}`)
     .all(...args, ...p, ...orderArgs));
   if (t.ascii.length) run('chunks_fts', 'chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid', 'chunks_fts MATCH ?', [t.ascii.map(quote).join(' OR ')], `ORDER BY bm25(chunks_fts, 3.0, 1.0), ${CHUNK_ORDER}`);
   for (const s of t.tri) {
@@ -135,7 +137,9 @@ function candidates(ctx, q, opts = {}) {
     if (f.ghKinds.length) pathRefsPending = itemLists(ctx.gh, t, f, ctx.meta.build_id, add, seeds);
   }
   if (f.sources.length) chunkLists(ctx.code, t, f, add, seeds);
-  return { lists, facts: { pathRefsPending, filesTruncated, githubPresent: !!ctx.gh }, view: view(ctx) };
+  // content(key): a chunk's title and body, which read.mjs rank asks for only when chunks tie on gk / ga / gb
+  const content = (key) => (key[0] === 'c' ? ctx.code.prepare('SELECT title, body FROM chunks WHERE id = ?').get(Number(key.slice(1))) ?? null : null);
+  return { lists, facts: { pathRefsPending, filesTruncated, githubPresent: !!ctx.gh }, view: view(ctx), content };
 }
 
 const chunkRow = (ctx, c) => ({ ...c, key: `c${c.id}`, ptr: chunkPtr(c, ctx.meta.build_id), rev: null, origin: c.source === 'vault' ? 'vault' : 'repo', parentPtr: null });

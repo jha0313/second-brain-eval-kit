@@ -4,13 +4,13 @@
 //   later calls (V16): a run's visible rows never change once it commits, so a later statement at R reads the same data.
 // - Visible at run R: valid_from <= R AND (valid_to IS NULL OR valid_to > R); chunks and refs follow their revision.
 // - Rows keep the Phase 1 SQLite shapes (code.db chunks, github.db items / refs rows, as the mirror writes them) and
-//   the mirror's ids ('c' + chunk_id, 'g' + item_id), so read.mjs shapes both stores alike and ties break as on a mirror
-//   of the same run. The lists follow src/store/sqlite.mjs one by one; FTS is chunk.tsv (simple over brain.fts_text:
-//   tokens and stems as FTS5's, sql/003) ranked by ts_rank instead of FTS5 bm25, and the trigram lists are ILIKE
-//   for every length: a term of 3+ characters one list part each (the pg_trgm indexes when it has a trigram and the
-//   planner takes them), a shorter one (never a trigram) in one shared scan (tr in candidates). Every list breaks
-//   ties by content (CHUNK_ORDER, an item's ptr) as sqlite.mjs does, not by id: a local build and the server number rows
-//   apart.
+//   the mirror's ids ('c' + chunk_id, 'g' + item_id), so read.mjs shapes both stores alike; a search breaks its ties
+//   by content (common.mjs Candidate), not by those ids. The lists follow src/store/sqlite.mjs one by one; FTS is
+//   chunk.tsv (simple over brain.fts_text: tokens and stems as FTS5's, sql/003) ranked by ts_rank instead of FTS5
+//   bm25, and the trigram lists are ILIKE for every length: a term of 3+ characters one list part each (the pg_trgm
+//   indexes when it has a trigram and the planner takes them), a shorter one (never a trigram) in one shared scan (tr
+//   in candidates). Every list breaks ties by content (CHUNK_ORDER, an item's ptr) as sqlite.mjs does, not by id: a
+//   local build and the server number rows apart.
 // - Search payload (§6.9): candidates with top ranks the lists in SQL and returns only the shown groups; rows with
 //   prefix cuts long bodies (read.mjs proves each snippet from the prefix, or reads that row again whole).
 // - Repo memory pointers: <source>:<path>:<a>-<b>@r<n> (rev n of item <source>:<path>). A Phase 1 @<build> pointer
@@ -160,10 +160,11 @@ async function candidates(client, q, opts = {}) {
   const t = termsOf(q), f = filterOf(opts);
   const { params, p } = statement();
   const ctes = [head(atRun(p, opts.asOf))], lists = [], names = [];
+  // a list row: key, grp, d, ptr, flags, gk, ga, gb (common.mjs Candidate)
   const add = (name, select, order) => {
     const c = `l${lists.length}`;
     ctes.push(`${c} AS (SELECT x.*, row_number() OVER (ORDER BY ${order}) AS o FROM (${select}) x ORDER BY o LIMIT ${CAP + 1})`);
-    lists.push(`(SELECT jsonb_build_object('name', '${name}', 'rows', coalesce(jsonb_agg(jsonb_build_array(key, grp, d, ptr, flags) ORDER BY o), '[]'::jsonb)) FROM ${c})`);
+    lists.push(`(SELECT jsonb_build_object('name', '${name}', 'rows', coalesce(jsonb_agg(jsonb_build_array(key, grp, d, ptr, flags, gk, ga, gb) ORDER BY o), '[]'::jsonb)) FROM ${c})`);
     names.push(name);
   };
   // each term through brain.fts_text as the indexed text (sql/003), then "t1" OR "t2" …; terms are [A-Za-z0-9_] only.
@@ -218,15 +219,15 @@ async function candidates(client, q, opts = {}) {
     if (f.author) w.push(`lower(i.author) = ${p(f.author)}`);
     if (f.since) w.push(`coalesce(i.updated_at, i.meta->>'submitted_at', i.meta->>'created_at') >= ${p(f.since)} ${BYTES}`);
     if (f.path) w.push(`(i.ptr IN (SELECT ptr FROM ph) OR p.ptr IN (SELECT ptr FROM ph) OR ${under("i.meta->>'path'")})`);
-    // a review / comment matches as itself but ranks as its PR (else issue) p; d: the date of p
-    ctes.push(`g AS (SELECT i.id, i.ptr, i.rev_id, i.meta->>'flags' AS flags, i.meta->>'merge_sha' AS merge_sha, p.id AS gid,
+    // a review / comment matches as itself but ranks as its PR (else issue) p; d: the date of p, gk: its ptr
+    ctes.push(`g AS (SELECT i.id, i.ptr, i.rev_id, i.meta->>'flags' AS flags, i.meta->>'merge_sha' AS merge_sha, p.id AS gid, p.ptr AS gk,
         coalesce(p.meta->>'merged_at', p.meta->>'closed_at', p.updated_at, p.meta->>'created_at') AS d
       FROM gi i
       LEFT JOIN gi a ON i.kind NOT IN ('pr', 'issue') AND a.ptr = 'pr:' || (i.meta->>'parent_number')
       LEFT JOIN gi b ON i.kind NOT IN ('pr', 'issue') AND b.ptr = 'issue:' || (i.meta->>'parent_number')
       JOIN gi p ON p.id = CASE WHEN i.kind IN ('pr', 'issue') THEN i.id ELSE coalesce(a.id, b.id) END
       WHERE ${w.join(' AND ')})`);
-    const G = (extra = '', from = '') => `SELECT g.id, 'g' || g.id AS key, 'g' || g.gid AS grp, g.d, g.ptr, g.flags${extra} FROM g${from}`;
+    const G = (extra = '', from = '') => `SELECT g.id, 'g' || g.id AS key, 'g' || g.gid AS grp, g.d, g.ptr, g.flags, g.gk, NULL::int AS ga, NULL::int AS gb${extra} FROM g${from}`;
     const text = ' JOIN brain.chunk c ON c.rev_id = g.rev_id AND c.ord = 0';   // the item's search chunk (title + body)
     if (tsq) add('items_fts', `${G(', ts_rank(c.tsv, w.q) AS sc', `${text} CROSS JOIN tq w`)} WHERE c.tsv @@ w.q`, `sc DESC, ptr ${BYTES}`);
     for (const s of t.tri) {
@@ -253,10 +254,10 @@ async function candidates(client, q, opts = {}) {
         JOIN brain.node n ON n.node_id = l.node_id WHERE l.chunk_id = c.chunk_id AND ${vis('l')} AND ${under('n.path')}))`);
     }
     ctes.push(`ch AS NOT MATERIALIZED (SELECT c.chunk_id AS id, 'c' || c.chunk_id AS key, 'c' || c.chunk_id AS grp, c.date AS d, NULL::text AS ptr,
-        NULL::text AS flags, c.tsv, c.title, c.body, c.prs, c.sha, i.kind AS source,
+        NULL::text AS flags, i.ptr AS gk, c.tsv, c.title, c.body, c.prs, c.sha, i.kind AS source,
         CASE WHEN i.kind = 'commit' THEN NULL ELSE substr(i.ptr, length(i.kind) + 2) END AS path, c.start_line, c.end_line
       FROM brain.item_rev r JOIN brain.item i USING (item_id) JOIN brain.chunk c USING (rev_id) WHERE i.origin = 'repo' AND ${vis('r')} AND ${w.join(' AND ')})`);
-    const K = 'SELECT id, key, grp, d, ptr, flags', KC = `${K}, source, path, sha, start_line, end_line, title`;   // KC: for CHUNK_ORDER
+    const K = 'SELECT id, key, grp, d, ptr, flags, gk, start_line AS ga, end_line AS gb', KC = `${K}, source, path, sha, start_line, end_line, title`;   // KC: for CHUNK_ORDER
     if (tsq) add('chunks_fts', `${KC}, ts_rank(tsv, w.q) AS sc FROM ch CROSS JOIN tq w WHERE tsv @@ w.q`, `sc DESC, ${CHUNK_ORDER}`);
     for (const s of t.tri) {
       const k = shortNo(s), L = k ? null : p(likeOf(s));
@@ -273,28 +274,42 @@ async function candidates(client, q, opts = {}) {
 
   // top { cursor, limit } (read.mjs searchIn): the lists are ranked here as read.mjs rank() ranks them, and only the
   // shown groups leave the server (§6.9). A key scores 1 / (RRF_K + o) in each list, summed in list order (the same
-  // float8 additions as rank()), and keeps the grp / d / ptr / flags of its first list; a group scores as its best key
-  // and takes the d of its first key. Keys are ASCII, and so is d as the kit writes it (an ISO date or null), where byte
-  // order is JS string order; a group with any other d gets the lists instead (JS compares UTF-16 code units). kids: the
-  // group's best three other keys (rank() kids). The page end is added in JS (cursor + limit may be Infinity there)
+  // float8 additions as rank()), and keeps the grp / d / ptr / flags / gk / ga / gb of its first list; a group scores as
+  // its best key and takes the d / gk / ga / gb of its first key; a chunk group's title and body are read (gt) only when
+  // it ties with another group on all of those. Keys are ASCII, and so is d as the kit writes it (an ISO date or null),
+  // where byte order is JS string order; a group with any other d gets the lists instead (JS compares d by UTF-16 code
+  // units; gk, title, body and ptr by bytes, as here). kids: the group's best three other keys (rank() kids). The page
+  // end is added in JS (cursor + limit may be Infinity there).
+  // With the lists, content: the title and body of each chunk candidate that shares its gk / ga / gb with another one
+  // (read.mjs rank's last tie-break), once per chunk
   const all = `jsonb_build_array(${lists.join(', ')})`;
-  let out = `${all} AS lists`;
+  const chunkLists = names.flatMap((name, n) => (name.startsWith('chunks') ? [`SELECT key, gk, ga, gb FROM l${n} WHERE o <= ${CAP}`] : []));
+  const content = chunkLists.length ? `(SELECT coalesce(jsonb_object_agg(t.key, jsonb_build_array(x.title, x.body)), '{}'::jsonb)
+      FROM (SELECT key, count(*) OVER (PARTITION BY gk ${BYTES}, ga, gb) AS n FROM (${chunkLists.join(' UNION ')}) u) t
+      JOIN brain.chunk x ON x.chunk_id = substr(t.key, 2)::bigint WHERE t.n > 1)` : `'{}'::jsonb`;
+  let out = `${all} AS lists, ${content} AS content`;
   if (opts.top && !names.length) out = `'{"shown": [], "total": 0, "groups": 0, "truncated": []}'::jsonb AS ranked`;
   else if (opts.top) {
-    ctes.push(`c AS (${names.map((_, n) => `SELECT ${n} AS n, key, grp, d, ptr, flags, o FROM l${n} WHERE o <= ${CAP}`).join(' UNION ALL ')})`,
+    ctes.push(`c AS (${names.map((_, n) => `SELECT ${n} AS n, key, grp, d, ptr, flags, gk, ga, gb, o FROM l${n} WHERE o <= ${CAP}`).join(' UNION ALL ')})`,
       `fu AS (SELECT key, (array_agg(grp ORDER BY n, o))[1] AS grp, (array_agg(d ORDER BY n, o))[1] AS d, (array_agg(ptr ORDER BY n, o))[1] AS ptr,
-          (array_agg(flags ORDER BY n, o))[1] AS flags, sum(1::float8 / (${RRF_K} + o)::float8 ORDER BY n, o) AS score, min(n * ${CAP + 2} + o) AS first
+          (array_agg(flags ORDER BY n, o))[1] AS flags, (array_agg(gk ORDER BY n, o))[1] AS gk, (array_agg(ga ORDER BY n, o))[1] AS ga,
+          (array_agg(gb ORDER BY n, o))[1] AS gb, sum(1::float8 / (${RRF_K} + o)::float8 ORDER BY n, o) AS score, min(n * ${CAP + 2} + o) AS first
         FROM c GROUP BY key)`,
-      `gr AS (SELECT grp AS key, max(score) AS score, (array_agg(d ORDER BY first))[1] AS d FROM fu GROUP BY grp)`,
-      `od AS (SELECT key, d, row_number() OVER (ORDER BY score DESC, coalesce(d, '') ${BYTES} DESC, key ${BYTES}) AS rn FROM gr)`);
+      `gr AS (SELECT grp AS key, max(score) AS score, (array_agg(d ORDER BY first))[1] AS d, (array_agg(gk ORDER BY first))[1] AS gk,
+          (array_agg(ga ORDER BY first))[1] AS ga, (array_agg(gb ORDER BY first))[1] AS gb FROM fu GROUP BY grp)`,
+      `gn AS (SELECT gr.*, count(*) OVER (PARTITION BY score, coalesce(d, '') ${BYTES}, gk ${BYTES}, ga, gb) AS n FROM gr)`,
+      `gt AS (SELECT gn.*, x.title, x.body FROM gn LEFT JOIN LATERAL (SELECT title, body FROM brain.chunk
+          WHERE gn.n > 1 AND starts_with(gn.key, 'c') AND chunk_id = substr(gn.key, 2)::bigint) x ON true)`,
+      `od AS (SELECT key, d, row_number() OVER (ORDER BY score DESC, coalesce(d, '') ${BYTES} DESC, gk ${BYTES}, ga NULLS FIRST, gb NULLS FIRST,
+          title ${BYTES} NULLS FIRST, body ${BYTES} NULLS FIRST, key ${BYTES}) AS rn FROM gt)`);
     const from = p(opts.top.cursor), to = p(opts.top.cursor + opts.top.limit);
     const ascii = `NOT EXISTS (SELECT 1 FROM gr WHERE octet_length(d) <> char_length(d))`;
     out = `CASE WHEN ${ascii} THEN jsonb_build_object('total', (SELECT count(*) FROM fu), 'groups', (SELECT count(*) FROM gr),
         'truncated', jsonb_build_array(${names.map((_, n) => `(SELECT count(*) > ${CAP} FROM l${n})`).join(', ')}),
-        'shown', (SELECT coalesce(jsonb_agg(jsonb_build_array(od.key, od.d, (SELECT coalesce(jsonb_agg(jsonb_build_array(k.ptr, k.flags) ORDER BY k.score DESC, k.key ${BYTES}), '[]'::jsonb)
-            FROM (SELECT ptr, flags, score, key FROM fu WHERE fu.grp = od.key AND fu.key <> fu.grp ORDER BY score DESC, key ${BYTES} LIMIT 3) k)) ORDER BY od.rn), '[]'::jsonb)
+        'shown', (SELECT coalesce(jsonb_agg(jsonb_build_array(od.key, od.d, (SELECT coalesce(jsonb_agg(jsonb_build_array(k.ptr, k.flags) ORDER BY k.score DESC, k.ptr ${BYTES}), '[]'::jsonb)
+            FROM (SELECT ptr, flags, score FROM fu WHERE fu.grp = od.key AND fu.key <> fu.grp ORDER BY score DESC, ptr ${BYTES} LIMIT 3) k)) ORDER BY od.rn), '[]'::jsonb)
           FROM od WHERE od.rn > ${from}::float8 AND od.rn <= ${to}::float8)) END AS ranked,
-      CASE WHEN NOT ${ascii} THEN ${all} END AS lists`;
+      CASE WHEN NOT ${ascii} THEN ${all} END AS lists, CASE WHEN NOT ${ascii} THEN ${content} END AS content`;
   }
   const sql = `WITH ${ctes.join(',\n')}
     SELECT ${VIEW}, ${pending} AS pending,
@@ -309,10 +324,13 @@ async function candidates(client, q, opts = {}) {
     return { ranked: { shown: k.shown.map(([key, d, kids]) => ({ key, d, kids: kids.map(([ptr, flags]) => ({ ptr, flags })) })), total: k.total,
       groups: k.groups, truncated: names.filter((_, n) => k.truncated[n]) }, facts, view };
   }
+  const text = new Map(Object.entries(r.content));
   return {
-    lists: r.lists.map((l) => ({ name: l.name, rows: l.rows.slice(0, CAP).map(([key, grp, d, ptr, flags]) => ({ key, grp, d, ptr, flags })), truncated: l.rows.length > CAP })),
+    lists: r.lists.map((l) => ({ name: l.name, rows: l.rows.slice(0, CAP).map(([key, grp, d, ptr, flags, gk, ga, gb]) => ({ key, grp, d, ptr, flags, gk, ga, gb })),
+      truncated: l.rows.length > CAP })),
     facts,
     view,
+    content: (key) => (text.has(key) ? { title: text.get(key)[0], body: text.get(key)[1] } : null),
   };
 }
 

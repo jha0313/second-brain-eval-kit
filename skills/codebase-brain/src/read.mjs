@@ -102,6 +102,10 @@ const flagsOf = (v) => String(v ?? '').split(' ').filter((f) => FLAGS.includes(f
 const strOr = (v) => (v == null ? null : String(v));
 
 const cmp = (a, b) => { a = String(a ?? ''); b = String(b ?? ''); return a < b ? -1 : a > b ? 1 : 0; };
+// text by its UTF-8 bytes, as Postgres COLLATE "C" (cmp compares UTF-16 code units: U+FF5E after U+1F600)
+const bytes = (a, b) => Buffer.compare(Buffer.from(String(a ?? ''), 'utf8'), Buffer.from(String(b ?? ''), 'utf8'));
+const nullFirst = (f) => (a, b) => (a == null ? (b == null ? 0 : -1) : b == null ? 1 : f(a, b));
+const line = nullFirst((a, b) => a - b), text = nullFirst(bytes);
 const cut = (s, n) => { const cs = [...s]; return cs.length <= n ? s : cs.slice(0, n - 1).join('') + '…'; };
 // one line for a search row: frontmatter and heading lines dropped (the title shows them), whitespace folded
 const fold = (body) => String(body ?? '').replace(/^---\n[\s\S]*?\n---\n?/, '').replace(/^#{1,6}\s.*$/gm, '').replace(/\s+/g, ' ').trim();
@@ -142,7 +146,9 @@ function searchFacts(c, opts, truncated) {
   for (const name of truncated) if (!out.truncatedLists.includes(name)) out.truncatedLists.push(name);
   return out;
 }
-// shown: { key, d, kids }; kids: the best three matched children ({ ptr, flags }), by score then key
+// shown: { key, d, kids }; kids: the best three matched children ({ ptr, flags }), by score then ptr.
+// Groups by score, then date (newest first), then gk / ga / gb (common.mjs Candidate) and, for chunks of one item that
+// share their lines, title then body (c.content); key (an id) only for rows alike in all of that, which show alike
 function rank(c, opts) {
   const { cursor, limit } = pageOf(opts);
   const out = searchFacts(c, opts, c.lists.filter((l) => l.truncated).map((l) => l.name));
@@ -155,13 +161,15 @@ function rank(c, opts) {
   });
   const groups = new Map();
   for (const x of fused.values()) {
-    const g = groups.get(x.grp) ?? { key: x.grp, d: x.d, score: 0, children: [] };
+    const g = groups.get(x.grp) ?? { key: x.grp, d: x.d, gk: x.gk, ga: x.ga, gb: x.gb, score: 0, children: [] };
     g.score = Math.max(g.score, x.score);
     if (x.key !== x.grp) g.children.push(x);
     groups.set(x.grp, g);
   }
-  const ordered = [...groups.values()].sort((a, b) => b.score - a.score || cmp(b.d, a.d) || cmp(a.key, b.key));
-  const kidsOf = (g) => g.children.sort((a, b) => b.score - a.score || cmp(a.key, b.key)).slice(0, 3).map((k) => ({ ptr: k.ptr, flags: k.flags }));
+  const seen = new Map(), content = (k) => (seen.has(k) ? seen.get(k) : seen.set(k, c.content(k)).get(k));
+  const ordered = [...groups.values()].sort((a, b) => b.score - a.score || cmp(b.d, a.d) || bytes(a.gk, b.gk) || line(a.ga, b.ga) || line(a.gb, b.gb)
+    || text(content(a.key)?.title, content(b.key)?.title) || text(content(a.key)?.body, content(b.key)?.body) || cmp(a.key, b.key));
+  const kidsOf = (g) => g.children.sort((a, b) => b.score - a.score || bytes(a.ptr, b.ptr)).slice(0, 3).map((k) => ({ ptr: k.ptr, flags: k.flags }));
   return { shown: ordered.slice(cursor, cursor + limit).map((g) => ({ key: g.key, d: g.d, kids: kidsOf(g) })), total: fused.size,
     next: cursor + limit < ordered.length ? cursor + limit : null, facts: out };
 }
