@@ -56,7 +56,7 @@ uv run --project $SE skill-eval run suites/my-suite/suite.yaml -k 3 -j 6 --max-u
 설계하고 구현시킬 때 실제로 쓴 프롬프트는 [prompts](prompts/README.md)에 모았습니다.
 
 - **로컬 모드를 기본으로 권장합니다.** 서버 모드는 로컬과 같은 후보를 찾지만 순서를 다르게 매겨서, 사전 등록 agent eval에서 통과율이 0.10 낮았습니다. 서버 모드는 여러 사람이 같은 brain을 읽어야 할 때 씁니다. 설정은 [skills/codebase-brain/README.md](skills/codebase-brain/README.md)에 있습니다.
-- **작업 전에 brain을 보게 하기:** 실제 백로그 과제에서 에이전트는 "구현해", "지워"를 받으면 스킬을 잘 열지 않았습니다. 스킬 설명을 고쳤고, 대상 repo의 `CLAUDE.md`에 넣을 한 줄을 codebase-brain README의 "작업 전에 brain을 보게 하기"에 적었습니다.
+- **작업 전에 brain을 보게 하기:** 실제 백로그 과제에서 에이전트는 "구현해", "지워"를 받으면 스킬을 잘 열지 않았습니다. 스킬 설명을 고쳤고, 대상 repo의 `.claude/CLAUDE.md`에 넣을 한 줄을 codebase-brain README의 "작업 전에 brain을 보게 하기"에 적었습니다. 사전 등록한 42번 시행 중 옛 PR·이슈·결정을 알아야 하는 과제에서, 첫 편집 전에 과제 주제로 brain을 검색한 시행은 그 파일이 없을 때 3/9, 한 줄이 있을 때 8/9였습니다. 파일과 새 값을 정해 준 작은 수정에서는 양쪽 모두 brain 호출이 0/9였습니다. 설정과 한계는 그 절에 적었습니다.
 
 ## 세미나 버전과 그 뒤 바뀐 것
 
