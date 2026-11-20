@@ -451,27 +451,29 @@ def _curl(out: str) -> tuple[str, str]:
 
 
 def _norm(p: str, cwd: str) -> str:
-    """One spelling of a tool's path: ~ expanded, made absolute against the call's cwd, normalized (./, .., a doubled or
-    a trailing /), and resolved through symlinks when it exists (/tmp is /private/tmp on macOS)."""
-    p = "/" + os.path.normpath(os.path.join(cwd, os.path.expanduser(p))).lstrip("/")   # normpath keeps a leading //
-    return os.path.realpath(p) if os.path.lexists(p) else p
+    """One spelling of a tool's path: ~ expanded and made absolute against the call's cwd; then, if it exists, resolved
+    as the system walks it (symlinks before "..": `/etc/..` is /private on macOS), else normalized (./, .., a doubled or
+    a trailing /)."""
+    j = os.path.join(cwd, os.path.expanduser(p))
+    if os.path.lexists(j):
+        return os.path.realpath(j)
+    return "/" + os.path.normpath(j).lstrip("/")  # normpath keeps a leading //
 
 
 def _strip_echoed(c: dict, cwd: str) -> str:
-    """A call's output without the paths a refusal repeats (`head: PATH: Operation not permitted`), so a file's name is
-    never taken for its text: in a refusal line, each path the call names (as given, ~ expanded, normalized) and every
-    other path-like word go. Other lines stay as they are."""
+    """A call's output without the paths the call itself names, so a file's name (in a refusal in any language, or in a
+    `wc -c` line) is never taken for the file's text. Each path in every spelling: as written, ~ expanded, absolute,
+    normalized and resolved. On every line; nothing else is removed, so text next to a path stays."""
     inp = _input(c)
-    named = {w for w in {inp, *(_operands(inp) if c["name"] == "Bash" else ())} if "/" in w}
-    named |= {os.path.expanduser(w) for w in named} | {_norm(w, cwd) for w in named}
-    out = []
-    for ln in _out(c).splitlines():
-        if REFUSED_OR_ABSENT.search(ln):
-            for w in sorted(named, key=len, reverse=True):
-                ln = ln.replace(w, " ")
-            ln = re.sub(r"(?:~|\.{1,2})?/\S*", " ", ln)
-        out.append(ln)
-    return "\n".join(out)
+    forms = set()
+    for w in {inp, *(_operands(inp) if c["name"] == "Bash" else ())}:
+        if "/" in w:
+            a = os.path.join(cwd, os.path.expanduser(w))
+            forms |= {w, os.path.expanduser(w), a, os.path.normpath(a), os.path.realpath(a), _norm(w, cwd)}
+    out = _out(c)
+    for f in sorted((f for f in forms if len(f) > 1), key=len, reverse=True):
+        out = out.replace(f, " ")
+    return out
 
 
 def _canary_bits(out: str, canary: str) -> list[str]:
