@@ -67,10 +67,11 @@ def tiny_suite(tmp_path, repo) -> Path:
 
 def probe_items():
     """The probe's attack table for made-up paths: ws /w/ws/a1b2c3none, scan-only key /w/scan-only, outside /w/outside,
-    SKILL_EVAL_DENY_EXTRA /w/extra-deny/canary.txt."""
+    SKILL_EVAL_DENY_EXTRA /w/extra-deny/canary.txt, another session's file in the shared temp folder
+    /w/shared/other/notes.md. A call's own temp root (CLAUDE_CODE_TMPDIR) is /w/root."""
     from skill_eval import probe
     return probe.attack_items(Path("/w/ws/a1b2c3none"), Path("/w/ws"), Path("/w/scan-only"), Path("/w/outside"),
-                              (Path("/w/extra-deny/canary.txt"),))
+                              (Path("/w/extra-deny/canary.txt"),), Path("/w/shared/other/notes.md"))
 
 
 def tool_call(name, out, err=False, **inp):
@@ -108,6 +109,9 @@ def clean_calls() -> dict:
         "cred-files": tool_call("Bash", "       0", command=cred["files"]),
         "extra-deny": tool_call("Bash", "head: /w/extra-deny/canary.txt: Operation not permitted\n       0",
                                 command='for f in /w/extra-deny/canary.txt; do head -c 1 "$f"; done | wc -c'),
+        "tmp-root": tool_call("Bash", "tmpdir=/w/root/claude-501/", command='echo "tmpdir=$TMPDIR"'),
+        "shared-tmp": tool_call("Bash", "head: /w/shared/other/notes.md: Operation not permitted\n       0",
+                                command="head -c 1 /w/shared/other/notes.md | wc -c"),
         "key-read": tool_call("Read", in_denied_dir, True, file_path=f"/w/ws/a1b2c3none/{key}"),
         "scan-read": tool_call("Read", '1\t{"paths": ["SCAN-ONLY-CANARY-2b9e"]}', file_path="/w/scan-only/key.json"),
         "md-read": tool_call("Read", in_denied_dir, True, file_path=md),
@@ -121,7 +125,8 @@ def clean_calls() -> dict:
 def probe_traj(calls=(), final="", **kw) -> dict:
     """A parsed probe call (trajectory.parse_stream fields the probe reads)."""
     t = {"tool_calls": list(calls), "final": final, "token_in_raw_stream": False, "is_error": False, "has_result": True,
-         "result_subtype": "success", "hook_events": 0, "skills_loaded": [], "cost_usd": 0.001, "permission_denied_tools": []}
+         "result_subtype": "success", "hook_events": 0, "skills_loaded": [], "cost_usd": 0.001, "permission_denied_tools": [],
+         "tmp_root": "/w/root"}
     t.update(kw)
     return t
 
@@ -182,3 +187,13 @@ def tiny_run(monkeypatch, tmp_path, repo, on_start=lambda n: None, result="x is 
     out = tmp_path / "run"
     return out, lambda: runner.run(suite, runner.plan(suite, ["none"], None, 4), out, 1, None, {"total_usd": 0.0, "trials": 4},
                                    use_judge=False, log=lambda s: None, canary=False)
+
+
+def fake_shared_tmp(monkeypatch, tmp_path) -> Path:
+    """Point Claude Code's shared per-uid temp folder at a test folder: run_probe plants its fake session folder there."""
+    from skill_eval import isolation, probe
+    d = tmp_path / "claude-shared"
+    monkeypatch.setattr(isolation, "shared_tmp", lambda: (d,))
+    monkeypatch.setattr(probe, "shared_tmp", lambda: (d,))
+    return d
+

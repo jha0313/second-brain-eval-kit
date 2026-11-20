@@ -23,7 +23,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -100,7 +102,8 @@ def token() -> str | None:
 def trial_settings(arm_skill: str | None, deny_dirs: list[Path], extra_off: list[str] = (), network: list[str] | None = None,
                    env=os.environ) -> dict:
     off = {s: "off" for s in [*BUNDLED_SKILLS, *extra_off] if s != arm_skill}
-    paths = [*map(str, deny_dirs), str(Path.home() / ".claude"), str(TOKEN_FILE.parent), *map(str, credential_paths(env))]
+    paths = [*map(str, deny_dirs), str(Path.home() / ".claude"), str(TOKEN_FILE.parent), *map(str, credential_paths(env)),
+             *map(str, shared_tmp())]           # other sessions' scratchpads (the trial's own $TMPDIR is its root)
     # "//abs/path" is an absolute path rule; "/**" covers a folder's contents, the bare form a single file
     deny = [f"{tool}(/{p}{tail})" for p in paths for tool in ("Read", "Edit") for tail in ("", "/**")]
     sandbox = {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False}
@@ -136,6 +139,70 @@ def claude_cmd(prompt: str, *, model: str, settings: dict, tools: str, max_turns
     return cmd
 
 
+# Claude Code's per-uid temp folder (/tmp/claude-<uid>) is shared by every session of this user: their scratchpads and
+# task outputs, maybe eval cases or answer-key drafts. A trial must not read it, so it is denied. But the sandboxed
+# shell's $TMPDIR (and Claude Code's cwd files) live there, so each child first gets a short private root:
+# CLAUDE_CODE_TMPDIR=<root> moves both to <root>/claude-<uid>. Observed in Claude Code 2.1.329: it does this only
+# when <root>/claude-<uid> is at most 44 bytes; else $TMPDIR stays in the shared folder (the probe then FAILs).
+TMPDIR_MAX = 44
+
+
+def shared_tmp() -> tuple[Path, ...]:
+    """Claude Code's shared per-uid temp folder in both spellings: /tmp/claude-<uid> and, on macOS, /private/tmp/...
+    Only /tmp is resolved: a claude-<uid> that is a symlink is not followed (the probe refuses it)."""
+    p = Path(f"/tmp/claude-{os.getuid()}")
+    return tuple(dict.fromkeys([p, Path(os.path.realpath("/tmp")) / p.name]))
+
+
+def root_layouts(tmp: str, uid: int) -> list[tuple[Path, int]]:
+    """Where the private roots can go, each with the length of a root's random name that keeps <root>/claude-<uid>
+    within TMPDIR_MAX bytes (as long as there is room for, at least 8 and at most 16 hex): <tmp>/sk-<uid>, or for a
+    long uid <tmp>/sk, sk0, sk1, ... in that order (another long-uid user may have the first ones)."""
+    own = TMPDIR_MAX - len(f"{tmp}/sk-{uid}//claude-{uid}".encode())
+    if own >= 8:
+        return [(Path(tmp) / f"sk-{uid}", min(own, 16))]
+    out = [(Path(tmp) / name, min(room, 16)) for name in ("sk", *(f"sk{i}" for i in range(100)))
+           if (room := TMPDIR_MAX - len(f"{tmp}/{name}//claude-{uid}".encode())) >= 8]
+    if not out:
+        raise RuntimeError(f"{tmp}/sk/<name>/claude-{uid} cannot fit in {TMPDIR_MAX} bytes: Claude Code would keep the "
+                           "trial's $TMPDIR in the shared folder")
+    return out
+
+
+def private_root() -> Path:
+    """A new folder for one child process (its CLAUDE_CODE_TMPDIR, config and gh dirs; a judge's cwd too). Its parent
+    has mode 0300: nobody lists it, so a trial cannot find another trial's root (the same design as the workspaces)."""
+    uid = os.getuid()
+    layouts = root_layouts(os.path.realpath("/tmp"), uid)
+    for parent, n in layouts:                     # one made now, or one an earlier call made (this uid, 0300)
+        try:
+            parent.mkdir(mode=0o300)
+            os.chmod(parent, 0o300)               # the umask may have taken bits
+        except FileExistsError:
+            pass
+        st = parent.lstat()
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == uid and st.st_mode & 0o777 == 0o300:
+            break
+    else:
+        raise RuntimeError(f"{layouts[0][0]} is not this user's 0300 folder for trial temp roots: remove it and run again")
+    root = parent / secrets.token_hex(8)[:n]
+    root.mkdir(mode=0o700)
+    found = ancestor_instructions(root / "cwd")    # a judge runs in a root: Claude Code would read these
+    if found:
+        root.rmdir()
+        raise RuntimeError(f"instruction files above the trial temp folders would be read by every judge: {found}")
+    return root
+
+
+def harness_dir(prefix: str) -> Path:
+    """A new folder for the harness's own files (workspaces, probe fixtures), never inside the shared Claude Code
+    folder that trials cannot read ($TMPDIR is in it when skill-eval runs from a sandboxed Claude Code shell)."""
+    base = Path(os.path.realpath(tempfile.gettempdir()))
+    if any(base.is_relative_to(s) for s in shared_tmp()):
+        base = Path(os.path.realpath("/tmp"))
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=base))
+
+
 class TrialEnv:
     """Environment for one child process: allowlisted variables, a fresh config dir, the token if present, and no
     GitHub or git credential (a fresh empty GH_CONFIG_DIR, NO_GIT_CREDENTIALS, no GH_* / GITHUB_* variable)."""
@@ -145,30 +212,42 @@ class TrialEnv:
         self.fixture = config_dir                  # the probe's positive control passes a canary config dir
         self.dir: Path | None = None
         self.gh_dir: Path | None = None
+        self.root: Path | None = None              # CLAUDE_CODE_TMPDIR: the child's own temp folder, removed on exit
         self.config_keys: dict[str, list[str]] = {}   # files Claude Code wrote into the config dir -> key names
 
     def __enter__(self) -> dict:
         env = {k: v for k, v in os.environ.items() if k in ENV_KEEP}
         env["DISABLE_AUTOUPDATER"] = "1"
-        tok = token()
-        if tok:
-            self.dir = None if self.fixture else Path(tempfile.mkdtemp(prefix="skill-eval-cfg-"))
-            env["CLAUDE_CONFIG_DIR"] = str(self.fixture or self.dir)
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
-        env.update(self.extra)
-        env = {k: v for k, v in env.items() if not GH_ENV_RE.match(k)}   # extra (skill_env) may not add any either
-        self.gh_dir = Path(tempfile.mkdtemp(prefix="skill-eval-gh-"))
-        env.update(NO_GIT_CREDENTIALS, GH_CONFIG_DIR=str(self.gh_dir))    # last: extra cannot override them
-        return env
+        self.root = private_root()
+        try:
+            tok = token()
+            if tok:
+                self.dir = None if self.fixture else Path(tempfile.mkdtemp(prefix="cfg-", dir=self.root))
+                env["CLAUDE_CONFIG_DIR"] = str(self.fixture or self.dir)
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+            env.update(self.extra)
+            env = {k: v for k, v in env.items() if not GH_ENV_RE.match(k)}   # extra (skill_env) may not add any either
+            self.gh_dir = Path(tempfile.mkdtemp(prefix="gh-", dir=self.root))
+            # last: extra cannot override them
+            env.update(NO_GIT_CREDENTIALS, GH_CONFIG_DIR=str(self.gh_dir), CLAUDE_CODE_TMPDIR=str(self.root))
+            return env
+        except BaseException:                      # no __exit__ follows a failed __enter__
+            self._remove_root()
+            raise
 
     def __exit__(self, *exc):
-        d = self.dir or self.fixture
-        if d:
-            self.config_keys = config_file_keys(d)
-        if self.dir:
-            shutil.rmtree(self.dir, ignore_errors=True)
-        if self.gh_dir:
-            shutil.rmtree(self.gh_dir, ignore_errors=True)
+        try:
+            d = self.dir or self.fixture
+            if d:
+                self.config_keys = config_file_keys(d)
+        finally:
+            self._remove_root()
+
+    def _remove_root(self):
+        if self.root:                              # the config and gh dirs are in it too
+            shutil.rmtree(self.root, ignore_errors=True)
+            if self.root.exists():
+                print(f"warning: could not remove {self.root} (a trial's temp files)", file=sys.stderr)
 
 
 def config_file_keys(d: Path) -> dict[str, list[str]]:

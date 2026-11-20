@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import checks, judge, report, stats
 from .stats import EXCLUDED, SCORED
-from .isolation import TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, redact, register_secret, trial_settings
+from .isolation import TrialEnv, ancestor_instructions, auth_mode, claude_cmd, clean_env, harness_dir, redact, register_secret, trial_settings
 from .trajectory import parse_stream
 
 # Rough $ per trial before any calibration. `--calibrate` replaces these with measured means.
@@ -581,7 +581,7 @@ def run(suite, specs: list[dict], out: Path, jobs: int, max_usd: float | None, e
                            "and save the token (see SKILL.md), or set SKILL_EVAL_ALLOW_KEYCHAIN=1 for a dev run.")
     out.mkdir(parents=True, exist_ok=True)
     (out / "trials").mkdir(exist_ok=True)
-    ws_root = Path(tempfile.mkdtemp(prefix="skill-eval-ws-"))        # outside the suite, the kit and the run records
+    ws_root = harness_dir("skill-eval-ws-")       # outside the suite, the kit, the run records and /tmp/claude-<uid>
     found = ancestor_instructions(ws_root / "x")
     if found:
         raise RuntimeError(f"instruction files above the workspace would be read by every trial: {found}")
