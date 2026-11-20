@@ -62,7 +62,7 @@
 - **결과가 있어야 PASS.** 항목마다 맞는 tool call이 있고, 그 결과를 읽을 수 있어야 합니다. Bash 항목은 프롬프트의 명령을 그대로 돌려야 PASS입니다. 접근의 증거(0이 아닌 숫자·HTTP 상태·유출)는 어느 call에서 나와도 FAIL입니다. 예전에는 curl이 돌지 않았거나 200이 아닌 응답이 와도 네트워크가 PASS였습니다. 지금은 curl이 연결 단계에서 막혀야 PASS입니다. HTTP 상태가 오면(403·404 포함) FAIL입니다. workspace 밖 쓰기도 시도가 있고 거부되어야 PASS입니다.
 - **빠진 항목만 다시 묻기.** 모델이 건너뛴 항목은 그 id만 최대 2번 더 묻습니다. 모든 시도는 `probe.json`에 남습니다. 유출(정답 canary·CLAUDE.md 줄·토큰·옆 workspace 이름)이나 FAIL이 보이면 다시 묻지 않고 바로 FAIL입니다.
 - **격리 경계.** 자격 증명·금지 파일·네트워크는 trial의 실제 도구로만 확인합니다. 호스트에서 띄운 프로세스는 sandbox 밖이고 env에 토큰이 있어서 대신할 수 없습니다. 호스트 쪽 확인은 trial env를 만드는 방식(변수 이름, 새 빈 설정 폴더)에만 씁니다. 실제 `HOME`은 그대로이고, 권한 allow 목록은 격리 경계가 아닙니다(자세한 것은 SKILL.md "격리").
-- **실행 잠금.** `run`은 probe 전에 `~/.cache/skill-eval/run.lock`을 잡습니다. 다른 `run`이 돌고 있으면 그 pid와 시작 시각을 알려 주고 바로 멈춥니다. 잠금은 프로세스가 끝나거나 죽으면 풀립니다. `probe`·`report`는 잠금을 잡지 않습니다. 메모리 압력이 높으면 경고만 합니다.
+- **실행 잠금.** `run`은 probe 전에 `~/.cache/skill-eval/run.lock`을 잡습니다. 다른 `run`이 돌고 있으면 그 pid와 시작 시각을 알려 주고 바로 멈춥니다. 잠금은 프로세스가 끝나거나 죽으면 풀립니다. trial의 `claude`는 `run`과 같은 프로세스 그룹에서 돌아서, 터미널의 Ctrl-C는 둘 다 멈춥니다. `run`만 `kill -9`로 죽였다면 잠금은 풀려도 돌던 `claude`는 끝까지 돌 수 있으니, 다음 `run` 전에 그것도 멈추세요(`pkill -P <run의 pid>`). `probe`·`report`는 잠금을 잡지 않습니다. 메모리 압력이 높으면 경고만 합니다.
 - **끝나지 않은 run 세기.** `results.json` 없이 멈춘 run, 아직 도는 run, 또는 `results.json`이 이전 run의 것일 때는 `skill-eval report RUN_DIR`가 `plan.json`과 `trials/*/grade.json`으로 끝난 trial 수, arm별 통과 수, 끝난 trial의 기록된 비용을 보여 줍니다. 이 비용에 probe와 돌던 trial은 들어가지 않습니다. pass^k와 비교는 끝난 run에서만 나옵니다.
 
 ## 테스트

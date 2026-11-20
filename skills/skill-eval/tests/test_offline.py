@@ -1,5 +1,7 @@
 """Offline tests: no model calls. Run: uv run --with pytest pytest tests"""
 import json
+import os
+import re
 
 from skill_eval.checks import (check_no_answer_key_access, check_sources_hit, check_workspace_unchanged, extract_paths,
                                majority, score_trial)
@@ -80,7 +82,9 @@ def test_verdict_does_not_presume():
 def test_cites_exist_ignores_ids_but_catches_claimed_commits(tmp_path):
     import subprocess
     from skill_eval.checks import check_cites_exist
-    run = lambda *a: subprocess.run(["git", "-C", str(tmp_path), *a], capture_output=True, text=True, check=True)  # noqa: E731
+    # fixed dates: the same SHA every run (a random one is all digits about 2% of the time, which no check reads as a commit)
+    env = {**os.environ, "GIT_AUTHOR_DATE": "2026-10-01T00:00:00Z", "GIT_COMMITTER_DATE": "2026-10-01T00:00:00Z"}
+    run = lambda *a: subprocess.run(["git", "-C", str(tmp_path), *a], capture_output=True, text=True, check=True, env=env)  # noqa: E731
     run("init", "-q")
     (tmp_path / "a.ts").write_text("x\n")
     (tmp_path / "Dockerfile.web").write_text("FROM x\nRUN y\n")
@@ -88,8 +92,9 @@ def test_cites_exist_ignores_ids_but_catches_claimed_commits(tmp_path):
     (tmp_path / "services" / "billing" / "CLAUDE.md").write_text("1\n2\n3\n")
     (tmp_path / "changes").mkdir()
     (tmp_path / "changes" / "20261001-retry-rule.md").write_text("1\n2\n")
-    run("add", "."), run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+    run("add", "."), run("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "c")
     head = run("rev-parse", "HEAD").stdout.strip()
+    assert re.search(r"\d", head[:8]) and re.search(r"[a-f]", head[:8]), head   # a hex token the checks read as a SHA
     grade = lambda text: check_cites_exist({"min": 1}, {"final": text}, repo=tmp_path, commit=head)  # noqa: E731
     ok = grade(f"See a.ts:1 and commit {head[:8]}. User 80b99389-f8a6-4db3-81da-3dc9d6c735aa hit Run cca1769f.")
     assert ok["ok"], ok
