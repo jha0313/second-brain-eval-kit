@@ -7,8 +7,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parity, runQuery } from './parity.mjs';
-import { fixtureRepo } from '../phase1/helpers.mjs';
+import * as T from './ties.mjs';
+import { fixtureRepo, makeGithubDb } from '../phase1/helpers.mjs';
 import { openContext } from '../../src/context.mjs';
+import { githubDbPath } from '../../src/gh-schema.mjs';
 import { core } from '../../src/store/sqlite.mjs';
 import { search } from '../../src/read.mjs';
 
@@ -113,5 +115,48 @@ test('search: a copy with every id reversed gives the same lists and results (a 
       assert.deepEqual(paths(cb, name, q), x, name);
     }
     for (const q of ['예약', 'src/lib/credits.ts', '예약 순서', 'credits.ts']) assert.deepEqual(search(cb, q, { limit: 50 }), search(ca, q, { limit: 50 }), q);
+  } finally { ca.close(); cb.close(); }
+});
+
+// github.db items ids reversed (their FTS rows follow: rowid = id)
+function reverseItemIds(file) {
+  const db = new DatabaseSync(file);
+  const n = db.prepare('SELECT max(id) + 1 AS m FROM items').get().m;
+  db.exec(`BEGIN; UPDATE items SET id = -id; UPDATE items SET id = ${n} + id;
+    DELETE FROM items_fts; INSERT INTO items_fts(rowid, title, body) SELECT id, coalesce(title, ''), coalesce(body, '') FROM items;
+    DELETE FROM items_tri; INSERT INTO items_tri(rowid, title, body) SELECT id, coalesce(title, ''), coalesce(body, '') FROM items; COMMIT;`);
+  db.close();
+}
+
+// search ties (test/pg/ties.mjs): groups with one final score and one date come in the order of their content on the
+// build (ids planted against it) and on a copy with every chunk and item id reversed; a vault note sorts as vault:<path>
+test('search: groups that tie on score and date come in one order by content, whatever the ids (commits, docs, items, a child-only PR, vault)', () => {
+  const { repo, codeDb } = fixtureRepo();
+  makeGithubDb(codeDb);
+  for (const [file, sql] of [[codeDb, T.codeSql([T.VAULT.chunk])], [githubDbPath(codeDb), T.ghSql()]]) { const db = new DatabaseSync(file); db.exec(sql); db.close(); }
+  const b = join(repo, '..', `${repo.split('/').pop()}-reversed.db`);
+  copyFileSync(codeDb, b);
+  copyFileSync(githubDbPath(codeDb), githubDbPath(b));
+  reverseIds(b).close();
+  reverseItemIds(githubDbPath(b));
+  const ca = openContext({ codeDbPath: codeDb }), cb = openContext({ codeDbPath: b });
+  try {
+    // the ids run against the order on the build, along it on the copy
+    const ids = (ctx) => [...T.ID_ORDER.items, ...T.ID_ORDER.children].map((p) => ctx.gh.prepare('SELECT id FROM items WHERE ptr = ?').get(p).id)
+      .concat(T.ID_ORDER.chunks.map((t) => ctx.code.prepare('SELECT id FROM chunks WHERE body = ?').get(t).id));
+    const falling = (xs) => xs.every((x, i) => i === 0 || x < xs[i - 1]);
+    const [ia, ib] = [ids(ca), ids(cb)];
+    assert.ok([ia.slice(0, 3), ia.slice(3, 7), ia.slice(7)].every(falling), `build ids ${ia}`);
+    assert.ok([ib.slice(0, 3), ib.slice(3, 7), ib.slice(7)].every((xs) => falling([...xs].reverse())), `copy ids ${ib}`);
+    const want = [...T.PAGE, T.VAULT_ROW];
+    for (const [ctx, q] of [[ca, T.VAULT.query], [cb, T.VAULT.query], [ca, `${T.QUERY_BACK} 고추`], [cb, `${T.QUERY_BACK} 고추`]]) {
+      const r = search(ctx, q, { limit: 50 });
+      assert.deepEqual([r.rows.map(T.rowOf), r.total, r.next], [want, 23, null], q);
+      // one row a page (each tied pair split), and pages of 5
+      assert.deepEqual(want.map((_, cursor) => search(ctx, q, { limit: 1, cursor }).rows.map(T.rowOf)), want.map((x) => [x]), q);
+      const pages = [0, 5, 10, 15].map((cursor) => search(ctx, q, { limit: 5, cursor }));
+      assert.deepEqual(pages.flatMap((p) => p.rows.map(T.rowOf)), want, q);
+      assert.deepEqual(pages.map((p) => p.next), [5, 10, 15, null], q);
+    }
   } finally { ca.close(); cb.close(); }
 });

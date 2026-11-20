@@ -371,21 +371,24 @@ export function checksum(state, shapes = ['code', 'github']) {
  * groups (read.mjs ranks between them): candidates stay light so a search moves keys, not bodies (§6.9). The Postgres
  * store also takes candidates top (it ranks as read.mjs rank() does and returns `ranked`, the shown groups only, instead
  * of lists) and rows prefix (bodies cut, see rows); the SQLite store ignores both.
- * @typedef {{ key: string, grp: string, d: string|null, ptr?: string|null, flags?: string|null }} Candidate
+ * @typedef {{ key: string, grp: string, d: string|null, ptr?: string|null, flags?: string|null, gk: string|null, ga: number|null, gb: number|null }} Candidate
  *   key / grp opaque ('c' + chunk id, 'g' + GitHub item id; the mirror's ids): equal keys = the same row; grp = the row
  *   it ranks as (a review / comment ranks as its PR, else issue). d: the group's date (tie-break). GitHub rows carry ptr
- *   and flags (a matched child is shown by those alone).
+ *   and flags (a matched child is shown by those alone). gk / ga / gb: the group's tie-break after d, by content
+ *   (src/store/common.mjs Candidate).
  * @typedef {Record<string, any> & { key: string, ptr: string, rev: number|null, origin: 'github'|'repo'|'vault', parentPtr: string|null }} StoreRow
  *   GitHub: the github.db items row columns; repo / vault: the code.db chunks row columns. ptr: GitHub items without a
  *   revision, repo memory `<source>:<path>:<a>-<b>@r<n>` (server) or `@<build>` (local), commits `commit:<sha8>`.
  *   rev: the revision number (null in the SQLite store). parentPtr: the PR / issue a review or comment rolls up to
  * @typedef {{
- *   candidates(q: string, opts: import('../read.mjs').SearchOpts & AtRun & { top?: { cursor: number, limit: number } }): Promise<{
- *     lists?: { name: string, rows: Candidate[], truncated: boolean }[],   // in rank order, max 2,000 per list
- *     ranked?: { shown: { key: string, d: string|null, kids: { ptr: string, flags: string|null }[] }[],   // top: instead of lists
+ *   candidates(q: string, opts: import('../read.mjs').SearchOpts & AtRun & { top?: { cursor: number, limit: number } }): Promise<({
+ *     lists: { name: string, rows: Candidate[], truncated: boolean }[],   // in rank order, max 2,000 per list
+ *     content: (key: string) => { title: string|null, body: string|null }|null,   // src/store/common.mjs Candidate
+ *   } | {
+ *     ranked: { shown: { key: string, d: string|null, kids: { ptr: string, flags: string|null }[] }[],   // top: instead of lists
  *       // (lists still, when a group's d is not ASCII: Postgres orders text by bytes, read.mjs by UTF-16 code units)
  *       total: number, groups: number, truncated: string[] },   // candidates, groups before paging, the lists that hit the cap
- *     facts: { pathRefsPending: number, filesTruncated: number, githubPresent: boolean }, view: View }>,
+ *   }) & { facts: { pathRefsPending: number, filesTruncated: number, githubPresent: boolean }, view: View }>,
  *   rows(keys: string[], opts?: AtRun & { prefix?: number }): Promise<{ rows: StoreRow[], view: View }>,   // unknown keys left out
  *     // prefix n: a body over n characters is its first n and the row has cut: true; a repo row then also has sus:
  *     // false when no SUSPICIOUS rule can match its text (read.mjs textOf), true when one may

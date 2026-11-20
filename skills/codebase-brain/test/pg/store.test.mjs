@@ -22,6 +22,7 @@ import { githubDbPath } from '../../src/gh-schema.mjs';
 import { openContext } from '../../src/context.mjs';
 import { pgStore, pgSuperset, suspectSql } from '../../src/store/pg.mjs';
 import { sqliteStore } from '../../src/store/sqlite.mjs';
+import * as T from './ties.mjs';
 import { search, get, source, searchIn, getIn, sourceIn, snippetFromPrefix, snippetOf } from '../../src/read.mjs';
 import { SUSPICIOUS, flagSuspicious } from '../../src/sanitize.mjs';
 import { parseRevPtr, formatRevPtr, parsePtr } from '../../src/ptr.mjs';
@@ -494,4 +495,44 @@ test('lists: ties come in one order on both stores, by content, not ids (a short
       }
     }
   } finally { ctx.close(); db.close(); gdb.close(); }
+}));
+
+test('search ties: groups with one score and date come in one order by content on the server (ranked, its lists, the fallback), a mirror and the build', { skip }, () => withStore(async (store) => {
+  // test/pg/ties.mjs in one run. Its ids run against PAGE on the server (so in a mirror) as in the build, as far as a
+  // publish lets them (ID_PAIRS): checked first
+  const last = Number((await b.query('reader', 'SELECT max(run_id) AS m FROM brain.run')).rows[0].m);
+  const b0 = new DatabaseSync(prev.codeDb, { readOnly: true }), build0 = JSON.parse(b0.prepare("SELECT value FROM meta WHERE key = 'build_id'").get().value);
+  b0.close();
+  await publish({ n: last + 1, base: last, at: '2099-11-28T00:00:00.000Z', code: `${T.codeSql([T.FALLBACK.chunk])} ${meta('golden10', SHA(7))}`,
+    gh: `${relink(build0, 'golden10')} ${T.ghSql()}` });
+  const m = await pullMirror({ url: b.readerUrl, dir: join(work, 'mirror-ties'), shapes: ['code', 'github'] });
+  const ctx = openContext({ codeDbPath: prev.codeDb }), mc = openContext({ codeDbPath: m.codeDb });
+  try {
+    const falling = (xs) => xs.every((x, i) => i === 0 || Number(x) < Number(xs[i - 1]));
+    const ptrs = [...T.ID_ORDER.items, ...T.ID_ORDER.children];
+    const items = new Map((await b.query('reader', 'SELECT ptr, item_id FROM brain.item WHERE ptr = ANY($1)', [ptrs])).rows.map((r) => [r.ptr, r.item_id]));
+    const chunks = new Map((await b.query('reader', `SELECT c.body, c.chunk_id FROM brain.chunk c JOIN brain.item_rev r USING (rev_id) JOIN brain.item i USING (item_id)
+      WHERE i.origin = 'repo' AND c.body = ANY($1)`, [T.ID_ORDER.chunks])).rows.map((r) => [r.body, r.chunk_id]));
+    const local = { item: (p) => ctx.gh.prepare('SELECT id FROM items WHERE ptr = ?').get(p).id, chunk: (t) => ctx.code.prepare('SELECT id FROM chunks WHERE body = ?').get(t).id };
+    for (const [id, who] of [[{ item: (p) => items.get(p), chunk: (t) => chunks.get(t) }, 'server'], [local, 'build']]) {
+      assert.ok(falling(T.ID_ORDER.items.map(id.item)) && falling(T.ID_ORDER.children.map(id.item)) && T.ID_PAIRS.every((p) => falling(p.map(id.chunk))), who);
+    }
+    assert.ok(falling(T.ID_ORDER.chunks.map(local.chunk)), 'build chunks');
+    // the page in order, whole and one row a page (each tied pair split), for the terms either way; on the server ranked
+    // in SQL, then its lists ranked by rank(); then with a group date that is not ASCII, for which the server sends its
+    // lists, and rank() orders them as every other store
+    assert.ok((await store.candidates(T.QUERY, { top: { cursor: 0, limit: 10 } })).ranked);
+    assert.ok((await store.candidates(T.FALLBACK.query, { top: { cursor: 0, limit: 10 } })).lists);
+    const stores = [[store, 'server'], [plainOf(store), 'server lists'], [sqliteStore(mc), 'mirror'], [sqliteStore(ctx), 'build']];
+    for (const [s, who] of stores) {
+      for (const [q, want, total] of [[T.QUERY, T.PAGE, 22], [T.QUERY_BACK, T.PAGE, 22], [T.FALLBACK.query, [T.FALLBACK_ROW, ...T.PAGE], 23],
+        [`${T.QUERY_BACK} 호박`, [T.FALLBACK_ROW, ...T.PAGE], 23]]) {
+        const r = await searchIn(s, q, { limit: 50 });
+        assert.deepEqual([r.rows.map(T.rowOf), r.total, r.next], [want, total, null], `${who} ${q}`);
+        const one = [];
+        for (let cursor = 0; cursor < want.length; cursor++) one.push((await searchIn(s, q, { limit: 1, cursor })).rows.map(T.rowOf));
+        assert.deepEqual(one, want.map((x) => [x]), `${who} ${q}: one row a page`);
+      }
+    }
+  } finally { ctx.close(); mc.close(); }
 }));

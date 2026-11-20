@@ -40,6 +40,11 @@ export const listOf = (json) => {
  * One candidate as a store lists it: light, so a search moves keys, not bodies (§6.9). key / grp are opaque to read.mjs
  * (equal keys = the same row; grp = the row it ranks as: a review or comment ranks as its PR / issue, everything else as
  * itself). d: the group's date (tie-break). GitHub rows also carry their own ptr and flags (a matched child is shown
- * by those alone). Hydrate a group with store.rows([grp]).
- * @typedef {{ key: string, grp: string, d: string|null, ptr?: string, flags?: string|null }} Candidate
+ * by those alone; ptr is also its tie-break among the group's children). Hydrate a group with store.rows([grp]).
+ * gk / ga / gb: the group's tie-break after d, the same in every store (key / grp are ids, which a build, a mirror and
+ * the server assign apart): the ptr of the PR / issue for GitHub rows (ga, gb null); for repo memory the chunk's item
+ * as contract.repoItemPtr names it (a vault note: its path, vault:<path>) and its start / end line. Chunks of one item
+ * with the same lines tie on these too; their title, then body decide: a store's candidates result with lists has
+ * content(key), the { title, body } of such a chunk key (null for any other key).
+ * @typedef {{ key: string, grp: string, d: string|null, ptr?: string, flags?: string|null, gk: string|null, ga: number|null, gb: number|null }} Candidate
  */
