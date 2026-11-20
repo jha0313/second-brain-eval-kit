@@ -115,7 +115,10 @@ check('a real commit SHA and a bare file name that exists are not marked', () =>
 });
 check('SKILL.md: description fits 1,024 chars, routes Korean questions, and names only flags brain has', () => {
   const skill = readFileSync(join(here, '..', 'SKILL.md'), 'utf8');
-  const desc = skill.match(/^description: (.*)$/m)[1];
+  const fm = skill.split(/^---$/m)[1].split('\n'), at = fm.indexOf('description: >-');   // a folded scalar: `: ` inside stays valid YAML
+  assert.ok(at >= 0, 'description is a folded block (description: >-)');
+  const block = []; for (const l of fm.slice(at + 1)) { if (l !== '' && !l.startsWith('  ')) break; block.push(l.trim()); }
+  const desc = block.join('\n').trim().split(/\n{2,}/).map((p) => p.split('\n').join(' ')).join('\n');   // YAML folding: lines join with a space, a blank line is a newline
   assert.ok(desc.length <= 1024 && /[가-힣]/.test(desc));
   const help = sh(brain, ['--help']);
   for (const flag of new Set(skill.match(/--[a-z][a-z-]+/g))) assert.ok(help.includes(flag), flag);

@@ -133,6 +133,23 @@ describe('P3 cells from real inputs', () => {
     x = setup({ tAgoMs: 24 * H - 1000 });
     assert.equal((await look(x)).memory.state, 'fresh');
   });
+  test('a missed schedule: one run at main, only the DB clock moves; 24h - 1ms is fresh, exactly 24h is (stale) and asks for a refresh', async () => {
+    const C = Math.floor(Date.now() / 1000) * 1000;   // a whole second: the stored cursor keeps no milliseconds
+    const fixed = { t: C, now() { return this.t; } };
+    const repos = gitRepos();
+    const world = createWorld({ clock: fixed, repos });
+    world.seedRun({ commit: repos.head(), tAgoMs: 0 });   // GitHub cursor = C
+    const x = { repos, world, reader: stubReader(world) };
+    fixed.t = C + 24 * H - 1;
+    let s = await look(x);
+    assert.deepEqual([s.code.state, s.memory.state, needsRefresh(s)], ['same', 'fresh', false]);
+    assert.ok(!REFRESH_TRIGGERS.some((t) => footerLine(s).includes(t)));
+    fixed.t = C + 24 * H;
+    s = await look(x);
+    assert.deepEqual([s.code.state, s.memory.state, needsRefresh(s)], ['same', 'old', true]);
+    assert.match(footerLine(s), / · = main · github as of 24h ago \(stale\)$/);
+    assert.ok(REFRESH_TRIGGERS.some((t) => footerLine(s).includes(t)));   // the words SKILL.md rule 10 reads
+  });
   test('F10: the only statement is STATUS_SQL, a single read without params', async () => {
     const x = setup();
     await look(x);
